@@ -83,6 +83,7 @@ private data class RemoteReel(
     val kind: String = "reel",
     val url: String? = null,
     val title: String? = null,
+    val thumbnail: String? = null,
     val registered: Boolean = true,
     val source: String = "android",
     val createdAt: Long = 0L,
@@ -95,6 +96,7 @@ private data class RemoteReel(
             kind = kind,
             url = link,
             title = title,
+            thumbnail = thumbnail?.takeIf { it.isNotBlank() },
             registered = registered,
             createdAt = if (createdAt > 0L) createdAt else System.currentTimeMillis(),
         )
@@ -106,6 +108,7 @@ private data class RemoteReel(
             kind = item.kind,
             url = item.url,
             title = item.title,
+            thumbnail = item.thumbnail,
             registered = true,
             source = "android",
             createdAt = if (item.createdAt > 0L) item.createdAt else System.currentTimeMillis(),

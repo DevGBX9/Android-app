@@ -5,6 +5,7 @@ import com.brainrot.pigeon.data.AvatarLoader
 import com.brainrot.pigeon.data.FirebaseReels
 import com.brainrot.pigeon.data.ProfileRepository
 import com.brainrot.pigeon.data.R2Uploader
+import com.brainrot.pigeon.data.ReelThumbnails
 import com.brainrot.pigeon.data.SavedRepository
 import com.brainrot.pigeon.data.SettingsRepository
 import java.util.concurrent.TimeUnit
@@ -32,8 +33,11 @@ class AppContainer(context: Context) {
 
     val settings = SettingsRepository(appContext)
     val reels = FirebaseReels(httpClient, BuildConfig.DEFAULT_FIREBASE_DB)
-    val saved = SavedRepository(appContext, reels, workScope)
+    val thumbnails = ReelThumbnails(httpClient)
+    val saved = SavedRepository(appContext, reels, thumbnails, workScope)
     val avatars = AvatarLoader(httpClient)
+    // صور أغلفة الريلز في الشبكة: كاش أكبر لأن الشبكة تعرض عشرات الصور.
+    val reelImages = AvatarLoader(httpClient, cacheSize = 90)
     val profile = ProfileRepository(appContext, settings, httpClient)
     val uploader = R2Uploader(httpClient)
 }

@@ -19,6 +19,8 @@ data class SavedItem(
     val fileName: String? = null,
     val mimeType: String? = null,
     val remoteUrl: String? = null,
+    /** رابط صورة غلاف الريل من إنستغرام (oEmbed). */
+    val thumbnail: String? = null,
     val registered: Boolean = false,
     val createdAt: Long = 0L,
 )

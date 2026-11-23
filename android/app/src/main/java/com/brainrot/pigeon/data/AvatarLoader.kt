@@ -17,9 +17,9 @@ import okhttp3.Request
  * المفتاح هو مسار الصورة فقط، لأن روابط إنستغرام تُوقَّع من جديد مع كل طلب
  * (?oh=...&oe=...)، والمقارنة بالرابط الكامل كانت تسبب أنيميشن وهمي.
  */
-class AvatarLoader(private val client: OkHttpClient) {
+class AvatarLoader(private val client: OkHttpClient, cacheSize: Int = 12) {
 
-    private val cache = LruCache<String, ImageBitmap>(12)
+    private val cache = LruCache<String, ImageBitmap>(cacheSize)
 
     fun cacheKey(url: String): String =
         runCatching { Uri.parse(url).path }.getOrNull() ?: url

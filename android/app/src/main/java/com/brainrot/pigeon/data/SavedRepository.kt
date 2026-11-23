@@ -5,6 +5,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
@@ -13,15 +14,19 @@ import kotlinx.serialization.json.Json
 
 private val SAVED_ITEMS_KEY = stringPreferencesKey("saved_items_json")
 private const val MAX_SAVED_ITEMS = 300
+private const val MAX_THUMBNAIL_LOOKUPS = 30
 
 /**
  * مصدر الحقيقة المحلي للريلز (DataStore) مع نسخة على Firebase:
  * الإضافة تُكتب محلياً فوراً ثم تُرفع في الخلفية، وعند كل فتح للتطبيق
  * تُسحب القائمة من Firebase وتُدمج مع المحلي.
+ *
+ * كل ريل يحصل على صورة غلاف من إنستغرام (oEmbed) وتُحفظ معه لتظهر في الشبكة.
  */
 class SavedRepository(
     private val context: Context,
     private val remote: FirebaseReels,
+    private val thumbnails: ReelThumbnails,
     private val scope: CoroutineScope,
 ) {
 
@@ -82,12 +87,47 @@ class SavedRepository(
         return Result.success(Unit)
     }
 
-    private suspend fun register(item: SavedItem) {
-        if (!remote.upload(item)) return
+    /**
+     * يجيب صور الغلاف للريلز القديمة التي انضافت قبل إضافة الثمبنيل،
+     * بحد أقصى 30 محاولة في كل فتح للتطبيق.
+     */
+    suspend fun ensureThumbnails() {
+        val local = runCatching { context.savedStore.data.first()[SAVED_ITEMS_KEY] }
+            .getOrNull()
+            ?.let(::decode)
+            .orEmpty()
 
+        local.asSequence()
+            .filter { it.url != null && it.thumbnail == null }
+            .take(MAX_THUMBNAIL_LOOKUPS)
+            .forEach { item ->
+                val thumb = thumbnails.thumbnailFor(item.url) ?: return@forEach
+                updateThumbnail(item.id, thumb)
+            }
+    }
+
+    private suspend fun register(item: SavedItem) {
+        val link = item.url ?: return
+        val thumb = item.thumbnail ?: thumbnails.thumbnailFor(link)
+        if (thumb != null && thumb != item.thumbnail) updateThumbnail(item.id, thumb)
+
+        if (!remote.upload(item.copy(thumbnail = thumb))) return
+        markRegistered(item.id)
+    }
+
+    private suspend fun markRegistered(id: String) {
         context.savedStore.edit { prefs ->
             val next = decode(prefs[SAVED_ITEMS_KEY]).map { saved ->
-                if (saved.id == item.id) saved.copy(registered = true) else saved
+                if (saved.id == id) saved.copy(registered = true) else saved
+            }
+            prefs[SAVED_ITEMS_KEY] = json.encodeToString(next)
+        }
+    }
+
+    private suspend fun updateThumbnail(id: String, thumbnail: String) {
+        context.savedStore.edit { prefs ->
+            val next = decode(prefs[SAVED_ITEMS_KEY]).map { saved ->
+                if (saved.id == id) saved.copy(thumbnail = thumbnail) else saved
             }
             prefs[SAVED_ITEMS_KEY] = json.encodeToString(next)
         }
