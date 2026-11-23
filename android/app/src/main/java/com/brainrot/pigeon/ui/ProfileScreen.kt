@@ -26,7 +26,6 @@ import com.brainrot.pigeon.R
 import com.brainrot.pigeon.data.PROFILE_PAGE_URL
 import com.brainrot.pigeon.ui.components.ProfileCard
 import com.brainrot.pigeon.ui.theme.TextMuted
-import com.brainrot.pigeon.ui.theme.TextPrimary
 import com.brainrot.pigeon.ui.util.openExternal
 
 @Composable
@@ -44,32 +43,29 @@ fun ProfileRoute(container: AppContainer) {
     val error by viewModel.error.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
+    // ما وصلت أي بيانات حقيقية بعد وما في خطأ: نعرض Skeleton.
+    val loading = profile.fetchedAt == 0L && error == null
+
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { viewModel.onForeground() }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 24.dp),
+            .padding(horizontal = 24.dp, vertical = 16.dp),
         contentAlignment = Alignment.Center,
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .widthIn(max = 430.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             ProfileCard(
                 profile = profile,
                 avatar = avatar,
+                loading = loading,
                 onAvatarLanded = viewModel::onAvatarLanded,
                 onAvatarClick = { openExternal(context, PROFILE_PAGE_URL) },
-            )
-
-            Text(
-                text = profile.bio.ifBlank { " " },
-                color = TextPrimary,
-                fontSize = 15.sp,
-                lineHeight = 20.sp,
-                modifier = Modifier.padding(top = 14.dp),
             )
 
             error?.let { reason ->
@@ -78,7 +74,9 @@ fun ProfileRoute(container: AppContainer) {
                     color = TextMuted,
                     fontSize = 12.sp,
                     lineHeight = 16.sp,
-                    modifier = Modifier.padding(top = 10.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 18.dp),
                 )
             }
         }

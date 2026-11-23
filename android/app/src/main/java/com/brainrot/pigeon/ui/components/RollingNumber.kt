@@ -23,6 +23,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
@@ -33,11 +34,14 @@ import java.text.NumberFormat
 import java.util.Locale
 
 private val rollEasing = CubicBezierEasing(0.22f, 0.61f, 0.36f, 1f)
-private const val DIGIT_HEIGHT_EM = 1.15f
+private const val DIGIT_HEIGHT_EM = 1.2f
 
 /**
  * نفس عداد الموقع: كل خانة رقم تتدحرج للرقم الجديد (فوق إذا زاد، تحت إذا نقص)،
  * وعند تغيّر عدد الخانات (999 ← 1,000) يعاد البناء مع أنيميشن pop خفيف.
+ *
+ * ارتفاع الخانة ثابت لكل رقم، وبدون font padding، حتى لا ينقصّ أي رقم من
+ * الأسفل أو تختفي خانات أثناء الحركة.
  */
 @Composable
 fun RollingNumber(
@@ -55,6 +59,7 @@ fun RollingNumber(
         fontWeight = fontWeight,
         color = TextPrimary,
         fontFeatureSettings = "tnum",
+        platformStyle = PlatformTextStyle(includeFontPadding = false),
     )
 
     val digitHeight = with(LocalDensity.current) { (fontSize.toPx() * DIGIT_HEIGHT_EM).toDp() }
@@ -112,9 +117,13 @@ private fun RollingDigit(digit: Int, digitHeight: Dp, style: TextStyle) {
         if (digit == current) return@LaunchedEffect
         upward = digit > current
         progress.snapTo(0f)
-        progress.animateTo(1f, tween(durationMillis = 720, easing = rollEasing))
+        try {
+            progress.animateTo(1f, tween(durationMillis = 720, easing = rollEasing))
+        } finally {
+            // حتى لو انقطعت الحركة بتحديث جديد، يبقى الرقم المعروض صحيحاً
+            current = digit
+        }
         // الترتيب مهم: نثبّت الرقم الجديد قبل ما نصفّر الحركة حتى ما تلمع خانة قديمة
-        current = digit
         progress.snapTo(0f)
     }
 

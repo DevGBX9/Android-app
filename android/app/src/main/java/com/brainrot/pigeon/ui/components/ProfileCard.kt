@@ -1,5 +1,11 @@
 package com.brainrot.pigeon.ui.components
 
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -17,14 +23,19 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -37,90 +48,189 @@ import com.brainrot.pigeon.data.Profile
 import com.brainrot.pigeon.ui.AvatarUiState
 import com.brainrot.pigeon.ui.theme.Bubble
 import com.brainrot.pigeon.ui.theme.BubbleText
+import com.brainrot.pigeon.ui.theme.TextMuted
 import com.brainrot.pigeon.ui.theme.TextPrimary
 
+private val ShimmerBase = Color(0xFF232A31)
+private val ShimmerHighlight = Color(0xFF3B454F)
+
+/**
+ * كرت الحساب: الببل + الصورة على اليسار، والاسم + البايو على اليمين، ثم صف
+ * الإحصائيات بعرض الكرت كامل حتى تأخذ كل خانة مساحتها ولا ينقصّ أي رقم.
+ * أثناء أول جلب تظهر أشرطة Skeleton متحركة بدل الأرقام.
+ */
 @Composable
 fun ProfileCard(
     profile: Profile,
     avatar: AvatarUiState,
+    loading: Boolean,
     onAvatarLanded: () -> Unit,
     onAvatarClick: () -> Unit,
 ) {
     BoxWithConstraints(Modifier.fillMaxWidth()) {
-        val compact = maxWidth < 380.dp
-        val tight = maxWidth < 340.dp
+        val compact = maxWidth < 360.dp
 
-        val avatarSize = if (compact) 78.dp else 88.dp
-        val valueSize = when {
-            tight -> 12.sp
-            compact -> 15.sp
-            else -> 17.sp
-        }
-        val statGap = when {
-            tight -> 10.dp
-            compact -> 20.dp
-            else -> 30.dp
-        }
+        val avatarSize = if (compact) 76.dp else 88.dp
         val nameSize = if (compact) 15.sp else 17.sp
+        val bioSize = if (compact) 13.sp else 14.sp
+        val statValueSize = if (compact) 15.sp else 17.sp
+        val statLabelSize = if (compact) 11.sp else 12.sp
+        val statGap = if (compact) 8.dp else 14.dp
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(24.dp),
-        ) {
-            Column(modifier = Modifier.width(avatarSize + 6.dp)) {
-                NoteBubble(
-                    width = avatarSize + 6.dp,
-                    minHeight = avatarSize * 0.57f,
-                )
-                Spacer(Modifier.height(6.dp))
-                Avatar(
-                    state = avatar,
-                    size = avatarSize,
-                    onLanded = onAvatarLanded,
-                    onClick = onAvatarClick,
-                )
+        Column(Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalAlignment = Alignment.Top,
+            ) {
+                Column(
+                    modifier = Modifier.width(avatarSize),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    NoteBubble(
+                        width = avatarSize,
+                        minHeight = avatarSize * 0.57f,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Avatar(
+                        state = avatar,
+                        size = avatarSize,
+                        onLanded = onAvatarLanded,
+                        onClick = onAvatarClick,
+                    )
+                }
+
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(top = 4.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = profile.username,
+                            color = TextPrimary,
+                            fontSize = nameSize,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                        VerifiedBadge(Modifier.size(17.dp))
+                    }
+
+                    Text(
+                        text = profile.bio.ifBlank { " " },
+                        color = TextPrimary,
+                        fontSize = bioSize,
+                        lineHeight = (bioSize.value + 5).sp,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
 
-            Column(
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(top = if (compact) 30.dp else 34.dp),
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    Text(
-                        text = profile.username,
-                        color = TextPrimary,
-                        fontSize = nameSize,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false),
-                    )
-                    VerifiedBadge(Modifier.size(17.dp))
-                }
+            Spacer(Modifier.height(22.dp))
 
-                Row(
-                    modifier = Modifier.padding(top = 18.dp),
-                    horizontalArrangement = Arrangement.spacedBy(statGap),
-                ) {
-                    StatColumn(value = profile.posts, label = "posts", valueSize = valueSize)
-                    StatColumn(value = profile.followers, label = "followers", valueSize = valueSize)
-                    StatColumn(value = profile.following, label = "following", valueSize = valueSize)
-                }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(statGap),
+            ) {
+                StatColumn(
+                    modifier = Modifier.weight(1f),
+                    value = profile.posts,
+                    label = "posts",
+                    loading = loading,
+                    valueSize = statValueSize,
+                    labelSize = statLabelSize,
+                )
+                StatColumn(
+                    modifier = Modifier.weight(1f),
+                    value = profile.followers,
+                    label = "followers",
+                    loading = loading,
+                    valueSize = statValueSize,
+                    labelSize = statLabelSize,
+                )
+                StatColumn(
+                    modifier = Modifier.weight(1f),
+                    value = profile.following,
+                    label = "following",
+                    loading = loading,
+                    valueSize = statValueSize,
+                    labelSize = statLabelSize,
+                )
             }
         }
     }
 }
 
 @Composable
-private fun StatColumn(value: Int?, label: String, valueSize: TextUnit) {
-    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        RollingNumber(value = value, fontSize = valueSize)
-        Text(text = label, color = TextPrimary, fontSize = valueSize, maxLines = 1, softWrap = false)
+private fun StatColumn(
+    modifier: Modifier,
+    value: Int?,
+    label: String,
+    loading: Boolean,
+    valueSize: TextUnit,
+    labelSize: TextUnit,
+) {
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Box(
+            modifier = Modifier.height(20.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (loading) {
+                ShimmerBar(width = 40.dp, height = 14.dp)
+            } else {
+                RollingNumber(value = value, fontSize = valueSize)
+            }
+        }
+        Text(
+            text = label,
+            color = TextMuted,
+            fontSize = labelSize,
+            maxLines = 1,
+            softWrap = false,
+        )
     }
+}
+
+/** شريط تحميل لامع يستخدم أثناء أول جلب للبيانات بدل الأرقام. */
+@Composable
+private fun ShimmerBar(width: Dp, height: Dp) {
+    val transition = rememberInfiniteTransition(label = "stat-skeleton")
+    val shift by transition.animateFloat(
+        initialValue = -1f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1100, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "stat-skeleton-shift",
+    )
+
+    val widthPx = with(LocalDensity.current) { width.toPx() }
+
+    Box(
+        modifier = Modifier
+            .width(width)
+            .height(height)
+            .clip(RoundedCornerShape(50))
+            .background(
+                Brush.linearGradient(
+                    colors = listOf(ShimmerBase, ShimmerHighlight, ShimmerBase),
+                    start = Offset(shift * widthPx * 2f, 0f),
+                    end = Offset(shift * widthPx * 2f + widthPx, 0f),
+                ),
+            ),
+    )
 }
 
 @Composable
@@ -131,14 +241,14 @@ private fun NoteBubble(width: Dp, minHeight: Dp) {
             .heightIn(min = minHeight)
             .clip(RoundedCornerShape(22.dp))
             .background(Bubble)
-            .padding(horizontal = 10.dp, vertical = 6.dp),
+            .padding(horizontal = 8.dp, vertical = 6.dp),
         contentAlignment = Alignment.Center,
     ) {
         Text(
             text = NOTE_TEXT,
             color = BubbleText,
-            fontSize = 15.sp,
-            lineHeight = 19.sp,
+            fontSize = 13.sp,
+            lineHeight = 17.sp,
             textAlign = TextAlign.Center,
             maxLines = 2,
         )

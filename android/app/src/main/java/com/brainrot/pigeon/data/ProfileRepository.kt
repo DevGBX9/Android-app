@@ -23,7 +23,9 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
-private val PROFILE_JSON_KEY = stringPreferencesKey("profile_json")
+// نسخة جديدة من المفتاح: نتجاهل أي كاش قديم كان يحمل الأرقام الافتراضية
+// (3099/48/5) حتى لا تظهر أبداً بعد التحديث.
+private val PROFILE_JSON_KEY = stringPreferencesKey("profile_json_v2")
 private const val MIN_REQUEST_GAP_MS = 20_000L
 private const val GRAPH_BASE = "https://graph.facebook.com"
 private const val GRAPH_VERSION = "v27.0"
