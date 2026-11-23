@@ -5,10 +5,10 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.lifecycle.lifecycleScope
-import com.brainrot.pigeon.AppTab
 import com.brainrot.pigeon.MainActivity
 import com.brainrot.pigeon.PigeonApp
 import com.brainrot.pigeon.R
+import com.brainrot.pigeon.ui.AppTab
 import kotlinx.coroutines.launch
 
 /**

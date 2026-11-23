@@ -136,17 +136,20 @@ fun Avatar(
         ) {
             Canvas(Modifier.size(9.dp)) {
                 val stroke = 1.8.dp.toPx()
+                // this.size هنا هو DrawScope.size، وليس معامل size المحيط
+                val canvasWidth = this.size.width
+                val canvasHeight = this.size.height
                 drawLine(
                     color = Background,
-                    start = Offset(0f, size.height / 2f),
-                    end = Offset(size.width, size.height / 2f),
+                    start = Offset(0f, canvasHeight / 2f),
+                    end = Offset(canvasWidth, canvasHeight / 2f),
                     strokeWidth = stroke,
                     cap = StrokeCap.Round,
                 )
                 drawLine(
                     color = Background,
-                    start = Offset(size.width / 2f, 0f),
-                    end = Offset(size.width / 2f, size.height),
+                    start = Offset(canvasWidth / 2f, 0f),
+                    end = Offset(canvasWidth / 2f, canvasHeight),
                     strokeWidth = stroke,
                     cap = StrokeCap.Round,
                 )
