@@ -28,8 +28,8 @@ private const val GRAPH_FIELDS =
     "id,username,name,profile_picture_url,biography,followers_count,follows_count,media_count"
 
 /**
- * يجيب بيانات الحساب مباشرة من Instagram Graph API بالتوكن اللي يدخله المستخدم
- * في الإعدادات (بدون بروكسي أو مفتاح وسيط).
+ * يجيب بيانات الحساب مباشرة من Instagram Graph API بالتوكن المدمج في البناء
+ * (بدون بروكسي أو مفتاح وسيط وبدون شاشة إعدادات).
  * - يبدأ ببيانات محفوظة على الجهاز (أو القيم الاحتياطية).
  * - يمنع تراكم الطلبات بـ Mutex + أقل فاصل زمني بين طلبين.
  * - يوقف نفسه إذا رفض Graph التوكن (401/403 أو رمز 190) بدل ما يضرب كل 30 ثانية،
@@ -71,7 +71,7 @@ class ProfileRepository(
             }
     }
 
-    /** يعيد التفعيل بعد تعديل التوكن أو الـ User ID من الإعدادات. */
+    /** يعيد تفعيل الطلبات بعد توقفها (يُستدعى عند كل عودة للتطبيق). */
     fun reset() {
         apiDisabled = false
         lastRequestAt = 0L

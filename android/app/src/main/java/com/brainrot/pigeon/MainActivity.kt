@@ -40,7 +40,6 @@ class MainActivity : ComponentActivity() {
         when (intent?.getStringExtra(EXTRA_TAB)) {
             AppTab.PROFILE.name -> AppTab.PROFILE
             AppTab.SAVED.name -> AppTab.SAVED
-            AppTab.SETTINGS.name -> AppTab.SETTINGS
             else -> null
         }
 

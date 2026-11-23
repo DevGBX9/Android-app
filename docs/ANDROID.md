@@ -20,7 +20,7 @@ Cloudflare R2 والـ API الحالي.
 | تحديث كل 30 ثانية + فاصل أدنى 20 ثانية | `ProfileViewModel` + `ProfileRepository` (Mutex + min gap) |
 | كاش آخر بيانات + قيم احتياطية | DataStore (`pigeon_profile`) + `Profile()` defaults |
 | أيقونة التبويب تتغير مع الصورة | لا مقابل مباشر على Android (أيقونة التطبيق ثابتة)، الصورة تتغير داخل التطبيق |
-| التوكن سيرفر-سايد في Cloudflare Worker | نفس الشيء: التطبيق يستدعي الـ Worker فقط، لا مفاتيح داخل APK |
+| التوكن سيرفر-سايد في Cloudflare Worker | التطبيق يستدعي Instagram Graph API مباشرة بتوكن مدمج في البناء |
 
 العداد في Compose لا يستخدم WebView أو HTML: كل خانة رقم عبارة عن عمود من خليتين
 ينزلق بـ `graphicsLayer.translationY`، وعند تغيّر عدد الخانات يُعاد البناء مع أنيميشن pop
@@ -33,7 +33,7 @@ android/
   app/src/main/java/com/brainrot/pigeon/
     AppContainer.kt          # تجميع التبعيات (OkHttp، DataStore، المستودعات)
     MainActivity.kt          # نقطة الدخول + التبويبات + onNewIntent
-    data/                    # Profile, ProfileRepository, Settings, Saved, AvatarLoader, R2Uploader
+    data/                    # Profile, ProfileRepository, Settings (قيم ثابتة), Saved, AvatarLoader, R2Uploader
     share/                   # ShareParser, ShareIntake, ShareReceiverActivity
     ui/                      # الشاشات + ViewModels + components + theme
   app/src/test/              # اختبارات JVM لمحلل الروابط (تعمل على CI)
@@ -78,11 +78,13 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```properties
 sdk.dir=C:\\Users\\<you>\\AppData\\Local\\Android\\Sdk
 pigeon.igUserId=17841438848736931
+pigeon.igAccessToken=<اختياري: تجاوز التوكن المدمج>
 pigeon.r2UploadEndpoint=
 ```
 
-**التوكن لا يُكتب في أي ملف بالمستودع**: تلصقه داخل التطبيق في تبويب
-**الإعدادات** ويُخزَّن في DataStore على الجهاز فقط.
+**توكن إنستغرام مدمج في البناء** عبر `BuildConfig.DEFAULT_IG_ACCESS_TOKEN`
+(قيمته الافتراضية في `android/app/build.gradle.kts`)، ولا توجد شاشة إعدادات
+لتعديله. هذا مقصود لأن التطبيق شخصي للاستخدام الخاص.
 
 ## 4. GitHub Actions (البناء الفعلي)
 
@@ -194,14 +196,15 @@ GET https://graph.facebook.com/v27.0/{IG_USER_ID}
     &access_token={ACCESS_TOKEN}
 ```
 
-- `IG_USER_ID` الافتراضي `17841438848736931`، ويُعدَّل من الإعدادات أو
-  `pigeon.igUserId` في `local.properties`.
-- `ACCESS_TOKEN` يُلصق في تبويب **الإعدادات** ويُخزَّن في DataStore على الجهاز
-  فقط؛ لا يدخل المستودع ولا يُضمَّن في الـ APK.
+- `IG_USER_ID` ثابت `17841438848736931`، ويُمكن تجاوزه بـ `pigeon.igUserId`
+  في `local.properties` وقت البناء فقط.
+- `ACCESS_TOKEN` مدمج في الـ APK (`BuildConfig.DEFAULT_IG_ACCESS_TOKEN`) عبر
+  `pigeon.igAccessToken` أو القيمة الافتراضية في `build.gradle.kts`؛ لا توجد
+  شاشة إعدادات ولا يمكن تعديله من داخل التطبيق.
 - الحقول المقروءة: `username`, `biography`, `media_count`, `followers_count`,
   `follows_count`, `profile_picture_url`.
-- عند 401/403 أو رمز الخطأ 190 يتوقف التحديث التلقائي حتى يعدّل المستخدم
-  التوكن من الإعدادات (يُعاد التفعيل تلقائياً عند العودة لشاشة الحساب).
+- عند 401/403 أو رمز الخطأ 190 يتوقف التحديث التلقائي، ويُعاد التفعيل
+  تلقائياً عند كل عودة للتطبيق (إن كان التوكن ما زال صالحاً).
 
 ## 8. ما الذي تم التحقق منه فعلياً وما لم يُتحقق
 

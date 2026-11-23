@@ -5,11 +5,7 @@
 
     <string name="tab_profile">الملف</string>
     <string name="tab_saved">المحفوظات</string>
-    <string name="tab_settings">الإعدادات</string>
     <string name="action_back">رجوع</string>
-
-    <string name="profile_setup_body">أضف Access Token وInstagram User ID من الإعدادات لعرض أرقام الحساب الحقيقية.</string>
-    <string name="profile_setup_cta">افتح الإعدادات</string>
 
     <string name="saved_empty_title">ما في شي محفوظ بعد</string>
     <string name="saved_empty_body">شارك رابط Reel أو فيديو TikTok من تطبيق إنستغرام أو TikTok واختَر brainrot.pigeon، ورح ينحفظ هون.</string>
@@ -27,19 +23,6 @@
     <string name="share_saved_one">تم الحفظ في brainrot.pigeon</string>
     <string name="share_saved_many">تم حفظ %1$d عناصر في brainrot.pigeon</string>
     <string name="share_nothing">ما لقيت رابط أو ملف صالح باللي انشارك</string>
-
-    <string name="settings_title">الإعدادات</string>
-    <string name="settings_ig_user">Instagram User ID</string>
-    <string name="settings_ig_user_hint">17841438848736931</string>
-    <string name="settings_token">Access Token</string>
-    <string name="settings_token_help">التوكن من Meta for Developers (صلاحية instagram_basic). يُحفظ على جهازك فقط، ويُرسل مباشرة إلى graph.facebook.com بدون أي وسيط.</string>
-    <string name="settings_r2_section">رفع الملفات إلى R2 (اختياري)</string>
-    <string name="settings_r2">عنوان رفع R2</string>
-    <string name="settings_r2_hint">https://example.workers.dev/r2/upload</string>
-    <string name="settings_r2_token">توكن رفع R2 (اختياري)</string>
-    <string name="settings_save">حفظ</string>
-    <string name="settings_saved">تم الحفظ</string>
-    <string name="settings_note">أسرار R2 الأفضل تبقى في Worker سيرفر-سايد. التوكن أعلاه يخص إنستغرام فقط ويبقى على الجهاز.</string>
 
     <string name="action_open_profile">فتح حساب إنستغرام</string>
     <string name="action_refresh">تحديث</string>

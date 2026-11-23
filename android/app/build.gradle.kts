@@ -33,13 +33,19 @@ android {
         applicationId = "com.brainrot.pigeon"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.2.0"
 
         buildConfigField(
             "String",
             "DEFAULT_IG_USER_ID",
             "\"${configValue("pigeon.igUserId", "17841438848736931")}\""
+        )
+        // توكن مدمج ثابت: التطبيق شخصي ولا توجد شاشة إعدادات لتعديله.
+        buildConfigField(
+            "String",
+            "DEFAULT_IG_ACCESS_TOKEN",
+            "\"${configValue("pigeon.igAccessToken", "EAAXjGpto53wBTMVsnQQjeqVKWIWJAHfYmP5ZCaER1rsBNPBTK6ZCeNYucqtRP7ASlX8fWNpZBlrO8S1BxvxdBfnm1Uh77lLfCb3WfTft9qLWTgqYeVHPXfILry76ZAydMnijMCoWIqPuRq4DeU1HoMZBoJ4BlDAympi76NQURbegHL6z6nL8CHjINNYRiJEG7WZAitoK2UHQ3STPAdiUZAHgcMTo3u1OgPZBiVqMGVZAA4HNncrf1YgZDZD")}\""
         )
         buildConfigField(
             "String",

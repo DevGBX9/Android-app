@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.List
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Scaffold
@@ -39,12 +38,11 @@ import com.brainrot.pigeon.ui.theme.TextPrimary
 enum class AppTab(val labelRes: Int) {
     PROFILE(R.string.tab_profile),
     SAVED(R.string.tab_saved),
-    SETTINGS(R.string.tab_settings),
 }
 
 /**
- * بدون شريط تنقل سفلي: شاشة الحساب هي الأساس، وأزرار صغيرة أعلى اليمين
- * للمحفوظات والإعدادات، وسهم رجوع داخل الشاشتين.
+ * بدون شريط تنقل سفلي وبدون شاشة إعدادات: شاشة الحساب هي الأساس، وأيقونة واحدة
+ * أعلى اليمين للمحفوظات، وسهم رجوع داخل شاشة المحفوظات.
  */
 @Composable
 fun PigeonRoot(container: AppContainer, requestedTab: AppTab) {
@@ -52,14 +50,7 @@ fun PigeonRoot(container: AppContainer, requestedTab: AppTab) {
 
     LaunchedEffect(requestedTab) { tab = requestedTab }
 
-    // نرجّع التحديث عند العودة للحساب (مثلاً بعد حفظ توكن جديد).
-    LaunchedEffect(tab) {
-        if (tab == AppTab.PROFILE) {
-            container.profile.reset()
-            runCatching { container.profile.refresh(minGapMs = 0L) }
-        }
-    }
-
+    // عند العودة إلى شاشة الحساب لا نوقف التحديث: التوكن مدمج وثابت.
     BackHandler(enabled = tab != AppTab.PROFILE) { tab = AppTab.PROFILE }
 
     Scaffold(
@@ -78,12 +69,8 @@ fun PigeonRoot(container: AppContainer, requestedTab: AppTab) {
                 .padding(padding),
         ) {
             when (tab) {
-                AppTab.PROFILE -> ProfileRoute(
-                    container = container,
-                    onOpenSettings = { tab = AppTab.SETTINGS },
-                )
+                AppTab.PROFILE -> ProfileRoute(container)
                 AppTab.SAVED -> SavedRoute(container)
-                AppTab.SETTINGS -> SettingsRoute(container)
             }
         }
     }
@@ -128,13 +115,6 @@ private fun TopActions(
                 Icon(
                     imageVector = Icons.Filled.List,
                     contentDescription = stringResource(R.string.tab_saved),
-                    tint = TextMuted,
-                )
-            }
-            IconButton(onClick = { onOpen(AppTab.SETTINGS) }) {
-                Icon(
-                    imageVector = Icons.Filled.Settings,
-                    contentDescription = stringResource(R.string.tab_settings),
                     tint = TextMuted,
                 )
             }
