@@ -92,15 +92,17 @@ class ProfileViewModel(
         }
     }
 
-    /** تحديث فوري عند رجوع التطبيق للواجهة، مع احترام أقل فاصل بين الطلبات. */
+    /** تحديث فوري عند رجوع التطبيق للواجهة (فاصل ثانية واحدة فقط لمنع التكرار). */
     fun onForeground() {
         // نعيد تفعيل الطلبات عند كل عودة للتطبيق حتى لو رفض Graph التوكن سابقاً.
         repository.reset()
-        viewModelScope.launch { repository.refresh(minGapMs = 3_000L) }
+        viewModelScope.launch { repository.refresh(minGapMs = FOREGROUND_MIN_GAP_MS) }
     }
 
     companion object {
-        const val REFRESH_INTERVAL_MS = 30_000L
-        const val RETRY_INTERVAL_MS = 10_000L
+        // تحديث شبه لحظي: الدورات كل 5 ثوانٍ بدل 30، والإعادة عند الفشل فوراً تقريباً.
+        const val REFRESH_INTERVAL_MS = 5_000L
+        const val RETRY_INTERVAL_MS = 5_000L
+        const val FOREGROUND_MIN_GAP_MS = 1_000L
     }
 }

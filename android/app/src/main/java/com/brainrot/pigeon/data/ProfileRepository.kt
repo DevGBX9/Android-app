@@ -5,11 +5,17 @@ import android.util.Log
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import java.io.IOException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -26,7 +32,9 @@ import okhttp3.Request
 // نسخة جديدة من المفتاح: نتجاهل أي كاش قديم كان يحمل الأرقام الافتراضية
 // (3099/48/5) حتى لا تظهر أبداً بعد التحديث.
 private val PROFILE_JSON_KEY = stringPreferencesKey("profile_json_v2")
-private const val MIN_REQUEST_GAP_MS = 20_000L
+// تحديث شبه لحظي: فحص كل 5 ثوانٍ، وأقل فاصل حقيقي بين طلبين ثانيتان.
+private const val MIN_REQUEST_GAP_MS = 2_000L
+private const val GRAPH_HEAD_START_MS = 1_200L
 private const val GRAPH_BASE = "https://graph.facebook.com"
 private const val GRAPH_VERSION = "v27.0"
 private const val GRAPH_FIELDS =
@@ -65,6 +73,11 @@ class ProfileRepository(
     private val mutex = Mutex()
     private var lastRequestAt = 0L
     private var cacheLoaded = false
+    private var lastPersisted: Profile? = null
+
+    // طلبات السباق تعمل خارج نطاق الـ ViewModel: الخاسر يُلغى في الخلفية بدل
+    // إبقاء المستخدم منتظراً اتصالاً لا يهمّه.
+    private val liveScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
     var apiDisabled: Boolean = false
@@ -80,6 +93,7 @@ class ProfileRepository(
 
         runCatching { json.decodeFromString<Profile>(raw) }
             .onSuccess { cached ->
+                lastPersisted = cached
                 if (_profile.value.fetchedAt == 0L) _profile.value = cached
             }
     }
@@ -107,22 +121,22 @@ class ProfileRepository(
             }
             lastRequestAt = now
 
-            val direct = runCatching { fetchGraph(config) }
-            direct.getOrNull()?.let { return@withLock publish(it) }
-
-            val directError = direct.exceptionOrNull()
-            Log.w(LOG_TAG, "graph.facebook.com failed: ${directError?.message}", directError)
-
-            val proxied = runCatching { fetchViaProxy(config) }
-            proxied.getOrNull()?.let {
-                Log.i(LOG_TAG, "profile loaded through worker proxy")
-                return@withLock publish(it)
+            val outcome = fetchLive(config)
+            outcome.profile?.let { fresh ->
+                if (outcome.viaProxy) Log.i(LOG_TAG, "profile loaded through worker proxy")
+                return@withLock publish(fresh)
             }
 
-            val proxyError = proxied.exceptionOrNull()
-            Log.w(LOG_TAG, "worker proxy failed: ${proxyError?.message}", proxyError)
+            val directError = outcome.directError
+            val proxyError = outcome.proxyError
+            if (directError != null) {
+                Log.w(LOG_TAG, "graph.facebook.com failed: ${directError.message}", directError)
+            }
+            if (proxyError != null) {
+                Log.w(LOG_TAG, "worker proxy failed: ${proxyError.message}", proxyError)
+            }
 
-            // التوكن نفسه مرفوض من Graph: نوقف المحاولات حتى العودة للتطبيق.
+            // التوكن نفسه مرفوض من المصدرين: نوقف المحاولات حتى العودة للتطبيق.
             if ((directError as? GraphCallError)?.authFailed == true &&
                 (proxyError as? GraphCallError)?.authFailed == true
             ) {
@@ -132,6 +146,54 @@ class ProfileRepository(
             _error.value = shorten(directError ?: proxyError)
             Result.failure(directError ?: proxyError ?: IllegalStateException("unknown"))
         }
+
+    /**
+     * سباق بين المسارين بدل الانتظار التسلسلي: البروكسي (Cloudflare edge) يبدأ
+     * فوراً، وGraph مباشرة تنطلق بعده بمهلة قصيرة فقط إذا لم يصل رد. أول رد
+     * ناجح يُعرض فوراً، والخاسر يُلغى في الخلفية.
+     */
+    private suspend fun fetchLive(config: AppSettings): LiveOutcome {
+        val results = Channel<PathResult>(Channel.UNLIMITED)
+        val jobs: List<Job> = listOf(
+            liveScope.launch {
+                results.trySend(
+                    PathResult(proxy = true, result = runCatching { fetchViaProxy(config) })
+                )
+            },
+            liveScope.launch {
+                delay(GRAPH_HEAD_START_MS)
+                results.trySend(
+                    PathResult(proxy = false, result = runCatching { fetchGraph(config) })
+                )
+            },
+        )
+
+        var profile: Profile? = null
+        var viaProxy = false
+        var proxyError: Throwable? = null
+        var directError: Throwable? = null
+
+        try {
+            repeat(2) {
+                if (profile != null) return@repeat
+                val path = results.receive()
+                val value = path.result.getOrNull()
+                if (value != null) {
+                    profile = value
+                    viaProxy = path.proxy
+                } else if (path.proxy) {
+                    proxyError = path.result.exceptionOrNull()
+                } else {
+                    directError = path.result.exceptionOrNull()
+                }
+            }
+        } finally {
+            jobs.forEach { it.cancel() }
+            results.close()
+        }
+
+        return LiveOutcome(profile, viaProxy, directError, proxyError)
+    }
 
     private suspend fun publish(fresh: Profile): Result<Profile> {
         _profile.value = fresh
@@ -214,6 +276,12 @@ class ProfileRepository(
         }
 
     private suspend fun persist(profile: Profile) {
+        // مع التحديث السريع نكتب على القرص فقط لما تتغير قيمة فعلية.
+        val previous = lastPersisted
+        if (previous != null && previous.copy(fetchedAt = 0L) == profile.copy(fetchedAt = 0L)) {
+            return
+        }
+        lastPersisted = profile
         runCatching {
             context.profileStore.edit { prefs ->
                 prefs[PROFILE_JSON_KEY] = json.encodeToString(profile)
@@ -239,6 +307,15 @@ class ProfileRepository(
 }
 
 private class GraphCallError(message: String, val authFailed: Boolean) : IOException(message)
+
+private data class PathResult(val proxy: Boolean, val result: Result<Profile>)
+
+private data class LiveOutcome(
+    val profile: Profile?,
+    val viaProxy: Boolean,
+    val directError: Throwable?,
+    val proxyError: Throwable?,
+)
 
 @Serializable
 private data class GraphProfileDto(
