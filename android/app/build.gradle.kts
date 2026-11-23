@@ -33,8 +33,8 @@ android {
         applicationId = "com.brainrot.pigeon"
         minSdk = 26
         targetSdk = 35
-        versionCode = 9
-        versionName = "1.4.3"
+        versionCode = 10
+        versionName = "1.5.0"
 
         buildConfigField(
             "String",
@@ -52,6 +52,12 @@ android {
             "String",
             "DEFAULT_API_ENDPOINT",
             "\"${configValue("pigeon.apiEndpoint", "https://brainrot-pigeon-api.brainrotpigeon.workers.dev/")}\""
+        )
+        // قاعدة بيانات الريلز المجدولة (Firebase Realtime Database) — قراءة/كتابة REST.
+        buildConfigField(
+            "String",
+            "DEFAULT_FIREBASE_DB",
+            "\"${configValue("pigeon.firebaseDb", "https://brainrotpigeon67-default-rtdb.europe-west1.firebasedatabase.app")}\""
         )
         buildConfigField(
             "String",

@@ -3,9 +3,10 @@ package com.brainrot.pigeon.data
 import kotlinx.serialization.Serializable
 
 /**
- * عنصر محفوظ وصل عن طريق Share Sheet (رابط Reel/TikTok أو ملف وسائط).
- * إذا كان ملفاً ننسخه إلى مساحة التطبيق الخاصة لأن صلاحية الـ Uri من
- * التطبيق المُرسل مؤقتة وتنتهي بعد إنهاء العملية.
+ * عنصر مجدول وصل عن طريق Share Sheet (رابط Reel/TikTok أو ملف وسائط).
+ *
+ * [registered] يعني أن السجل مرفوع ومحفوظ فعلاً في قائمة Firebase الخاصة
+ * بالتطبيق؛ يصير true بعد نجاح الرفع أو بعد سحبه من قاعدة البيانات.
  */
 @Serializable
 data class SavedItem(
@@ -18,5 +19,6 @@ data class SavedItem(
     val fileName: String? = null,
     val mimeType: String? = null,
     val remoteUrl: String? = null,
+    val registered: Boolean = false,
     val createdAt: Long = 0L,
 )

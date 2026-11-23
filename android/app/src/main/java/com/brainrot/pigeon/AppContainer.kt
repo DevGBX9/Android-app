@@ -2,11 +2,15 @@ package com.brainrot.pigeon
 
 import android.content.Context
 import com.brainrot.pigeon.data.AvatarLoader
+import com.brainrot.pigeon.data.FirebaseReels
 import com.brainrot.pigeon.data.ProfileRepository
 import com.brainrot.pigeon.data.R2Uploader
 import com.brainrot.pigeon.data.SavedRepository
 import com.brainrot.pigeon.data.SettingsRepository
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import okhttp3.OkHttpClient
 
 /**
@@ -23,8 +27,12 @@ class AppContainer(context: Context) {
         .readTimeout(9, TimeUnit.SECONDS)
         .build()
 
+    // أعمال خلفية تعيش مع التطبيق: رفع الريلز بعد المشاركة لا يُلغى بإغلاق الشاشة.
+    private val workScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     val settings = SettingsRepository(appContext)
-    val saved = SavedRepository(appContext)
+    val reels = FirebaseReels(httpClient, BuildConfig.DEFAULT_FIREBASE_DB)
+    val saved = SavedRepository(appContext, reels, workScope)
     val avatars = AvatarLoader(httpClient)
     val profile = ProfileRepository(appContext, settings, httpClient)
     val uploader = R2Uploader(httpClient)

@@ -1,34 +1,44 @@
 package com.brainrot.pigeon.ui
 
 import android.content.Context
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -36,7 +46,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
@@ -44,240 +53,208 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.brainrot.pigeon.AppContainer
 import com.brainrot.pigeon.R
 import com.brainrot.pigeon.data.SavedItem
-import com.brainrot.pigeon.ui.theme.Bubble
-import com.brainrot.pigeon.ui.theme.CardSurface
+import com.brainrot.pigeon.ui.theme.Accent
+import com.brainrot.pigeon.ui.theme.Outline
 import com.brainrot.pigeon.ui.theme.TextMuted
 import com.brainrot.pigeon.ui.theme.TextPrimary
 import com.brainrot.pigeon.ui.util.openExternal
-import com.brainrot.pigeon.ui.util.openUri
-import com.brainrot.pigeon.ui.util.shareFile
-import com.brainrot.pigeon.ui.util.shareText
 import com.brainrot.pigeon.ui.util.toast
-import java.io.File
-import java.time.Instant
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
-import java.util.Locale
 
-private val savedTimeFormatter =
-    DateTimeFormatter.ofPattern("d MMM · HH:mm", Locale.forLanguageTag("ar"))
+private val CellTop = Color(0xFF1C232B)
+private val CellBottom = Color(0xFF0F141A)
 
+/**
+ * صفحة الريلز: شريط أيقونة الشبكة مثل إنستغرام ثم شبكة ثلاثية الخانات.
+ * كل ريل مجدول يُفتح بالضغط عليه.
+ */
 @Composable
-fun SavedRoute(container: AppContainer) {
+fun ReelsRoute(container: AppContainer) {
     val viewModel: SavedViewModel = viewModel(
         factory = viewModelFactory {
-            initializer {
-                SavedViewModel(container.saved, container.settings, container.uploader)
-            }
+            initializer { SavedViewModel(container.saved) }
         },
     )
-
     val items by viewModel.items.collectAsStateWithLifecycle()
-    val busyId by viewModel.busyId.collectAsStateWithLifecycle()
     val context = LocalContext.current
-    val snackbar = remember { SnackbarHostState() }
 
-    LaunchedEffect(viewModel) {
-        viewModel.messages.collect { message -> snackbar.showSnackbar(message) }
-    }
+    Column(
+        Modifier
+            .fillMaxSize()
+            .statusBarsPadding(),
+    ) {
+        ReelsHeader()
+        HorizontalDivider(color = Outline, thickness = 1.dp)
 
-    Box(Modifier.fillMaxSize()) {
         if (items.isEmpty()) {
-            Column(
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .padding(28.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                Text(
-                    text = stringResource(R.string.saved_empty_title),
-                    color = TextPrimary,
-                    fontSize = 17.sp,
-                    fontWeight = FontWeight.SemiBold,
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = stringResource(R.string.saved_empty_body),
-                    color = TextMuted,
-                    fontSize = 14.sp,
-                    lineHeight = 21.sp,
-                    textAlign = TextAlign.Center,
-                )
-            }
+            EmptyReels(Modifier.weight(1f))
         } else {
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 24.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(3),
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .navigationBarsPadding(),
+                contentPadding = PaddingValues(2.dp),
+                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
-                item {
-                    Text(
-                        text = stringResource(R.string.saved_count, items.size),
-                        color = TextMuted,
-                        fontSize = 13.sp,
-                        modifier = Modifier.padding(bottom = 2.dp),
-                    )
-                }
-
                 items(items, key = { it.id }) { item ->
-                    SavedRow(
-                        item = item,
-                        busy = busyId == item.id,
-                        onOpen = { openSaved(context, item) },
-                        onShare = { shareSaved(context, item) },
-                        onUpload = { viewModel.upload(item) },
-                        onDelete = { viewModel.delete(item.id) },
-                    )
+                    ReelCell(item = item, onClick = { openReel(context, item) })
                 }
             }
         }
+    }
+}
 
-        SnackbarHost(
-            hostState = snackbar,
+@Composable
+private fun ReelsHeader() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 9.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            GridGlyph(color = TextPrimary, modifier = Modifier.size(22.dp))
+            Spacer(Modifier.height(7.dp))
+            Box(
+                Modifier
+                    .width(54.dp)
+                    .height(1.dp)
+                    .background(TextPrimary),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReelCell(item: SavedItem, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .aspectRatio(1f)
+            .clip(RoundedCornerShape(3.dp))
+            .background(Brush.linearGradient(listOf(CellTop, CellBottom)))
+            .clickable(onClick = onClick),
+    ) {
+        ReelGlyph(
+            color = TextMuted.copy(alpha = 0.7f),
             modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(12.dp),
+                .align(Alignment.Center)
+                .size(26.dp),
+        )
+
+        if (item.registered) {
+            Icon(
+                imageVector = Icons.Filled.Check,
+                contentDescription = stringResource(R.string.reels_registered),
+                tint = Accent,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(5.dp)
+                    .size(13.dp),
+            )
+        }
+
+        Text(
+            text = reelLabel(item),
+            color = TextMuted,
+            fontSize = 9.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(horizontal = 6.dp, vertical = 5.dp),
         )
     }
 }
 
 @Composable
-private fun SavedRow(
-    item: SavedItem,
-    busy: Boolean,
-    onOpen: () -> Unit,
-    onShare: () -> Unit,
-    onUpload: () -> Unit,
-    onDelete: () -> Unit,
-) {
-    Card(
-        shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = CardSurface),
+private fun EmptyReels(modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 34.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                PlatformChip(platform = item.platform)
-                Spacer(Modifier.weight(1f))
-                Text(
-                    text = formatTime(item.createdAt),
-                    color = TextMuted,
-                    fontSize = 11.sp,
+        ReelGlyph(color = TextMuted, modifier = Modifier.size(34.dp))
+        Spacer(Modifier.height(14.dp))
+        Text(
+            text = stringResource(R.string.reels_empty_title),
+            color = TextPrimary,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Spacer(Modifier.height(7.dp))
+        Text(
+            text = stringResource(R.string.reels_empty_body),
+            color = TextMuted,
+            fontSize = 13.sp,
+            lineHeight = 20.sp,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+/** أيقونة شبكة ٣×٣ مرسومة، حتى لا نحتاج مكتبة أيقونات إضافية. */
+@Composable
+private fun GridGlyph(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val cell = size.minDimension / 3f
+        val gap = cell * 0.16f
+
+        for (row in 0..2) {
+            for (column in 0..2) {
+                drawRect(
+                    color = color,
+                    topLeft = Offset(column * cell + gap / 2f, row * cell + gap / 2f),
+                    size = Size(cell - gap, cell - gap),
                 )
-            }
-
-            Text(
-                text = item.title ?: item.url ?: item.fileName
-                ?: stringResource(R.string.saved_link_only),
-                color = TextPrimary,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-
-            if (item.remoteUrl != null) {
-                Text(
-                    text = stringResource(R.string.saved_uploaded),
-                    color = TextMuted,
-                    fontSize = 11.sp,
-                )
-            }
-
-            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-                SavedAction(stringResource(R.string.saved_open), onOpen)
-                SavedAction(stringResource(R.string.saved_share), onShare)
-
-                if (busy) {
-                    CircularProgressIndicator(
-                        modifier = Modifier
-                            .padding(horizontal = 10.dp)
-                            .size(16.dp),
-                        color = TextPrimary,
-                        strokeWidth = 2.dp,
-                    )
-                } else {
-                    SavedAction(stringResource(R.string.saved_upload), onUpload)
-                }
-
-                SavedAction(stringResource(R.string.saved_delete), onDelete)
             }
         }
     }
 }
 
+/** أيقونة ريل: مستطيل بزوايا دائرية بداخله مثلث تشغيل. */
 @Composable
-private fun PlatformChip(platform: String) {
-    val label = when (platform) {
-        "instagram" -> "Instagram"
-        "tiktok" -> "TikTok"
-        "video", "file" -> stringResource(R.string.saved_file)
-        else -> stringResource(R.string.saved_link_only)
-    }
+fun ReelGlyph(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val side = size.minDimension
+        val stroke = side * 0.08f
 
-    Text(
-        text = label,
-        color = TextPrimary,
-        fontSize = 11.sp,
-        modifier = Modifier
-            .background(Bubble, RoundedCornerShape(50))
-            .padding(horizontal = 9.dp, vertical = 4.dp),
-    )
-}
+        drawRoundRect(
+            color = color,
+            cornerRadius = CornerRadius(side * 0.24f),
+            style = Stroke(stroke),
+        )
 
-@Composable
-private fun SavedAction(text: String, onClick: () -> Unit) {
-    TextButton(
-        onClick = onClick,
-        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-    ) {
-        Text(text = text, color = TextPrimary, fontSize = 12.sp)
-    }
-}
-
-private fun formatTime(epochMillis: Long): String {
-    if (epochMillis <= 0L) return ""
-    return runCatching {
-        Instant.ofEpochMilli(epochMillis)
-            .atZone(ZoneId.systemDefault())
-            .format(savedTimeFormatter)
-    }.getOrDefault("")
-}
-
-private fun openSaved(context: Context, item: SavedItem) {
-    val file = item.filePath?.let(::File)
-
-    if (file != null && file.isFile) {
-        runCatching {
-            FileProvider.getUriForFile(context, "${context.packageName}.files", file)
-        }.getOrNull()?.let { uri ->
-            if (openUri(context, uri)) return
+        val play = Path().apply {
+            moveTo(side * 0.38f, side * 0.30f)
+            lineTo(side * 0.72f, side * 0.50f)
+            lineTo(side * 0.38f, side * 0.70f)
+            close()
         }
-    }
 
+        drawPath(play, color)
+    }
+}
+
+private fun reelLabel(item: SavedItem): String {
+    val code = item.url
+        ?.trimEnd('/')
+        ?.substringAfterLast('/')
+        ?.takeIf { it.isNotBlank() }
+
+    return code ?: item.title?.takeIf { it.isNotBlank() } ?: item.platform
+}
+
+private fun openReel(context: Context, item: SavedItem) {
     val url = item.url ?: item.remoteUrl
-    if (url != null) {
-        if (!openExternal(context, url)) {
-            toast(context, context.getString(R.string.saved_no_app))
-        }
-    } else {
+    if (url == null) {
         toast(context, context.getString(R.string.saved_no_content))
+        return
     }
-}
-
-private fun shareSaved(context: Context, item: SavedItem) {
-    val file = item.filePath?.let(::File)
-
-    if (file != null && file.isFile) {
-        shareFile(context, file, item.mimeType)
-    } else {
-        item.url?.let { shareText(context, it) }
+    if (!openExternal(context, url)) {
+        toast(context, context.getString(R.string.saved_no_app))
     }
 }

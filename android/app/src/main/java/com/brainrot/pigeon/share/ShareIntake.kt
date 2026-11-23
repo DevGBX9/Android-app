@@ -15,51 +15,58 @@ import kotlinx.coroutines.withContext
 private const val MAX_SHARED_FILE_BYTES = 150L * 1024 * 1024
 
 /**
- * يحوّل محتوى Intent المشاركة إلى عناصر محفوظة:
+ * يحوّل محتوى Intent المشاركة إلى عناصر مجدولة:
  * نص فيه رابط، ملف واحد، عدة ملفات، أو رابط تم فتحه مباشرة.
+ *
+ * يعيد عناوين ما أُضيف فعلاً حتى تعرض النافذة الطافية اسم الريل.
  */
 class ShareIntake(
     private val context: Context,
     private val saved: SavedRepository,
 ) {
 
-    suspend fun handle(intent: Intent?): Int = withContext(Dispatchers.IO) {
-        if (intent == null) return@withContext 0
+    suspend fun handle(intent: Intent?): List<String> = withContext(Dispatchers.IO) {
+        if (intent == null) return@withContext emptyList()
 
-        var count = 0
+        val added = mutableListOf<String>()
         val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
 
         when (intent.action) {
             Intent.ACTION_SEND -> {
                 ShareParser.fromText(sharedText)?.let { target ->
                     saved.add(target.toSavedItem())
-                    count++
+                    added += target.title
                 }
-                intent.singleStream()?.let { uri -> if (saveFile(uri)) count++ }
+                intent.singleStream()?.let { uri ->
+                    saveFile(uri)?.let { added += it }
+                }
             }
 
             Intent.ACTION_SEND_MULTIPLE -> {
                 ShareParser.fromText(sharedText)?.let { target ->
                     saved.add(target.toSavedItem())
-                    count++
+                    added += target.title
                 }
-                intent.allStreams().forEach { uri -> if (saveFile(uri)) count++ }
+                intent.allStreams().forEach { uri ->
+                    saveFile(uri)?.let { added += it }
+                }
             }
 
             Intent.ACTION_VIEW -> {
                 intent.dataString?.let { raw ->
                     ShareParser.classify(raw)?.let { target ->
                         saved.add(target.toSavedItem())
-                        count++
+                        added += target.title
                     }
                 }
             }
         }
 
-        count
+        added
     }
 
-    private suspend fun saveFile(uri: Uri): Boolean = withContext(Dispatchers.IO) {
+    /** يعيد عنوان الملف بعد نسخه، أو null إذا فشل. */
+    private suspend fun saveFile(uri: Uri): String? = withContext(Dispatchers.IO) {
         var target: File? = null
         try {
             val resolver = context.contentResolver
@@ -101,10 +108,10 @@ class ShareIntake(
                     createdAt = System.currentTimeMillis(),
                 ),
             )
-            true
+            displayName
         } catch (_: Exception) {
             target?.delete()
-            false
+            null
         }
     }
 

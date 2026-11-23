@@ -18,6 +18,8 @@ val BubbleText = Color(0xFFC9CED3)
 val TextPrimary = Color(0xFFF5F5F5)
 val TextMuted = Color(0xFF8C9298)
 val Outline = Color(0xFF2E353C)
+// لون إنستغرام المستخدم في شارة التسجيل وأيقونة نافذة المشاركة.
+val Accent = Color(0xFFE1306C)
 
 @Composable
 fun PigeonTheme(content: @Composable () -> Unit) {

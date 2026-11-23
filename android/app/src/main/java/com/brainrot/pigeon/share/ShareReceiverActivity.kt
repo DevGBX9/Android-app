@@ -12,8 +12,8 @@ import com.brainrot.pigeon.ui.AppTab
 import kotlinx.coroutines.launch
 
 /**
- * شاشة شفافة بلا واجهة: تستقبل المشاركة، تحفظها، تفتح التطبيق على تبويب
- * المحفوظات، وتنتهي فوراً.
+ * شاشة شفافة بلا واجهة: تستقبل المشاركة، تحفظها، تفتح التطبيق على شبكة
+ * الريلز مع النافذة الطافية «تم اضافة الريل للقائمة»، وتنتهي فوراً.
  */
 class ShareReceiverActivity : ComponentActivity() {
 
@@ -24,27 +24,35 @@ class ShareReceiverActivity : ComponentActivity() {
         val incoming = intent
 
         lifecycleScope.launch {
-            val count = ShareIntake(this@ShareReceiverActivity, container.saved).handle(incoming)
+            val added = ShareIntake(this@ShareReceiverActivity, container.saved).handle(incoming)
 
-            val message = when {
-                count <= 0 -> getString(R.string.share_nothing)
-                count == 1 -> getString(R.string.share_saved_one)
-                else -> getString(R.string.share_saved_many, count)
+            if (added.isEmpty()) {
+                Toast.makeText(
+                    this@ShareReceiverActivity,
+                    getString(R.string.share_nothing),
+                    Toast.LENGTH_SHORT,
+                ).show()
+                finish()
+                return@launch
             }
-            Toast.makeText(this@ShareReceiverActivity, message, Toast.LENGTH_SHORT).show()
 
-            if (count > 0) {
-                startActivity(
-                    Intent(this@ShareReceiverActivity, MainActivity::class.java).apply {
-                        putExtra(MainActivity.EXTRA_TAB, AppTab.SAVED.name)
-                        addFlags(
-                            Intent.FLAG_ACTIVITY_NEW_TASK or
-                                Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                                Intent.FLAG_ACTIVITY_SINGLE_TOP
-                        )
-                    },
-                )
+            val detail = if (added.size == 1) {
+                added.first()
+            } else {
+                getString(R.string.reel_added_many, added.size)
             }
+
+            startActivity(
+                Intent(this@ShareReceiverActivity, MainActivity::class.java).apply {
+                    putExtra(MainActivity.EXTRA_TAB, AppTab.SAVED.name)
+                    putExtra(MainActivity.EXTRA_SHARED_REEL, detail)
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    )
+                },
+            )
 
             finish()
         }

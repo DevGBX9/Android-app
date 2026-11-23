@@ -3,29 +3,18 @@
     <string name="app_name">brainrot.pigeon</string>
     <string name="share_receiver_label">حفظ في brainrot.pigeon</string>
 
-    <string name="tab_profile">الملف</string>
-    <string name="tab_saved">المحفوظات</string>
-    <string name="action_back">رجوع</string>
+    <string name="reels_empty_title">ما في ريلز مجدولة بعد</string>
+    <string name="reels_empty_body">افتح إنستغرام، اضغط مشاركة على أي ريل، واختَر brainrot.pigeon — ورح ينضاف هون فوراً.</string>
+    <string name="reels_registered">مسجل في التطبيق</string>
+    <string name="reel_added_title">تم اضافة الريل للقائمة</string>
+    <string name="reel_added_many">انضاف %1$d ريلز للقائمة</string>
+    <string name="shared_reel_unknown">ريل جديد</string>
+    <string name="action_close">إغلاق</string>
 
-    <string name="saved_empty_title">ما في شي محفوظ بعد</string>
-    <string name="saved_empty_body">شارك رابط Reel أو فيديو TikTok من تطبيق إنستغرام أو TikTok واختَر brainrot.pigeon، ورح ينحفظ هون.</string>
-    <string name="saved_count">%1$d عنصر محفوظ</string>
-    <string name="saved_open">فتح</string>
-    <string name="saved_share">مشاركة</string>
-    <string name="saved_upload">رفع إلى R2</string>
-    <string name="saved_delete">حذف</string>
-    <string name="saved_uploaded">مرفوع</string>
-    <string name="saved_link_only">رابط</string>
-    <string name="saved_file">ملف</string>
     <string name="saved_no_app">ما في تطبيق يقدر يفتح هذا الرابط</string>
     <string name="saved_no_content">ما في محتوى قابل للفتح</string>
 
-    <string name="share_saved_one">تم الحفظ في brainrot.pigeon</string>
-    <string name="share_saved_many">تم حفظ %1$d عناصر في brainrot.pigeon</string>
     <string name="share_nothing">ما لقيت رابط أو ملف صالح باللي انشارك</string>
 
     <string name="profile_update_failed">تعذّر تحديث البيانات من إنستغرام: %1$s</string>
-
-    <string name="action_open_profile">فتح حساب إنستغرام</string>
-    <string name="action_refresh">تحديث</string>
 </resources>
