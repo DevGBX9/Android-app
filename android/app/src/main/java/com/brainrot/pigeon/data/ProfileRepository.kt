@@ -10,22 +10,30 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import okhttp3.CacheControl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
 private val PROFILE_JSON_KEY = stringPreferencesKey("profile_json")
 private const val MIN_REQUEST_GAP_MS = 20_000L
+private const val GRAPH_BASE = "https://graph.facebook.com"
+private const val GRAPH_VERSION = "v27.0"
+private const val GRAPH_FIELDS =
+    "id,username,name,profile_picture_url,biography,followers_count,follows_count,media_count"
 
 /**
- * يجيب بيانات الحساب من نفس بروكسي Cloudflare Worker اللي يستخدمه الموقع.
+ * يجيب بيانات الحساب مباشرة من Instagram Graph API بالتوكن اللي يدخله المستخدم
+ * في الإعدادات (بدون بروكسي أو مفتاح وسيط).
  * - يبدأ ببيانات محفوظة على الجهاز (أو القيم الاحتياطية).
  * - يمنع تراكم الطلبات بـ Mutex + أقل فاصل زمني بين طلبين.
- * - يوقف نفسه إذا رفض الـ API التوكن (401/403) بدل ما يضرب كل 30 ثانية.
+ * - يوقف نفسه إذا رفض Graph التوكن (401/403 أو رمز 190) بدل ما يضرب كل 30 ثانية،
+ *   ويرجع يشتغل عند تغيير الإعدادات عبر [reset].
  */
 class ProfileRepository(
     private val context: Context,
@@ -63,8 +71,18 @@ class ProfileRepository(
             }
     }
 
+    /** يعيد التفعيل بعد تعديل التوكن أو الـ User ID من الإعدادات. */
+    fun reset() {
+        apiDisabled = false
+        lastRequestAt = 0L
+    }
+
     suspend fun refresh(minGapMs: Long = MIN_REQUEST_GAP_MS): Result<Profile> =
         mutex.withLock {
+            val config = settings.current()
+            if (config.igUserId.isBlank() || config.accessToken.isBlank()) {
+                return@withLock Result.failure(IllegalStateException("missing credentials"))
+            }
             if (apiDisabled) {
                 return@withLock Result.failure(IllegalStateException("api disabled"))
             }
@@ -75,23 +93,33 @@ class ProfileRepository(
             }
             lastRequestAt = now
 
-            val endpoint = settings.current().apiEndpoint
+            val url = "$GRAPH_BASE/$GRAPH_VERSION/${config.igUserId.trim()}".toHttpUrlOrNull()
+                ?.newBuilder()
+                ?.addQueryParameter("fields", GRAPH_FIELDS)
+                ?.addQueryParameter("access_token", config.accessToken.trim())
+                ?.build()
+                ?: return@withLock Result.failure(IllegalArgumentException("bad ig user id"))
+
             val request = Request.Builder()
-                .url(endpoint)
+                .url(url)
                 .header("Accept", "application/json")
                 .cacheControl(CacheControl.Builder().noCache().build())
                 .build()
 
             runCatching {
                 client.newCall(request).execute().use { response ->
-                    if (response.code == 401 || response.code == 403) {
-                        apiDisabled = true
+                    val body = response.body?.string().orEmpty() ?: ""
+                    if (!response.isSuccessful) {
+                        val error = runCatching {
+                            json.decodeFromString<GraphErrorEnvelope>(body)
+                        }.getOrNull()?.error
+                        if (response.code == 401 || response.code == 403 || error?.code == 190) {
+                            apiDisabled = true
+                        }
+                        throw IOException(error?.message ?: "HTTP ${response.code}")
                     }
-                    val body = response.body?.string().orEmpty()
-                    if (!response.isSuccessful || body.isBlank()) {
-                        throw IOException("HTTP ${response.code}")
-                    }
-                    json.decodeFromString<ProfileDto>(body)
+                    if (body.isBlank()) throw IOException("empty response")
+                    json.decodeFromString<GraphProfileDto>(body)
                 }
             }
                 .mapCatching { dto -> dto.toProfile(_profile.value) }
@@ -109,23 +137,32 @@ class ProfileRepository(
         }
     }
 
-    private fun ProfileDto.toProfile(previous: Profile): Profile = Profile(
+    private fun GraphProfileDto.toProfile(previous: Profile): Profile = Profile(
         username = username?.takeIf { it.isNotBlank() } ?: previous.username,
-        bio = bio.orEmpty(),
-        posts = posts ?: previous.posts,
-        followers = followers ?: previous.followers,
-        following = following ?: previous.following,
-        avatarUrl = avatar.orEmpty(),
+        bio = biography.orEmpty(),
+        posts = mediaCount ?: previous.posts,
+        followers = followersCount ?: previous.followers,
+        following = followsCount ?: previous.following,
+        avatarUrl = profilePictureUrl?.takeIf { it.isNotBlank() } ?: previous.avatarUrl,
         fetchedAt = System.currentTimeMillis(),
     )
 }
 
 @Serializable
-private data class ProfileDto(
+private data class GraphProfileDto(
     val username: String? = null,
-    val bio: String? = null,
-    val posts: Int? = null,
-    val followers: Int? = null,
-    val following: Int? = null,
-    val avatar: String? = null,
+    val biography: String? = null,
+    @SerialName("media_count") val mediaCount: Int? = null,
+    @SerialName("followers_count") val followersCount: Int? = null,
+    @SerialName("follows_count") val followsCount: Int? = null,
+    @SerialName("profile_picture_url") val profilePictureUrl: String? = null,
+)
+
+@Serializable
+private data class GraphErrorEnvelope(val error: GraphError? = null)
+
+@Serializable
+private data class GraphError(
+    val message: String? = null,
+    val code: Int? = null,
 )

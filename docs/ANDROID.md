@@ -73,24 +73,25 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ملاحظة: نسخة الـ Debug تستخدم `applicationId` مختلف
 (`com.brainrot.pigeon.debug`) حتى تنزل جنب النسخة النهائية.
 
-بيانات الاتصال بالـ API تُقرأ من `local.properties` (غير مرفوع إلى Git):
+`IG_USER_ID` الافتراضي يُقرأ من `local.properties` (غير مرفوع إلى Git):
 
 ```properties
 sdk.dir=C:\\Users\\<you>\\AppData\\Local\\Android\\Sdk
-pigeon.apiEndpoint=https://brainrot-pigeon-api.brainrotpigeon.workers.dev/
+pigeon.igUserId=17841438848736931
 pigeon.r2UploadEndpoint=
 ```
 
-أو عدّلها من داخل التطبيق: تبويب **الإعدادات** (تُحفظ في DataStore على الجهاز).
+**التوكن لا يُكتب في أي ملف بالمستودع**: تلصقه داخل التطبيق في تبويب
+**الإعدادات** ويُخزَّن في DataStore على الجهاز فقط.
 
 ## 4. GitHub Actions (البناء الفعلي)
 
 الملف: `.github/workflows/android.yml`.
 
-- يعمل على `push` إلى `main`/`master`، وعلى Pull Request، وعلى أي وسم `v*`، ويدوياً.
-- يثبّت JDK 17 وGradle 8.13، ويشغّل `testDebugUnitTest` ثم `assembleDebug` و`bundleRelease`.
-- يرفع أثرين: `brainrot-pigeon-debug-apk` و`brainrot-pigeon-release-aab`.
-- على الوسم `v*` يرفق APK/AAB في GitHub Release.
+- يعمل على `push` إلى `main`، وعلى Pull Request، وعلى أي وسم `v*`، ويدوياً.
+- يثبّت JDK 17 وGradle 8.13، ويشغّل `testDebugUnitTest` ثم `assembleDebug` فقط.
+- يرفع أثراً واحداً `brainrot-pigeon-apk`، وينشر الـ APK في Release باسم `latest`
+  مع كل دفعة (عدا Pull Requests).
 
 توقيع الإصدار (اختياري لكن مطلوب للنشر على Google Play). أضف هذه الأسرار في
 Settings → Secrets and variables → Actions:
@@ -183,24 +184,24 @@ export default {
 بعد رفع الـ Worker: ضع عنوانه في الإعدادات، أو في `pigeon.r2UploadEndpoint`
 بـ `local.properties` أو في متغير مشروع Gradle.
 
-## 7. API البروفايل الحالي
+## 7. API البروفايل (مباشر بالتوكن)
 
-`pigeon.apiEndpoint` يجب أن يرجع نفس شكل الرد الحالي:
+التطبيق يستدعي Instagram Graph API مباشرة بدون بروكسي أو وسيط:
 
-```json
-{
-  "username": "brainrot.pigeon",
-  "bio": "I'm a pigeon",
-  "posts": 48,
-  "followers": 3099,
-  "following": 5,
-  "avatar": "https://.../profile.jpg"
-}
+```
+GET https://graph.facebook.com/v27.0/{IG_USER_ID}
+    ?fields=id,username,name,profile_picture_url,biography,followers_count,follows_count,media_count
+    &access_token={ACCESS_TOKEN}
 ```
 
-`apiEndpoint` الافتراضي هو الـ Worker المنشور
-`https://brainrot-pigeon-api.brainrotpigeon.workers.dev/`، ويقبل التعديل من الإعدادات.
-عند 401/403 يتوقف التحديث التلقائي بدل إغراق الـ API (نفس سلوك الموقع).
+- `IG_USER_ID` الافتراضي `17841438848736931`، ويُعدَّل من الإعدادات أو
+  `pigeon.igUserId` في `local.properties`.
+- `ACCESS_TOKEN` يُلصق في تبويب **الإعدادات** ويُخزَّن في DataStore على الجهاز
+  فقط؛ لا يدخل المستودع ولا يُضمَّن في الـ APK.
+- الحقول المقروءة: `username`, `biography`, `media_count`, `followers_count`,
+  `follows_count`, `profile_picture_url`.
+- عند 401/403 أو رمز الخطأ 190 يتوقف التحديث التلقائي حتى يعدّل المستخدم
+  التوكن من الإعدادات (يُعاد التفعيل تلقائياً عند العودة لشاشة الحساب).
 
 ## 8. ما الذي تم التحقق منه فعلياً وما لم يُتحقق
 

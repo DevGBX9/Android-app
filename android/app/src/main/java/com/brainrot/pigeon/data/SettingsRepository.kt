@@ -8,12 +8,14 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 
-private val API_ENDPOINT_KEY = stringPreferencesKey("api_endpoint")
+private val IG_USER_ID_KEY = stringPreferencesKey("ig_user_id")
+private val IG_TOKEN_KEY = stringPreferencesKey("ig_access_token")
 private val R2_ENDPOINT_KEY = stringPreferencesKey("r2_upload_endpoint")
 private val R2_TOKEN_KEY = stringPreferencesKey("r2_token")
 
 data class AppSettings(
-    val apiEndpoint: String,
+    val igUserId: String,
+    val accessToken: String,
     val r2UploadEndpoint: String,
     val r2Token: String,
 )
@@ -22,8 +24,9 @@ class SettingsRepository(private val context: Context) {
 
     val settings: Flow<AppSettings> = context.settingsStore.data.map { prefs ->
         AppSettings(
-            apiEndpoint = prefs[API_ENDPOINT_KEY]?.trim()?.takeIf { it.isNotEmpty() }
-                ?: BuildConfig.DEFAULT_API_ENDPOINT,
+            igUserId = prefs[IG_USER_ID_KEY]?.trim()?.takeIf { it.isNotEmpty() }
+                ?: BuildConfig.DEFAULT_IG_USER_ID,
+            accessToken = prefs[IG_TOKEN_KEY]?.trim().orEmpty(),
             r2UploadEndpoint = prefs[R2_ENDPOINT_KEY]?.trim()
                 ?: BuildConfig.DEFAULT_R2_ENDPOINT,
             r2Token = prefs[R2_TOKEN_KEY].orEmpty(),
@@ -32,9 +35,15 @@ class SettingsRepository(private val context: Context) {
 
     suspend fun current(): AppSettings = settings.first()
 
-    suspend fun save(apiEndpoint: String, r2UploadEndpoint: String, r2Token: String) {
+    suspend fun save(
+        igUserId: String,
+        accessToken: String,
+        r2UploadEndpoint: String,
+        r2Token: String,
+    ) {
         context.settingsStore.edit { prefs ->
-            prefs[API_ENDPOINT_KEY] = apiEndpoint.trim()
+            prefs[IG_USER_ID_KEY] = igUserId.trim()
+            prefs[IG_TOKEN_KEY] = accessToken.trim()
             prefs[R2_ENDPOINT_KEY] = r2UploadEndpoint.trim()
             prefs[R2_TOKEN_KEY] = r2Token.trim()
         }

@@ -6,14 +6,17 @@ import androidx.lifecycle.viewModelScope
 import com.brainrot.pigeon.data.AvatarLoader
 import com.brainrot.pigeon.data.Profile
 import com.brainrot.pigeon.data.ProfileRepository
+import com.brainrot.pigeon.data.SettingsRepository
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
@@ -27,9 +30,16 @@ data class AvatarUiState(
 class ProfileViewModel(
     private val repository: ProfileRepository,
     private val avatars: AvatarLoader,
+    settings: SettingsRepository,
 ) : ViewModel() {
 
     val profile: StateFlow<Profile> = repository.profile
+
+    /** هل يوجد توكن وUser ID؟ لو لا، نعرض تلميح بدل أرقام احتياطية. */
+    val configured: StateFlow<Boolean> = settings.settings
+        .map { it.igUserId.isNotBlank() && it.accessToken.isNotBlank() }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), false)
 
     private val _avatar = MutableStateFlow(AvatarUiState())
     val avatar: StateFlow<AvatarUiState> = _avatar.asStateFlow()
@@ -83,7 +93,6 @@ class ProfileViewModel(
         pollJob = viewModelScope.launch {
             while (isActive) {
                 repository.refresh()
-                if (repository.apiDisabled) break
                 delay(REFRESH_INTERVAL_MS)
             }
         }

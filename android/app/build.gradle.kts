@@ -33,13 +33,13 @@ android {
         applicationId = "com.brainrot.pigeon"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
 
         buildConfigField(
             "String",
-            "DEFAULT_API_ENDPOINT",
-            "\"${configValue("pigeon.apiEndpoint", "https://brainrot-pigeon-api.brainrotpigeon.workers.dev/")}\""
+            "DEFAULT_IG_USER_ID",
+            "\"${configValue("pigeon.igUserId", "17841438848736931")}\""
         )
         buildConfigField(
             "String",

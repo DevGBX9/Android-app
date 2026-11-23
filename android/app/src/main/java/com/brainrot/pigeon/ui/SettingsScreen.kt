@@ -71,10 +71,47 @@ fun SettingsRoute(container: AppContainer) {
             )
 
             SettingsField(
-                labelRes = R.string.settings_api,
-                value = state.apiEndpoint,
-                onValueChange = viewModel::setApiEndpoint,
-                placeholder = stringResource(R.string.settings_api_hint),
+                labelRes = R.string.settings_ig_user,
+                value = state.igUserId,
+                onValueChange = viewModel::setIgUserId,
+                placeholder = stringResource(R.string.settings_ig_user_hint),
+            )
+
+            SettingsField(
+                labelRes = R.string.settings_token,
+                value = state.accessToken,
+                onValueChange = viewModel::setAccessToken,
+                placeholder = "",
+                password = true,
+            )
+
+            Text(
+                text = stringResource(R.string.settings_token_help),
+                color = TextMuted,
+                fontSize = 12.sp,
+                lineHeight = 18.sp,
+            )
+
+            Button(
+                onClick = viewModel::save,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = TextPrimary,
+                    contentColor = Background,
+                ),
+            ) {
+                Text(
+                    text = stringResource(R.string.settings_save),
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+
+            Text(
+                text = stringResource(R.string.settings_r2_section),
+                color = TextPrimary,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(top = 8.dp),
             )
 
             SettingsField(
@@ -91,20 +128,6 @@ fun SettingsRoute(container: AppContainer) {
                 placeholder = "",
                 password = true,
             )
-
-            Button(
-                onClick = viewModel::save,
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = TextPrimary,
-                    contentColor = Background,
-                ),
-            ) {
-                Text(
-                    text = stringResource(R.string.settings_save),
-                    fontWeight = FontWeight.SemiBold,
-                )
-            }
 
             Text(
                 text = stringResource(R.string.settings_note),

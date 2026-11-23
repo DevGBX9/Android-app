@@ -10,7 +10,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 data class SettingsUiState(
-    val apiEndpoint: String = "",
+    val igUserId: String = "",
+    val accessToken: String = "",
     val r2UploadEndpoint: String = "",
     val r2Token: String = "",
     val loaded: Boolean = false,
@@ -26,7 +27,8 @@ class SettingsViewModel(private val repository: SettingsRepository) : ViewModel(
         viewModelScope.launch {
             val current = repository.current()
             _state.value = SettingsUiState(
-                apiEndpoint = current.apiEndpoint,
+                igUserId = current.igUserId,
+                accessToken = current.accessToken,
                 r2UploadEndpoint = current.r2UploadEndpoint,
                 r2Token = current.r2Token,
                 loaded = true,
@@ -34,7 +36,9 @@ class SettingsViewModel(private val repository: SettingsRepository) : ViewModel(
         }
     }
 
-    fun setApiEndpoint(value: String) = _state.update { it.copy(apiEndpoint = value) }
+    fun setIgUserId(value: String) = _state.update { it.copy(igUserId = value) }
+
+    fun setAccessToken(value: String) = _state.update { it.copy(accessToken = value) }
 
     fun setR2Endpoint(value: String) = _state.update { it.copy(r2UploadEndpoint = value) }
 
@@ -44,7 +48,8 @@ class SettingsViewModel(private val repository: SettingsRepository) : ViewModel(
         val snapshot = _state.value
         viewModelScope.launch {
             repository.save(
-                apiEndpoint = snapshot.apiEndpoint,
+                igUserId = snapshot.igUserId,
+                accessToken = snapshot.accessToken,
                 r2UploadEndpoint = snapshot.r2UploadEndpoint,
                 r2Token = snapshot.r2Token,
             )
