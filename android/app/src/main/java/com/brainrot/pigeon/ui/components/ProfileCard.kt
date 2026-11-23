@@ -191,8 +191,9 @@ private fun StatColumn(
         horizontalAlignment = Alignment.Start,
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
+        // heightIn (وليس height) حتى لا يُقص أي رقم أو شريط تحميل
         Box(
-            modifier = Modifier.height((valueSize.value * 1.35f).dp),
+            modifier = Modifier.heightIn(min = (valueSize.value * 1.3f).dp),
             contentAlignment = Alignment.CenterStart,
         ) {
             if (loading) {
