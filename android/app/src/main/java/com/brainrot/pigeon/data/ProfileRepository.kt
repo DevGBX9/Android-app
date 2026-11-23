@@ -1,6 +1,7 @@
 package com.brainrot.pigeon.data
 
 import android.content.Context
+import android.util.Log
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import java.io.IOException
@@ -26,14 +27,17 @@ private const val GRAPH_BASE = "https://graph.facebook.com"
 private const val GRAPH_VERSION = "v27.0"
 private const val GRAPH_FIELDS =
     "id,username,name,profile_picture_url,biography,followers_count,follows_count,media_count"
+private const val LOG_TAG = "PigeonProfile"
+private const val MAX_ERROR_LENGTH = 90
 
 /**
- * يجيب بيانات الحساب مباشرة من Instagram Graph API بالتوكن المدمج في البناء
- * (بدون بروكسي أو مفتاح وسيط وبدون شاشة إعدادات).
- * - يبدأ ببيانات محفوظة على الجهاز (أو القيم الاحتياطية).
- * - يمنع تراكم الطلبات بـ Mutex + أقل فاصل زمني بين طلبين.
- * - يوقف نفسه إذا رفض Graph التوكن (401/403 أو رمز 190) بدل ما يضرب كل 30 ثانية،
- *   ويرجع يشتغل عند تغيير الإعدادات عبر [reset].
+ * يجيب بيانات الحساب بالتوكن المدمج في البناء، بمسارين:
+ * 1. Instagram Graph API مباشرة (`graph.facebook.com`).
+ * 2. عند فشل الأول: بروكسي Cloudflare Worker المنشور (نفس بيانات الموقع)،
+ *    لأن بعض الشبكات تحجب `graph.facebook.com` من الهاتف.
+ *
+ * سبب الفشل يُسجَّل في logcat (PigeonProfile) ويُعرض للمستخدم بدل ما تنعرض
+ * الأرقام الاحتياطية وكأنها حقيقية.
  */
 class ProfileRepository(
     private val context: Context,
@@ -48,6 +52,11 @@ class ProfileRepository(
 
     private val _profile = MutableStateFlow(Profile())
     val profile: StateFlow<Profile> = _profile.asStateFlow()
+
+    private val _error = MutableStateFlow<String?>(null)
+
+    /** آخر سبب فشل، أو null بعد نجاح آخر تحديث. */
+    val error: StateFlow<String?> = _error.asStateFlow()
 
     private val mutex = Mutex()
     private var lastRequestAt = 0L
@@ -81,6 +90,7 @@ class ProfileRepository(
         mutex.withLock {
             val config = settings.current()
             if (config.igUserId.isBlank() || config.accessToken.isBlank()) {
+                _error.value = "missing credentials"
                 return@withLock Result.failure(IllegalStateException("missing credentials"))
             }
             if (apiDisabled) {
@@ -93,41 +103,106 @@ class ProfileRepository(
             }
             lastRequestAt = now
 
-            val url = "$GRAPH_BASE/$GRAPH_VERSION/${config.igUserId.trim()}".toHttpUrlOrNull()
-                ?.newBuilder()
-                ?.addQueryParameter("fields", GRAPH_FIELDS)
-                ?.addQueryParameter("access_token", config.accessToken.trim())
-                ?.build()
-                ?: return@withLock Result.failure(IllegalArgumentException("bad ig user id"))
+            val direct = runCatching { fetchGraph(config) }
+            direct.getOrNull()?.let { return@withLock publish(it) }
 
-            val request = Request.Builder()
-                .url(url)
-                .header("Accept", "application/json")
-                .cacheControl(CacheControl.Builder().noCache().build())
-                .build()
+            val directError = direct.exceptionOrNull()
+            Log.w(LOG_TAG, "graph.facebook.com failed: ${directError?.message}", directError)
 
-            runCatching {
-                client.newCall(request).execute().use { response ->
-                    val body = response.body?.string().orEmpty() ?: ""
-                    if (!response.isSuccessful) {
-                        val error = runCatching {
-                            json.decodeFromString<GraphErrorEnvelope>(body)
-                        }.getOrNull()?.error
-                        if (response.code == 401 || response.code == 403 || error?.code == 190) {
-                            apiDisabled = true
-                        }
-                        throw IOException(error?.message ?: "HTTP ${response.code}")
-                    }
-                    if (body.isBlank()) throw IOException("empty response")
-                    json.decodeFromString<GraphProfileDto>(body)
-                }
+            val proxied = runCatching { fetchViaProxy(config) }
+            proxied.getOrNull()?.let {
+                Log.i(LOG_TAG, "profile loaded through worker proxy")
+                return@withLock publish(it)
             }
-                .mapCatching { dto -> dto.toProfile(_profile.value) }
-                .onSuccess { fresh ->
-                    _profile.value = fresh
-                    persist(fresh)
-                }
+
+            val proxyError = proxied.exceptionOrNull()
+            Log.w(LOG_TAG, "worker proxy failed: ${proxyError?.message}", proxyError)
+
+            // التوكن نفسه مرفوض من Graph: نوقف المحاولات حتى العودة للتطبيق.
+            if ((directError as? GraphCallError)?.authFailed == true &&
+                (proxyError as? GraphCallError)?.authFailed == true
+            ) {
+                apiDisabled = true
+            }
+
+            _error.value = shorten(directError ?: proxyError)
+            Result.failure(directError ?: proxyError ?: IllegalStateException("unknown"))
         }
+
+    private suspend fun publish(fresh: Profile): Result<Profile> {
+        _profile.value = fresh
+        _error.value = null
+        persist(fresh)
+        return Result.success(fresh)
+    }
+
+    private fun fetchGraph(config: AppSettings): Profile {
+        val url = "$GRAPH_BASE/$GRAPH_VERSION/${config.igUserId.trim()}".toHttpUrlOrNull()
+            ?.newBuilder()
+            ?.addQueryParameter("fields", GRAPH_FIELDS)
+            ?.addQueryParameter("access_token", config.accessToken.trim())
+            ?.build()
+            ?: throw GraphCallError("bad ig user id", authFailed = false)
+
+        val request = Request.Builder()
+            .url(url)
+            .header("Accept", "application/json")
+            .cacheControl(CacheControl.Builder().noCache().build())
+            .build()
+
+        client.newCall(request).execute().use { response ->
+            val body = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                val error = runCatching {
+                    json.decodeFromString<GraphErrorEnvelope>(body)
+                }.getOrNull()?.error
+                val authFailed =
+                    response.code == 401 || response.code == 403 || error?.code == 190
+                throw GraphCallError(
+                    "graph HTTP ${response.code}: ${error?.message ?: "request failed"}",
+                    authFailed,
+                )
+            }
+            if (body.isBlank()) throw GraphCallError("graph empty response", false)
+            return json.decodeFromString<GraphProfileDto>(body).toProfile(_profile.value)
+        }
+    }
+
+    private fun fetchViaProxy(config: AppSettings): Profile {
+        val base = config.apiEndpoint.trim()
+        if (base.isBlank()) throw GraphCallError("no proxy endpoint", false)
+
+        val url = base.trimEnd('/').toHttpUrlOrNull()
+            ?: throw GraphCallError("bad proxy endpoint", false)
+
+        val request = Request.Builder()
+            .url(url)
+            .header("Accept", "application/json")
+            .cacheControl(CacheControl.Builder().noCache().build())
+            .build()
+
+        client.newCall(request).execute().use { response ->
+            val body = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                throw GraphCallError(
+                    "proxy HTTP ${response.code}",
+                    authFailed = response.code == 401 || response.code == 403,
+                )
+            }
+            if (body.isBlank()) throw GraphCallError("proxy empty response", false)
+
+            val dto = json.decodeFromString<ProxyProfileDto>(body)
+            return Profile(
+                username = dto.username?.takeIf { it.isNotBlank() } ?: _profile.value.username,
+                bio = dto.bio.orEmpty(),
+                posts = dto.posts ?: _profile.value.posts,
+                followers = dto.followers ?: _profile.value.followers,
+                following = dto.following ?: _profile.value.following,
+                avatarUrl = dto.avatar?.takeIf { it.isNotBlank() } ?: _profile.value.avatarUrl,
+                fetchedAt = System.currentTimeMillis(),
+            )
+        }
+    }
 
     private suspend fun persist(profile: Profile) {
         runCatching {
@@ -135,6 +210,12 @@ class ProfileRepository(
                 prefs[PROFILE_JSON_KEY] = json.encodeToString(profile)
             }
         }
+    }
+
+    private fun shorten(error: Throwable?): String {
+        val message = error?.message?.takeIf { it.isNotBlank() } ?: error?.javaClass?.simpleName
+            ?: "unknown error"
+        return if (message.length <= MAX_ERROR_LENGTH) message else message.take(MAX_ERROR_LENGTH)
     }
 
     private fun GraphProfileDto.toProfile(previous: Profile): Profile = Profile(
@@ -148,6 +229,8 @@ class ProfileRepository(
     )
 }
 
+private class GraphCallError(message: String, val authFailed: Boolean) : IOException(message)
+
 @Serializable
 private data class GraphProfileDto(
     val username: String? = null,
@@ -156,6 +239,16 @@ private data class GraphProfileDto(
     @SerialName("followers_count") val followersCount: Int? = null,
     @SerialName("follows_count") val followsCount: Int? = null,
     @SerialName("profile_picture_url") val profilePictureUrl: String? = null,
+)
+
+@Serializable
+private data class ProxyProfileDto(
+    val username: String? = null,
+    val bio: String? = null,
+    val posts: Int? = null,
+    val followers: Int? = null,
+    val following: Int? = null,
+    val avatar: String? = null,
 )
 
 @Serializable

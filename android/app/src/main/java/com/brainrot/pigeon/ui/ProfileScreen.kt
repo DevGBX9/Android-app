@@ -12,6 +12,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -21,8 +22,10 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.brainrot.pigeon.AppContainer
+import com.brainrot.pigeon.R
 import com.brainrot.pigeon.data.PROFILE_PAGE_URL
 import com.brainrot.pigeon.ui.components.ProfileCard
+import com.brainrot.pigeon.ui.theme.TextMuted
 import com.brainrot.pigeon.ui.theme.TextPrimary
 import com.brainrot.pigeon.ui.util.openExternal
 
@@ -38,6 +41,7 @@ fun ProfileRoute(container: AppContainer) {
 
     val profile by viewModel.profile.collectAsStateWithLifecycle()
     val avatar by viewModel.avatar.collectAsStateWithLifecycle()
+    val error by viewModel.error.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { viewModel.onForeground() }
@@ -67,6 +71,16 @@ fun ProfileRoute(container: AppContainer) {
                 lineHeight = 20.sp,
                 modifier = Modifier.padding(top = 14.dp),
             )
+
+            error?.let { reason ->
+                Text(
+                    text = stringResource(R.string.profile_update_failed, reason),
+                    color = TextMuted,
+                    fontSize = 12.sp,
+                    lineHeight = 16.sp,
+                    modifier = Modifier.padding(top = 10.dp),
+                )
+            }
         }
     }
 }

@@ -17,6 +17,8 @@ private val R2_TOKEN_KEY = stringPreferencesKey("r2_token")
 data class AppSettings(
     val igUserId: String,
     val accessToken: String,
+    /** بروكسي الموقع على Cloudflare Workers (يُستخدم لو حجب Graph من الهاتف). */
+    val apiEndpoint: String,
     val r2UploadEndpoint: String,
     val r2Token: String,
 )
@@ -27,6 +29,7 @@ class SettingsRepository(private val context: Context) {
         AppSettings(
             igUserId = BuildConfig.DEFAULT_IG_USER_ID,
             accessToken = BuildConfig.DEFAULT_IG_ACCESS_TOKEN,
+            apiEndpoint = BuildConfig.DEFAULT_API_ENDPOINT,
             r2UploadEndpoint = prefs[R2_ENDPOINT_KEY]?.trim()
                 ?: BuildConfig.DEFAULT_R2_ENDPOINT,
             r2Token = prefs[R2_TOKEN_KEY].orEmpty(),

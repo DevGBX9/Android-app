@@ -31,6 +31,9 @@ class ProfileViewModel(
 
     val profile: StateFlow<Profile> = repository.profile
 
+    /** سبب فشل آخر تحديث، أو null إذا نجح. */
+    val error: StateFlow<String?> = repository.error
+
     private val _avatar = MutableStateFlow(AvatarUiState())
     val avatar: StateFlow<AvatarUiState> = _avatar.asStateFlow()
 
@@ -82,8 +85,9 @@ class ProfileViewModel(
         if (pollJob?.isActive == true) return
         pollJob = viewModelScope.launch {
             while (isActive) {
-                repository.refresh()
-                delay(REFRESH_INTERVAL_MS)
+                // عند الفشل نعيد المحاولة أسرع بدل انتظار الدورة الكاملة.
+                val result = repository.refresh()
+                delay(if (result.isSuccess) REFRESH_INTERVAL_MS else RETRY_INTERVAL_MS)
             }
         }
     }
@@ -97,5 +101,6 @@ class ProfileViewModel(
 
     companion object {
         const val REFRESH_INTERVAL_MS = 30_000L
+        const val RETRY_INTERVAL_MS = 10_000L
     }
 }

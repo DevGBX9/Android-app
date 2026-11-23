@@ -24,6 +24,8 @@
     <string name="share_saved_many">تم حفظ %1$d عناصر في brainrot.pigeon</string>
     <string name="share_nothing">ما لقيت رابط أو ملف صالح باللي انشارك</string>
 
+    <string name="profile_update_failed">تعذّر تحديث البيانات من إنستغرام: %1$s</string>
+
     <string name="action_open_profile">فتح حساب إنستغرام</string>
     <string name="action_refresh">تحديث</string>
 </resources>

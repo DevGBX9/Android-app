@@ -33,8 +33,8 @@ android {
         applicationId = "com.brainrot.pigeon"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.2.0"
+        versionCode = 4
+        versionName = "1.3.0"
 
         buildConfigField(
             "String",
@@ -46,6 +46,12 @@ android {
             "String",
             "DEFAULT_IG_ACCESS_TOKEN",
             "\"${configValue("pigeon.igAccessToken", "EAAXjGpto53wBTMVsnQQjeqVKWIWJAHfYmP5ZCaER1rsBNPBTK6ZCeNYucqtRP7ASlX8fWNpZBlrO8S1BxvxdBfnm1Uh77lLfCb3WfTft9qLWTgqYeVHPXfILry76ZAydMnijMCoWIqPuRq4DeU1HoMZBoJ4BlDAympi76NQURbegHL6z6nL8CHjINNYRiJEG7WZAitoK2UHQ3STPAdiUZAHgcMTo3u1OgPZBiVqMGVZAA4HNncrf1YgZDZD")}\""
+        )
+        // بروكسي الموقع على Cloudflare Workers: مسار بديل لو حجب الهاتف graph.facebook.com.
+        buildConfigField(
+            "String",
+            "DEFAULT_API_ENDPOINT",
+            "\"${configValue("pigeon.apiEndpoint", "https://brainrot-pigeon-api.brainrotpigeon.workers.dev/")}\""
         )
         buildConfigField(
             "String",
