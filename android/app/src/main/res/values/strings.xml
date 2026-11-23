@@ -1,20 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">brainrot.pigeon</string>
-    <string name="share_receiver_label">حفظ في brainrot.pigeon</string>
+    <string name="share_receiver_label">Save to brainrot.pigeon</string>
 
-    <string name="reels_empty_title">ما في ريلز مجدولة بعد</string>
-    <string name="reels_empty_body">افتح إنستغرام، اضغط مشاركة على أي ريل، واختَر brainrot.pigeon — ورح ينضاف هون فوراً.</string>
-    <string name="reels_registered">مسجل في التطبيق</string>
-    <string name="reel_added_title">تم اضافة الريل للقائمة</string>
-    <string name="reel_added_many">انضاف %1$d ريلز للقائمة</string>
-    <string name="shared_reel_unknown">ريل جديد</string>
-    <string name="action_close">إغلاق</string>
+    <string name="share_dialog_title">Reel added</string>
+    <string name="share_dialog_many">Added %1$d reels</string>
+    <string name="share_dialog_saving">Saving reel…</string>
+    <string name="share_dialog_failed_title">No reel found</string>
+    <string name="share_dialog_failed_body">We couldn\'t find a reel link in what you shared.</string>
+    <string name="action_view">View</string>
+    <string name="action_close">Close</string>
 
-    <string name="saved_no_app">ما في تطبيق يقدر يفتح هذا الرابط</string>
-    <string name="saved_no_content">ما في محتوى قابل للفتح</string>
+    <string name="reels_empty_title">No reels scheduled yet</string>
+    <string name="reels_empty_body">Open Instagram, tap Share on any reel, and pick brainrot.pigeon — it lands here instantly.</string>
+    <string name="reels_registered">Registered in the app</string>
 
-    <string name="share_nothing">ما لقيت رابط أو ملف صالح باللي انشارك</string>
+    <string name="saved_no_app">No app can open this link</string>
+    <string name="saved_no_content">Nothing to open</string>
 
-    <string name="profile_update_failed">تعذّر تحديث البيانات من إنستغرام: %1$s</string>
+    <string name="profile_update_failed">Couldn\'t update from Instagram: %1$s</string>
 </resources>

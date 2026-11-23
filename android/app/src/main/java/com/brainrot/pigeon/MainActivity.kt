@@ -17,14 +17,12 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
 
     private var requestedTab by mutableStateOf(AppTab.PROFILE)
-    private var sharedReel by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
         requestedTab = tabFromIntent(intent) ?: AppTab.PROFILE
-        sharedReel = intent?.getStringExtra(EXTRA_SHARED_REEL)
         val container = (application as PigeonApp).container
 
         // مع كل فتح للتطبيق: نسحب قائمة الريلز من Firebase ونعرضها.
@@ -35,8 +33,6 @@ class MainActivity : ComponentActivity() {
                 PigeonRoot(
                     container = container,
                     requestedTab = requestedTab,
-                    sharedReel = sharedReel,
-                    onSharedReelShown = { sharedReel = null },
                 )
             }
         }
@@ -46,7 +42,6 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         tabFromIntent(intent)?.let { requestedTab = it }
-        intent.getStringExtra(EXTRA_SHARED_REEL)?.let { sharedReel = it }
     }
 
     private fun tabFromIntent(intent: Intent?): AppTab? =
@@ -58,6 +53,5 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_TAB = "com.brainrot.pigeon.extra.TAB"
-        const val EXTRA_SHARED_REEL = "com.brainrot.pigeon.extra.SHARED_REEL"
     }
 }

@@ -28,7 +28,7 @@ class R2Uploader(private val client: OkHttpClient) {
             val endpoint = settings.r2UploadEndpoint.trim()
             if (endpoint.isEmpty()) {
                 return@withContext Result.failure(
-                    IllegalStateException("ما في عنوان رفع R2 مضبوط بالإعدادات"),
+                    IllegalStateException("No R2 upload endpoint configured"),
                 )
             }
 
@@ -76,7 +76,7 @@ class R2Uploader(private val client: OkHttpClient) {
 
                     fromJson?.takeIf { it.isNotBlank() }
                         ?: text.trim().takeIf { it.startsWith("http") }
-                        ?: throw IOException("الرد ما احتوى رابط الملف")
+                        ?: throw IOException("Response did not contain a file URL")
                 }
             }
         }
