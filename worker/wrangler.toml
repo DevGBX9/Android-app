@@ -1,0 +1,7 @@
+name = "brainrot-pigeon-api"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+# معرّف الحساب (عام، مش سر). التوكن بينحط كسر عبر wrangler secret put
+IG_USER_ID = "17841438848736931"

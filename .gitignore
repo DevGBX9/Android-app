@@ -1,0 +1,24 @@
+node_modules/
+functions/.env
+functions/.env.*
+.firebase/
+firebase-debug.log
+*.log
+.tools/
+.cloud-attachments/
+worker/node_modules/
+worker/.dev.vars/
+worker/.wrangler/
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/keystore.properties
+android/*.jks
+android/*.keystore
+android/.kotlin/
+.idea/
+*.iml
+captures/

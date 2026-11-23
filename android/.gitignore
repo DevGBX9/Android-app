@@ -1,0 +1,14 @@
+# Android
+
+Generated Gradle/IDE output.
+
+.gradle/
+build/
+local.properties
+keystore.properties
+*.jks
+*.keystore
+.kotlin/
+captures/
+*.iml
+.idea/

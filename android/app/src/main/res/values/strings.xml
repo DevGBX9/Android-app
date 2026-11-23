@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">brainrot.pigeon</string>
+    <string name="share_receiver_label">حفظ في brainrot.pigeon</string>
+
+    <string name="tab_profile">الملف</string>
+    <string name="tab_saved">المحفوظات</string>
+    <string name="tab_settings">الإعدادات</string>
+
+    <string name="saved_empty_title">ما في شي محفوظ بعد</string>
+    <string name="saved_empty_body">شارك رابط Reel أو فيديو TikTok من تطبيق إنستغرام أو TikTok واختَر brainrot.pigeon، ورح ينحفظ هون.</string>
+    <string name="saved_count">%1$d عنصر محفوظ</string>
+    <string name="saved_open">فتح</string>
+    <string name="saved_share">مشاركة</string>
+    <string name="saved_upload">رفع إلى R2</string>
+    <string name="saved_delete">حذف</string>
+    <string name="saved_uploaded">مرفوع</string>
+    <string name="saved_link_only">رابط</string>
+    <string name="saved_file">ملف</string>
+    <string name="saved_no_app">ما في تطبيق يقدر يفتح هذا الرابط</string>
+    <string name="saved_no_content">ما في محتوى قابل للفتح</string>
+
+    <string name="share_saved_one">تم الحفظ في brainrot.pigeon</string>
+    <string name="share_saved_many">تم حفظ %1$d عناصر في brainrot.pigeon</string>
+    <string name="share_nothing">ما لقيت رابط أو ملف صالح باللي انشارك</string>
+
+    <string name="settings_title">الإعدادات</string>
+    <string name="settings_api">عنوان API للبروفايل</string>
+    <string name="settings_api_hint">https://brainrot-pigeon-api.brainrotpigeon.workers.dev/</string>
+    <string name="settings_r2">عنوان رفع R2</string>
+    <string name="settings_r2_hint">https://example.workers.dev/r2/upload</string>
+    <string name="settings_r2_token">توكن رفع R2 (اختياري)</string>
+    <string name="settings_save">حفظ</string>
+    <string name="settings_saved">تم الحفظ</string>
+    <string name="settings_note">التوكن يبقى على الجهاز فقط. الأفضل استخدام رابط موقّع أو Worker يخزّن أسرار R2 سيرفر-سايد.</string>
+
+    <string name="action_open_profile">فتح حساب إنستغرام</string>
+    <string name="action_refresh">تحديث</string>
+</resources>

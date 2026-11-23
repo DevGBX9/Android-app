@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="ar" dir="ltr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>@brainrot.pigeon</title>
+  <link rel="icon" id="favicon" type="image/webp" href="assets/avatar.webp" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="sheet">
+    <section class="profile" aria-label="Profile stats for @brainrot.pigeon">
+      <div class="profile__left">
+        <div class="note" id="note"></div>
+        <div class="avatar">
+          <img id="avatar" src="assets/avatar.webp" alt="brainrot.pigeon profile picture" />
+          <img id="avatarNext" class="avatar__next" alt="" aria-hidden="true" />
+          <button class="avatar__plus" type="button" aria-label="Add to story">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="profile__right">
+        <h1 class="username">
+          <span id="username"></span>
+          <svg class="verified" viewBox="0 0 24 24" role="img" aria-label="Verified">
+            <circle cx="12" cy="12" r="10" fill="none" stroke="currentColor"
+                    stroke-width="2" stroke-linecap="round" stroke-dasharray="2.4 2.6" />
+            <path d="M7.6 12.3l2.9 2.9 5.9-6.1" fill="none" stroke="currentColor"
+                  stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+        </h1>
+
+        <ul class="stats">
+          <li><b id="posts"></b><span>posts</span></li>
+          <li><b id="followers"></b><span>followers</span></li>
+          <li><b id="following"></b><span>following</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <p class="bio" id="bio"></p>
+  </main>
+
+  <script src="script.js?v=3"></script>
+</body>
+</html>

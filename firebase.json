@@ -1,0 +1,31 @@
+{
+  "hosting": {
+    "public": ".",
+    "ignore": [
+      "firebase.json",
+      ".firebaserc",
+      "**/.*",
+      ".tools/**",
+      ".cloud-attachments/**",
+      ".freebuff/**",
+      ".github/**",
+      "**/node_modules/**",
+      "functions/**",
+      "worker/**",
+      "android/**",
+      "docs/**",
+      "index - Copy.html",
+      "AGENTS.md",
+      "*.log"
+    ],
+    "headers": [
+      {
+        "source": "**",
+        "headers": [
+          { "key": "X-Content-Type-Options", "value": "nosniff" },
+          { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" }
+        ]
+      }
+    ]
+  }
+}

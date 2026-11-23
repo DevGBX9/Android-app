@@ -1,0 +1,12 @@
+{
+  "name": "brainrot-pigeon-functions",
+  "description": "بروكسي آمن لبيانات إنستغرام عبر Meta Graph API",
+  "private": true,
+  "main": "index.js",
+  "engines": {
+    "node": "20"
+  },
+  "dependencies": {
+    "firebase-functions": "^5.0.1"
+  }
+}
