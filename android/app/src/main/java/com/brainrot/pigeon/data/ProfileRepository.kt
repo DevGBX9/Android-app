@@ -5,12 +5,14 @@ import android.util.Log
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import java.io.IOException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -136,7 +138,9 @@ class ProfileRepository(
         return Result.success(fresh)
     }
 
-    private fun fetchGraph(config: AppSettings): Profile {
+    // OkHttp هنا متزامن، ولا بد من Dispatchers.IO: استدعاؤه على Main يرمي
+    // NetworkOnMainThreadException ويظهر للمستخدم كفشل تحديث.
+    private suspend fun fetchGraph(config: AppSettings): Profile = withContext(Dispatchers.IO) {
         val url = "$GRAPH_BASE/$GRAPH_VERSION/${config.igUserId.trim()}".toHttpUrlOrNull()
             ?.newBuilder()
             ?.addQueryParameter("fields", GRAPH_FIELDS)
@@ -164,45 +168,48 @@ class ProfileRepository(
                 )
             }
             if (body.isBlank()) throw GraphCallError("graph empty response", false)
-            return json.decodeFromString<GraphProfileDto>(body).toProfile(_profile.value)
+            json.decodeFromString<GraphProfileDto>(body).toProfile(_profile.value)
         }
     }
 
-    private fun fetchViaProxy(config: AppSettings): Profile {
-        val base = config.apiEndpoint.trim()
-        if (base.isBlank()) throw GraphCallError("no proxy endpoint", false)
+    private suspend fun fetchViaProxy(config: AppSettings): Profile =
+        withContext(Dispatchers.IO) {
+            val base = config.apiEndpoint.trim()
+            if (base.isBlank()) throw GraphCallError("no proxy endpoint", false)
 
-        val url = base.trimEnd('/').toHttpUrlOrNull()
-            ?: throw GraphCallError("bad proxy endpoint", false)
+            val url = base.trimEnd('/').toHttpUrlOrNull()
+                ?: throw GraphCallError("bad proxy endpoint", false)
 
-        val request = Request.Builder()
-            .url(url)
-            .header("Accept", "application/json")
-            .cacheControl(CacheControl.Builder().noCache().build())
-            .build()
+            val request = Request.Builder()
+                .url(url)
+                .header("Accept", "application/json")
+                .cacheControl(CacheControl.Builder().noCache().build())
+                .build()
 
-        client.newCall(request).execute().use { response ->
-            val body = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                throw GraphCallError(
-                    "proxy HTTP ${response.code}",
-                    authFailed = response.code == 401 || response.code == 403,
+            client.newCall(request).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    throw GraphCallError(
+                        "proxy HTTP ${response.code}",
+                        authFailed = response.code == 401 || response.code == 403,
+                    )
+                }
+                if (body.isBlank()) throw GraphCallError("proxy empty response", false)
+
+                val dto = json.decodeFromString<ProxyProfileDto>(body)
+                Profile(
+                    username = dto.username?.takeIf { it.isNotBlank() }
+                        ?: _profile.value.username,
+                    bio = dto.bio.orEmpty(),
+                    posts = dto.posts ?: _profile.value.posts,
+                    followers = dto.followers ?: _profile.value.followers,
+                    following = dto.following ?: _profile.value.following,
+                    avatarUrl = dto.avatar?.takeIf { it.isNotBlank() }
+                        ?: _profile.value.avatarUrl,
+                    fetchedAt = System.currentTimeMillis(),
                 )
             }
-            if (body.isBlank()) throw GraphCallError("proxy empty response", false)
-
-            val dto = json.decodeFromString<ProxyProfileDto>(body)
-            return Profile(
-                username = dto.username?.takeIf { it.isNotBlank() } ?: _profile.value.username,
-                bio = dto.bio.orEmpty(),
-                posts = dto.posts ?: _profile.value.posts,
-                followers = dto.followers ?: _profile.value.followers,
-                following = dto.following ?: _profile.value.following,
-                avatarUrl = dto.avatar?.takeIf { it.isNotBlank() } ?: _profile.value.avatarUrl,
-                fetchedAt = System.currentTimeMillis(),
-            )
         }
-    }
 
     private suspend fun persist(profile: Profile) {
         runCatching {
