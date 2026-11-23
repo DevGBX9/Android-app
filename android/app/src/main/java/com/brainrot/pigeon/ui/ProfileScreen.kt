@@ -51,7 +51,7 @@ fun ProfileRoute(container: AppContainer) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 24.dp, vertical = 16.dp),
+            .padding(horizontal = 17.dp, vertical = 16.dp),
         contentAlignment = Alignment.Center,
     ) {
         Column(

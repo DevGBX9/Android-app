@@ -128,14 +128,14 @@ fun Avatar(
         Box(
             modifier = Modifier
                 .align(Alignment.BottomEnd)
-                .offset(x = 2.dp, y = 2.dp)
-                .size(21.dp)
+                .offset(x = 1.dp, y = 1.dp)
+                .size(18.dp)
                 .background(Color(0xFFF5F5F5), CircleShape)
                 .border(2.dp, Background, CircleShape),
             contentAlignment = Alignment.Center,
         ) {
-            Canvas(Modifier.size(9.dp)) {
-                val stroke = 1.8.dp.toPx()
+            Canvas(Modifier.size(8.dp)) {
+                val stroke = 1.6.dp.toPx()
                 // this.size هنا هو DrawScope.size، وليس معامل size المحيط
                 val canvasWidth = this.size.width
                 val canvasHeight = this.size.height

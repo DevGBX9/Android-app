@@ -48,15 +48,21 @@ import com.brainrot.pigeon.data.Profile
 import com.brainrot.pigeon.ui.AvatarUiState
 import com.brainrot.pigeon.ui.theme.Bubble
 import com.brainrot.pigeon.ui.theme.BubbleText
-import com.brainrot.pigeon.ui.theme.TextMuted
 import com.brainrot.pigeon.ui.theme.TextPrimary
 
 private val ShimmerBase = Color(0xFF232A31)
 private val ShimmerHighlight = Color(0xFF3B454F)
 
+// نفس نسب الصورة المرجعية: الأفاتار 76dp، فقاعة أعرض قليلاً من الأفاتار
+// ومُلتصقة فيه، البايو تحت العمود الأيسر، والاسم والإحصائيات على اليمين بمحاذاة
+// يسار واحدة.
+private val AVATAR_SIZE = 76.dp
+private val BUBBLE_WIDTH = 74.dp
+private val LEFT_INSET = 7.dp
+private val COLUMN_GAP = 24.dp
+
 /**
- * كرت الحساب: الببل + الصورة على اليسار، والاسم + البايو على اليمين، ثم صف
- * الإحصائيات بعرض الكرت كامل حتى تأخذ كل خانة مساحتها ولا ينقصّ أي رقم.
+ * كرت الحساب: ببل + أفاتار + بايو على اليسار، والاسم مع الإحصائيات على اليمين.
  * أثناء أول جلب تظهر أشرطة Skeleton متحركة بدل الأرقام.
  */
 @Composable
@@ -68,30 +74,27 @@ fun ProfileCard(
     onAvatarClick: () -> Unit,
 ) {
     BoxWithConstraints(Modifier.fillMaxWidth()) {
-        val compact = maxWidth < 360.dp
+        val compact = maxWidth < 320.dp
 
-        val avatarSize = if (compact) 76.dp else 88.dp
-        val nameSize = if (compact) 15.sp else 17.sp
-        val bioSize = if (compact) 13.sp else 14.sp
-        val statValueSize = if (compact) 15.sp else 17.sp
-        val statLabelSize = if (compact) 11.sp else 12.sp
-        val statGap = if (compact) 8.dp else 14.dp
+        val avatarSize = if (compact) 66.dp else AVATAR_SIZE
+        val bubbleWidth = if (compact) 64.dp else BUBBLE_WIDTH
+        val nameSize = if (compact) 16.sp else 18.sp
+        val bioSize = if (compact) 14.sp else 15.sp
+        val statValueSize = if (compact) 16.sp else 18.sp
+        val statLabelSize = if (compact) 12.sp else 15.sp
+        val statGap = if (compact) 8.dp else 12.dp
 
         Column(Modifier.fillMaxWidth()) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(16.dp),
                 verticalAlignment = Alignment.Top,
             ) {
                 Column(
-                    modifier = Modifier.width(avatarSize),
-                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(start = LEFT_INSET),
+                    horizontalAlignment = Alignment.Start,
                 ) {
-                    NoteBubble(
-                        width = avatarSize,
-                        minHeight = avatarSize * 0.57f,
-                    )
-                    Spacer(Modifier.height(6.dp))
+                    NoteBubble(width = bubbleWidth, minHeight = if (compact) 34.dp else 38.dp)
+                    Spacer(Modifier.height(3.dp))
                     Avatar(
                         state = avatar,
                         size = avatarSize,
@@ -100,15 +103,17 @@ fun ProfileCard(
                     )
                 }
 
+                Spacer(Modifier.width(COLUMN_GAP))
+
                 Column(
                     modifier = Modifier
                         .weight(1f)
-                        .padding(top = 4.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                        .padding(top = if (compact) 18.dp else 22.dp),
+                    horizontalAlignment = Alignment.Start,
                 ) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
                     ) {
                         Text(
                             text = profile.username,
@@ -119,58 +124,62 @@ fun ProfileCard(
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f, fill = false),
                         )
-                        VerifiedBadge(Modifier.size(17.dp))
+                        VerifiedBadge(Modifier.size(if (compact) 14.dp else 15.dp))
                     }
 
-                    Text(
-                        text = profile.bio.ifBlank { " " },
-                        color = TextPrimary,
-                        fontSize = bioSize,
-                        lineHeight = (bioSize.value + 5).sp,
-                        maxLines = 3,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    Spacer(Modifier.height(if (compact) 10.dp else 14.dp))
+
+                    // وزن متساوٍ لكل خانة: كل عمود يأخذ ثلث المساحة بمحاذاة يسار،
+                    // فلا يضيق عمود «followers» ويُنقص منه رقم.
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(statGap),
+                    ) {
+                        StatColumn(
+                            modifier = Modifier.weight(1f),
+                            value = profile.posts,
+                            label = "posts",
+                            loading = loading,
+                            valueSize = statValueSize,
+                            labelSize = statLabelSize,
+                        )
+                        StatColumn(
+                            modifier = Modifier.weight(1f),
+                            value = profile.followers,
+                            label = "followers",
+                            loading = loading,
+                            valueSize = statValueSize,
+                            labelSize = statLabelSize,
+                        )
+                        StatColumn(
+                            modifier = Modifier.weight(1f),
+                            value = profile.following,
+                            label = "following",
+                            loading = loading,
+                            valueSize = statValueSize,
+                            labelSize = statLabelSize,
+                        )
+                    }
                 }
             }
 
-            Spacer(Modifier.height(22.dp))
+            Spacer(Modifier.height(6.dp))
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(statGap),
-            ) {
-                StatColumn(
-                    modifier = Modifier.weight(1f),
-                    value = profile.posts,
-                    label = "posts",
-                    loading = loading,
-                    valueSize = statValueSize,
-                    labelSize = statLabelSize,
-                )
-                StatColumn(
-                    modifier = Modifier.weight(1f),
-                    value = profile.followers,
-                    label = "followers",
-                    loading = loading,
-                    valueSize = statValueSize,
-                    labelSize = statLabelSize,
-                )
-                StatColumn(
-                    modifier = Modifier.weight(1f),
-                    value = profile.following,
-                    label = "following",
-                    loading = loading,
-                    valueSize = statValueSize,
-                    labelSize = statLabelSize,
-                )
-            }
+            Text(
+                text = profile.bio.ifBlank { " " },
+                color = TextPrimary,
+                fontSize = bioSize,
+                lineHeight = (bioSize.value + 5).sp,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
 
 @Composable
 private fun StatColumn(
-    modifier: Modifier,
+    modifier: Modifier = Modifier,
     value: Int?,
     label: String,
     loading: Boolean,
@@ -179,22 +188,22 @@ private fun StatColumn(
 ) {
     Column(
         modifier = modifier,
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(3.dp),
+        horizontalAlignment = Alignment.Start,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         Box(
-            modifier = Modifier.height(20.dp),
-            contentAlignment = Alignment.Center,
+            modifier = Modifier.height((valueSize.value * 1.35f).dp),
+            contentAlignment = Alignment.CenterStart,
         ) {
             if (loading) {
-                ShimmerBar(width = 40.dp, height = 14.dp)
+                ShimmerBar(width = 42.dp, height = 15.dp)
             } else {
                 RollingNumber(value = value, fontSize = valueSize)
             }
         }
         Text(
             text = label,
-            color = TextMuted,
+            color = TextPrimary,
             fontSize = labelSize,
             maxLines = 1,
             softWrap = false,
@@ -239,16 +248,16 @@ private fun NoteBubble(width: Dp, minHeight: Dp) {
         modifier = Modifier
             .width(width)
             .heightIn(min = minHeight)
-            .clip(RoundedCornerShape(22.dp))
+            .clip(RoundedCornerShape(20.dp))
             .background(Bubble)
-            .padding(horizontal = 8.dp, vertical = 6.dp),
+            .padding(horizontal = 6.dp, vertical = 5.dp),
         contentAlignment = Alignment.Center,
     ) {
         Text(
             text = NOTE_TEXT,
             color = BubbleText,
-            fontSize = 13.sp,
-            lineHeight = 17.sp,
+            fontSize = 12.sp,
+            lineHeight = 15.sp,
             textAlign = TextAlign.Center,
             maxLines = 2,
         )

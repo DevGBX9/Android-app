@@ -37,11 +37,10 @@ private val rollEasing = CubicBezierEasing(0.22f, 0.61f, 0.36f, 1f)
 private const val DIGIT_HEIGHT_EM = 1.2f
 
 /**
- * نفس عداد الموقع: كل خانة رقم تتدحرج للرقم الجديد (فوق إذا زاد، تحت إذا نقص)،
- * وعند تغيّر عدد الخانات (999 ← 1,000) يعاد البناء مع أنيميشن pop خفيف.
+ * نفس عداد الموقع: كل خانة رقم تتدحرج للرقم الجديد (فوق إذا زاد، تحت إذا نقص).
  *
- * ارتفاع الخانة ثابت لكل رقم، وبدون font padding، حتى لا ينقصّ أي رقم من
- * الأسفل أو تختفي خانات أثناء الحركة.
+ * الحركة تنتهي دائماً عند 1f وتبقى هناك، والخانة تعرض الرقم الجديد مباشرة:
+ * لا إرجاع للصفر بعد الحركة، لذلك لا يظهر فراغ أو اختفاء بين الرقمين.
  */
 @Composable
 fun RollingNumber(
@@ -64,24 +63,8 @@ fun RollingNumber(
 
     val digitHeight = with(LocalDensity.current) { (fontSize.toPx() * DIGIT_HEIGHT_EM).toDp() }
 
-    val pop = remember { Animatable(1f) }
-    var lastLength by remember { mutableIntStateOf(formatted.length) }
-
-    LaunchedEffect(formatted.length) {
-        if (formatted.length != lastLength) {
-            lastLength = formatted.length
-            pop.snapTo(0f)
-            pop.animateTo(1f, tween(durationMillis = 340))
-        }
-    }
-
     Row(
-        modifier = modifier
-            .clearAndSetSemantics { contentDescription = formatted }
-            .graphicsLayer {
-                alpha = 0.35f + 0.65f * pop.value
-                translationY = (1f - pop.value) * 5.dp.toPx()
-            },
+        modifier = modifier.clearAndSetSemantics { contentDescription = formatted },
         verticalAlignment = Alignment.Top,
     ) {
         val tokens = remember(formatted) { formatted.toList() }
@@ -110,25 +93,24 @@ fun RollingNumber(
 @Composable
 private fun RollingDigit(digit: Int, digitHeight: Dp, style: TextStyle) {
     var current by remember { mutableIntStateOf(digit) }
+    var previous by remember { mutableIntStateOf(digit) }
     var upward by remember { mutableStateOf(true) }
-    val progress = remember { Animatable(0f) }
+    // نبدأ من 1f ونبقى عليه بعد كل حركة: الخانة تعرض دائماً رقماً كاملاً.
+    val progress = remember { Animatable(1f) }
 
     LaunchedEffect(digit) {
         if (digit == current) return@LaunchedEffect
+
+        previous = current
         upward = digit > current
+        // نصفّر قبل تبديل الرقم حتى لا تُرسم لحظة بلا رقم
         progress.snapTo(0f)
-        try {
-            progress.animateTo(1f, tween(durationMillis = 720, easing = rollEasing))
-        } finally {
-            // حتى لو انقطعت الحركة بتحديث جديد، يبقى الرقم المعروض صحيحاً
-            current = digit
-        }
-        // الترتيب مهم: نثبّت الرقم الجديد قبل ما نصفّر الحركة حتى ما تلمع خانة قديمة
-        progress.snapTo(0f)
+        current = digit
+        progress.animateTo(1f, tween(durationMillis = 720, easing = rollEasing))
     }
 
-    val top = if (upward) current else digit
-    val bottom = if (upward) digit else current
+    val top = if (upward) previous else current
+    val bottom = if (upward) current else previous
     val heightPx = with(LocalDensity.current) { digitHeight.toPx() }
 
     Box(
