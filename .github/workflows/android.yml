@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build debug APK (installable) and release AAB
+    name: Build installable APK
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -41,41 +41,28 @@ jobs:
       - name: 4. Run unit tests
         run: gradle --no-daemon testDebugUnitTest
 
-      - name: 5. Build the debug APK
+      - name: 5. Build the APK
         run: gradle --no-daemon assembleDebug
 
-      - name: 6. Build the release AAB (unsigned)
-        run: gradle --no-daemon bundleRelease
+      - name: 6. Show the APK
+        run: ls -lh app/build/outputs/apk/debug/
 
-      - name: 7. Show build output
-        run: |
-          ls -lh app/build/outputs/apk/debug/
-          ls -lh app/build/outputs/bundle/release/
-
-      - name: 8. Upload APK to Actions artifacts
+      - name: 7. Upload the APK (Actions artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
+          name: brainrot-pigeon-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
 
-      - name: 9. Upload AAB to Actions artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-release-aab
-          path: android/app/build/outputs/bundle/release/app-release.aab
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: 10. Publish the APK as the "latest" release
+      - name: 8. Publish the APK as the "latest" release
         if: github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: Latest APK
           body: >
-            أحدث نسخة Debug مبنية من ${{ github.sha }}.
+            أحدث نسخة مبنية من ${{ github.sha }}.
             حمّل app-debug.apk من قسم Assets وثبّتها على هاتف Android 8.0+.
           files: android/app/build/outputs/apk/debug/app-debug.apk
           make_latest: true
