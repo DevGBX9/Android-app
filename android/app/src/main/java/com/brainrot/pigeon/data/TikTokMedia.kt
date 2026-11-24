@@ -25,26 +25,31 @@ class TikTokMedia(private val client: OkHttpClient) {
     suspend fun resolve(link: String?): String? = withContext(Dispatchers.IO) {
         val target = link?.takeIf { it.contains("tiktok.com") } ?: return@withContext null
 
-        val body = runCatching {
-            val request = Request.Builder()
-                .url(RESOLVER + URLEncoder.encode(target, "UTF-8"))
-                .header("Accept", "application/json")
-                .build()
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) null else response.body?.string()
-            }
-        }.getOrElse { error ->
-            Log.w(LOG_TAG, "resolve failed: ${error.message}")
-            null
-        } ?: return@withContext null
+        // محاولتان: الخدمة أحياناً ترد 5xx عابرة.
+        repeat(2) { attempt ->
+            val body = runCatching {
+                val request = Request.Builder()
+                    .url(RESOLVER + URLEncoder.encode(target, "UTF-8"))
+                    .header("Accept", "application/json")
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) null else response.body?.string()
+                }
+            }.getOrElse { error ->
+                Log.w(LOG_TAG, "resolve failed: ${error.message}")
+                null
+            } ?: return@repeat
 
-        val data = runCatching { JSONObject(body).optJSONObject("data") }.getOrNull()
-            ?: return@withContext null
+            val data = runCatching { JSONObject(body).optJSONObject("data") }.getOrNull()
+                ?: return@repeat
 
-        // hdplay/play نسختان بلا علامة مائية؛ نتجاهل wmplay المعلّمة.
-        sequenceOf("hdplay", "play")
-            .map { key -> data.optString(key, "") }
-            .firstOrNull { it.startsWith("http") && isCdn(it) }
+            // hdplay/play نسختان بلا علامة مائية؛ نتجاهل wmplay المعلّمة.
+            val media = sequenceOf("hdplay", "play")
+                .map { key -> data.optString(key, "") }
+                .firstOrNull { it.startsWith("http") && isCdn(it) }
+            if (media != null) return@withContext media
+        }
+        null
     }
 
     private fun isCdn(url: String): Boolean {
