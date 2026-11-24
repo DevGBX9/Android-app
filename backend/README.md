@@ -1,8 +1,11 @@
 # Pigeon Reels API (Cloudflare Python Worker)
 
-ينزّل ريل إنستغرام من رابطه، يخزّنه في R2، ويكتب تقدّم المعالجة في Firebase
-تحت `/reels/<id>/archive` حتى يعرضه التطبيق كنسبة 0..100، ثم يقدّم الملف من
-`GET /download/<id>` لتحميله على الجهاز.
+ينزّل ريل إنستغرام أو فيديو تيك توك من رابطه، يخزّنه في R2، ويكتب تقدّم
+المعالجة في Firebase تحت `/reels/<id>/archive` حتى يعرضه التطبيق كنسبة 0..100،
+ثم يقدّم الملف من `GET /download/<id>` لتحميله على الجهاز.
+
+كذلك ينشر الريلز المجدولة من Cloudflare إلى إنستغرام عند موعدها عبر
+Instagram Graph API، من cron داخلي، وليس من جدولة إنستغرام نفسها.
 
 ## المسارات
 
@@ -12,19 +15,40 @@
 | `POST /reels` | `{"id","url","thumbnail"}` → 202 ويبدأ التنزيل والتخزين |
 | `GET /reels/<id>` | حالة الأرشفة (`state`, `progress`, `url`, `bytes`, `error`) |
 | `GET /download/<id>` | ملف الـmp4 من R2 بـ`Content-Disposition: attachment` |
+| `GET /media/<id>` | نفس الملف للعرض العام (تقرأه Meta وقت النشر، بلا مفتاح) |
 
 `state` تكون: `queued` → `downloading` (0..92) → `storing` → `ready`، أو `failed`.
+
+## النشر المجدول إلى إنستغرام
+
+- التطبيق يكتب الموعد في Firebase تحت `/schedules/<id>` (منفصل عن سجل الريل
+  حتى لا يمسحه PATCH):
+  `{"at": 1764000000000, "timezone": "Africa/Algiers", "state": "scheduled"}`.
+- `wrangler.jsonc` فيه cron كل 5 دقائق (`*/5 * * * *`). عند حلول الموعد:
+  1. يتأكد أن الفيديو موجود في R2 (`reels/<id>.mp4`).
+  2. ينشئ Instagram media container بـ`media_type=REELS` ورابط
+     `PUBLIC_BASE_URL/media/<id>`.
+  3. يفحص حالة الحاوية كل تشغيل حتى `FINISHED` (أو `ERROR`/`EXPIRED`).
+  4. ينادي `media_publish` ويحفظ `mediaId` و`publishedAt`.
+- حالات الموعد: `scheduled` → `creating` → `publishing` → `published`، أو
+  `failed` مع `error`. لو انقطع الـWorker بعد `media_publish` لا يعيد النشر
+  تلقائياً (حتى لا يتكرر الريل)، بل يعلّم الحالة `failed` للمراجعة.
+- الوقت ثابت 19:00 بتوقيت الجزائر (`Africa/Algiers` = UTC+1) أي 18:00 UTC.
+- `IG_ACCESS_TOKEN` سرّ في GitHub Actions وليس في `wrangler.jsonc`؛ يحتاج
+  صلاحية `instagram_content_publish`. `IG_USER_ID` و`PUBLIC_BASE_URL` في
+  `vars`.
 
 ## النشر
 
 الـWorker يُنشر من GitHub Actions فقط (`.github/workflows/api.yml`)، بدون أي
-تثبيت محلي. أضف سرّين في المستودع من
+تثبيت محلي. أضف الأسرار في المستودع من
 `Settings → Secrets and variables → Actions`:
 
 | السر | من وين تجيبه |
 | --- | --- |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Dashboard → Workers & Pages → Account ID |
 | `CLOUDFLARE_API_TOKEN` | My Profile → API Tokens → Create Token بصلاحيات **Workers Scripts: Edit** و **R2: Edit** |
+| `IG_ACCESS_TOKEN` | توكن إنستغرام طويل الأمد لنفس الحساب، بصلاحية `instagram_content_publish` |
 
 بديل للتوكن: `CLOUDFLARE_EMAIL` (بريد حساب Cloudflare) مع `CLOUDFLARE_API_KEY`
 (Global API Key من My Profile → API Tokens → Global API Key). يكفي واحد من

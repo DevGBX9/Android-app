@@ -4,22 +4,27 @@
 R2، ويحدّث حالة المعالجة والتقدّم في Firebase Realtime Database تحت
 `/reels/<id>/archive`، ثم يقدّم الملف للتحميل من `GET /download/<id>`.
 
+كذلك ينشر الريلز المجدولة من `/schedules/<id>` إلى إنستغرام عند حلول موعدها
+(19:00 بتوقيت الجزائر) عبر Instagram Graph API، من cron داخل الـWorker، لا من
+جدولة إنستغرام نفسها. الملف العام الذي يقرأه Meta من `GET /media/<id>`.
+
 المسارات:
     GET  /                     معلومات الخدمة
     GET  /health               فحص سريع
     POST /reels                {"id", "url", "thumbnail"?} -> 202 ويبدأ المعالجة
     GET  /reels/<id>           حالة الأرشفة (تقرأ من Firebase، وبدونها من R2)
     GET  /download/<id>        ملف الفيديو من R2 (Content-Disposition: attachment)
+    GET  /media/<id>           نفس الملف للعرض العام (لـMeta، بلا مفتاح)
 
 كل الطلبات تُرفض إذا لم يكن `API_TOKEN` مضبوطاً في الأسرار، ولم يكن الترويسة
-`X-Api-Key` مطابقة.
+`X-Api-Key` مطابقة، ما عدا `/media/<id>` و`/health`.
 """
 
 import asyncio
 import json
 import re
 import time
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from workers import Response, WorkerEntrypoint, fetch
 
@@ -47,6 +52,18 @@ PROGRESS_STEP = 4
 FETCH_TIMEOUT_S = 8
 ARCHIVE_BUDGET_S = 24
 STALE_JOB_MS = 75_000
+
+# النشر إلى إنستغرام من نفس الـWorker (لا من جدولة إنستغرام).
+IG_GRAPH = "https://graph.facebook.com/v23.0"
+IG_DEFAULT_USER_ID = "17841438848736931"
+IG_DEFAULT_PUBLIC_BASE = "https://brainrot-pigeon-reels.brainrotpigeon.workers.dev"
+
+# عدد محاولات cron قبل اعتبار الريل فاشلاً (cron كل 5 دقائق).
+SCHEDULE_RETRY_LIMIT = 12
+
+# لو توقّف الـWorker بعد إرسال media_publish وقبل كتابة النتيجة، لا نعيد النشر
+# تلقائياً حتى لا يتكرر الريل؛ ننتظر هذه المدة ثم نعلّم الحالة فاشلة للمراجعة.
+PUBLISH_STUCK_MS = 10 * 60 * 1000
 
 INSTAGRAM_HOSTS = (
     "instagram.com",
@@ -311,6 +328,18 @@ async def _firebase_put(base, path, payload):
     response = await _fetch(
         f"{base.rstrip('/')}/{path.lstrip('/')}",
         method="PUT",
+        headers={"content-type": "application/json; charset=utf-8"},
+        body=body,
+    )
+    return int(response.status)
+
+
+async def _firebase_patch(base, path, payload):
+    """تحديث جزئي: لا يمسح حقول الموعد التي لم نرسلها (مثل at/timezone)."""
+    body = json.dumps(payload, ensure_ascii=False)
+    response = await _fetch(
+        f"{base.rstrip('/')}/{path.lstrip('/')}",
+        method="PATCH",
         headers={"content-type": "application/json; charset=utf-8"},
         body=body,
     )
@@ -685,12 +714,101 @@ async def _download_bytes(media_url, on_progress, headers, known_size=0):
 
 
 # --------------------------------------------------------------------------
+# نشر إنستغرام (Graph API)
+# --------------------------------------------------------------------------
+
+
+def _ig_user(env):
+    return _clean(getattr(env, "IG_USER_ID", None), IG_DEFAULT_USER_ID)
+
+
+def _ig_token(env):
+    return _clean(getattr(env, "IG_ACCESS_TOKEN", None))
+
+
+def _ig_public_base(env):
+    return _clean(
+        getattr(env, "PUBLIC_BASE_URL", None), IG_DEFAULT_PUBLIC_BASE
+    ).rstrip("/")
+
+
+def _ig_message(payload, status):
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        text = error.get("error_user_msg") or error.get("message") or "instagram error"
+        code = error.get("code")
+        sub = error.get("error_subcode")
+        return f"instagram {status}: {str(text)[:220]} (code {code}/{sub})"
+    return f"instagram HTTP {status}"
+
+
+async def _ig_json(response):
+    text = await response.text()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return {"raw": text[:300]}
+    return parsed if isinstance(parsed, dict) else {"raw": text[:300]}
+
+
+async def _ig_create_container(user_id, token, media_url, caption):
+    """ينشئ Reels media container من رابط عام؛ Meta تنزّل الفيديو بنفسها."""
+    payload = {
+        "media_type": "REELS",
+        "video_url": media_url,
+        "share_to_feed": "true",
+        "access_token": token,
+    }
+    if caption:
+        payload["caption"] = caption
+
+    response = await _fetch(
+        f"{IG_GRAPH}/{user_id}/media",
+        method="POST",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        body=urlencode(payload),
+    )
+    data = await _ig_json(response)
+    if int(response.status) != 200 or not data.get("id"):
+        raise RuntimeError(_ig_message(data, int(response.status)))
+    return str(data["id"])
+
+
+async def _ig_container_status(container_id, token):
+    """يرجّع (status_code, status) للحاوية: IN_PROGRESS / FINISHED / ERROR…"""
+    query = urlencode({"fields": "status_code,status", "access_token": token})
+    response = await _fetch(f"{IG_GRAPH}/{container_id}?{query}")
+    data = await _ig_json(response)
+    if int(response.status) != 200:
+        raise RuntimeError(_ig_message(data, int(response.status)))
+    return (
+        _clean(data.get("status_code"), "UNKNOWN"),
+        _clean(data.get("status")),
+    )
+
+
+async def _ig_publish(user_id, token, container_id):
+    response = await _fetch(
+        f"{IG_GRAPH}/{user_id}/media_publish",
+        method="POST",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        body=urlencode({"creation_id": container_id, "access_token": token}),
+    )
+    data = await _ig_json(response)
+    if int(response.status) != 200 or not data.get("id"):
+        raise RuntimeError(_ig_message(data, int(response.status)))
+    return str(data["id"])
+
+
+# --------------------------------------------------------------------------
 # الـWorker
 # --------------------------------------------------------------------------
 
 
 class Default(WorkerEntrypoint):
-    """نقطة الدخول: راوتر صغير لثلاثة مسارات + خلفية الأرشفة."""
+    """نقطة الدخول: راوتر صغير للمسارات + خلفية الأرشفة + cron النشر."""
 
     def _db(self):
         return _clean(getattr(self.env, "FIREBASE_DB", None), RTDB_FALLBACK)
@@ -712,15 +830,24 @@ class Default(WorkerEntrypoint):
                 {
                     "ok": True,
                     "service": "pigeon-reels",
-                    "version": 2,
-                    "routes": ["POST /reels", "GET /reels/<id>", "GET /download/<id>"],
+                    "version": 3,
+                    "routes": [
+                        "POST /reels",
+                        "GET /reels/<id>",
+                        "GET /download/<id>",
+                        "GET /media/<id>",
+                    ],
                     "sources": ["instagram", "tiktok"],
+                    "publishing": "instagram graph api (cron)",
                 }
             )
 
         if parts[0] == "health":
             return _json({"ok": True, "time": int(time.time() * 1000)})
 
+        # ملف عام يقرأه Meta وقت النشر: بلا X-Api-Key لأن Graph API لا يرسله.
+        if parts[0] == "media" and len(parts) == 2 and method in ("GET", "HEAD"):
+            return await self._media(parts[1], method)
 
         if not self._authorized(request):
             return _error("unauthorized", 401)
@@ -863,8 +990,287 @@ class Default(WorkerEntrypoint):
             },
         )
 
+    async def _media(self, reel_id, method="GET"):
+        """نسخة عامة من الملف لـMeta: بلا Content-Disposition: attachment."""
+        reel_id = _safe_id(reel_id)
+        if not reel_id:
+            return _error("bad id", 404)
+
+        headers = {
+            "content-type": "video/mp4",
+            "content-disposition": f'inline; filename="pigeon-{reel_id}.mp4"',
+            "cache-control": "public, max-age=86400",
+            "access-control-allow-origin": "*",
+        }
+
+        # HEAD لا يحتاج جسم الملف: نقرأ البيانات الوصفية فقط.
+        if method == "HEAD":
+            obj = await self.env.FILES.head(self._key(reel_id))
+            if obj is None:
+                return _error("not stored yet", 404)
+            size = getattr(obj, "size", None)
+            if size is not None:
+                headers["content-length"] = str(size)
+            return Response("", headers=headers)
+
+        obj = await self.env.FILES.get(self._key(reel_id))
+        if obj is None:
+            return _error("not stored yet", 404)
+        return Response(obj.body, headers=headers)
+
     def _key(self, reel_id):
         return f"reels/{reel_id}.mp4"
+
+    # ----------------------------------------------------------------------
+    # cron: نشر الريلز التي حان موعدها من Cloudflare إلى إنستغرام
+    # ----------------------------------------------------------------------
+
+    async def scheduled(self, controller, env, ctx):
+        """يُستدعى من cron في wrangler.jsonc كل 5 دقائق."""
+        try:
+            await self._publish_due()
+        except Exception as exc:  # noqa: BLE001 - لا نُفشل الـcron كله
+            print(f"pigeon schedule run failed: {exc}")
+
+    async def _publish_due(self):
+        db = self._db()
+        schedules = await _firebase_get(db, "schedules.json") or {}
+        if not isinstance(schedules, dict):
+            return
+
+        now = int(time.time() * 1000)
+        due = []
+        for schedule_id, schedule in schedules.items():
+            if not isinstance(schedule, dict):
+                continue
+            try:
+                at = int(schedule.get("at") or 0)
+            except (TypeError, ValueError):
+                continue
+            state = _clean(schedule.get("state"), "scheduled")
+            if at <= 0 or at > now:
+                continue
+            if state not in ("scheduled", "creating", "publishing"):
+                continue
+            due.append((schedule_id, schedule, at))
+
+        # الأقدم أولاً، وبحد 3 في التشغيل الواحد حتى تبقى مدة cron قصيرة.
+        due.sort(key=lambda entry: entry[2])
+        for schedule_id, schedule, at in due[:3]:
+            clean_id = _safe_id(schedule_id)
+            if not clean_id:
+                continue
+            try:
+                await self._publish_one(db, clean_id, schedule, now)
+            except Exception as exc:  # noqa: BLE001
+                print(f"pigeon schedule {clean_id} failed: {exc}")
+                try:
+                    await _firebase_patch(
+                        db,
+                        f"schedules/{clean_id}.json",
+                        {
+                            "error": str(exc)[:300],
+                            "updatedAt": int(time.time() * 1000),
+                        },
+                    )
+                except Exception:
+                    pass
+
+    async def _publish_one(self, db, schedule_id, schedule, now):
+        path = f"schedules/{schedule_id}.json"
+        token = _ig_token(self.env)
+        if not token:
+            await _firebase_patch(
+                db,
+                path,
+                {
+                    "error": "IG_ACCESS_TOKEN is not configured",
+                    "updatedAt": now,
+                },
+            )
+            return
+
+        state = _clean(schedule.get("state"), "scheduled")
+        try:
+            attempts = int(schedule.get("attempts") or 0)
+        except (TypeError, ValueError):
+            attempts = 0
+        user_id = _ig_user(self.env)
+
+        if state == "publishing":
+            updated = 0
+            try:
+                updated = int(schedule.get("updatedAt") or 0)
+            except (TypeError, ValueError):
+                updated = 0
+            if now - updated < PUBLISH_STUCK_MS:
+                return
+            await _firebase_patch(
+                db,
+                path,
+                {
+                    "state": "failed",
+                    "error": "publishing was interrupted; check Instagram before retrying",
+                    "updatedAt": now,
+                },
+            )
+            return
+
+        if state == "scheduled":
+            # لازم يكون الملف في R2 قبل ما تعطيه Meta رابطاً عاماً.
+            obj = await self.env.FILES.head(self._key(schedule_id))
+            if obj is None:
+                attempts += 1
+                if attempts >= SCHEDULE_RETRY_LIMIT:
+                    await _firebase_patch(
+                        db,
+                        path,
+                        {
+                            "state": "failed",
+                            "attempts": attempts,
+                            "error": "the reel was not archived before its publish time",
+                            "updatedAt": now,
+                        },
+                    )
+                else:
+                    await _firebase_patch(
+                        db,
+                        path,
+                        {
+                            "attempts": attempts,
+                            "error": "waiting for the reel archive",
+                            "updatedAt": now,
+                        },
+                    )
+                return
+
+            media_url = f"{_ig_public_base(self.env)}/media/{schedule_id}"
+            try:
+                container_id = await _ig_create_container(
+                    user_id, token, media_url, ""
+                )
+            except Exception as exc:  # noqa: BLE001 - خطأ واضح في سجل الموعد
+                await _firebase_patch(
+                    db,
+                    path,
+                    {
+                        "state": "failed",
+                        "error": str(exc)[:300],
+                        "updatedAt": now,
+                    },
+                )
+                return
+
+            await _firebase_patch(
+                db,
+                path,
+                {
+                    "state": "creating",
+                    "containerId": container_id,
+                    "attempts": 0,
+                    "error": None,
+                    "updatedAt": now,
+                },
+            )
+            return
+
+        if state == "creating":
+            container_id = _clean(schedule.get("containerId"))
+            if not container_id:
+                await _firebase_patch(
+                    db,
+                    path,
+                    {
+                        "state": "failed",
+                        "error": "the Instagram container id is missing",
+                        "updatedAt": now,
+                    },
+                )
+                return
+
+            try:
+                status_code, status_text = await _ig_container_status(
+                    container_id, token
+                )
+            except Exception as exc:  # noqa: BLE001 - نعيد المحاولة في cron القادم
+                attempts += 1
+                payload = {
+                    "attempts": attempts,
+                    "error": str(exc)[:300],
+                    "updatedAt": now,
+                }
+                if attempts >= SCHEDULE_RETRY_LIMIT:
+                    payload["state"] = "failed"
+                await _firebase_patch(db, path, payload)
+                return
+
+            if status_code == "FINISHED":
+                await _firebase_patch(
+                    db,
+                    path,
+                    {
+                        "state": "publishing",
+                        "attempts": 0,
+                        "error": None,
+                        "updatedAt": now,
+                    },
+                )
+                try:
+                    media_id = await _ig_publish(user_id, token, container_id)
+                except Exception as exc:  # noqa: BLE001
+                    # قد يكون النشر نجح والرد ضاع؛ لا نعيده تلقائياً حتى لا
+                    # يتكرر الريل. بعد PUBLISH_STUCK_MS تصير الحالة failed.
+                    await _firebase_patch(
+                        db,
+                        path,
+                        {
+                            "state": "publishing",
+                            "error": str(exc)[:300],
+                            "updatedAt": int(time.time() * 1000),
+                        },
+                    )
+                    return
+
+                finished = int(time.time() * 1000)
+                await _firebase_patch(
+                    db,
+                    path,
+                    {
+                        "state": "published",
+                        "mediaId": media_id,
+                        "publishedAt": finished,
+                        "error": None,
+                        "updatedAt": finished,
+                    },
+                )
+                return
+
+            if status_code in ("ERROR", "EXPIRED"):
+                await _firebase_patch(
+                    db,
+                    path,
+                    {
+                        "state": "failed",
+                        "error": (
+                            f"instagram container {status_code.lower()}: {status_text}"
+                        )[:300],
+                        "updatedAt": now,
+                    },
+                )
+                return
+
+            # IN_PROGRESS: الحاوية تنزّل الفيديو؛ نفحصها في cron القادم، وبعد
+            # ساعة بلا نتيجة نعلّمها فاشلة بدل الانتظار بلا نهاية.
+            attempts += 1
+            payload = {
+                "attempts": attempts,
+                "error": None,
+                "updatedAt": now,
+            }
+            if attempts >= SCHEDULE_RETRY_LIMIT:
+                payload["state"] = "failed"
+                payload["error"] = "instagram did not finish processing the video"
+            await _firebase_patch(db, path, payload)
 
     async def _archive(
         self, reel_id, code, tiktok, source, origin, thumbnail, app_media=None

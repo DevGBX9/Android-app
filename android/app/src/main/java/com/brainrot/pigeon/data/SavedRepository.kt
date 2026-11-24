@@ -57,7 +57,39 @@ class SavedRepository(
         }
 
         // الرفع لا يعطّل الواجهة ولا ينتهي بإغلاق شاشة المشاركة.
-        if (item.url != null) scope.launch { register(item) }
+        if (item.url != null) {
+            scope.launch {
+                register(item)
+                item.schedule?.let { remote.uploadSchedule(item.id, it) }
+            }
+        }
+    }
+
+    /** يحفظ مجموعة مشاركات مرة واحدة (نص + ملفات) بنفس ترتيب وصولها. */
+    suspend fun addAll(items: List<SavedItem>) {
+        items.forEach { add(it) }
+    }
+
+    /**
+     * يحدد هل هذه أول مشاركة (اختيار يدوي) أم أن هناك ريلاً مجدولاً سابقاً
+     * فنحسب الموعد التالي تلقائياً. يعتمد على Firebase أولاً ثم المحلي.
+     */
+    suspend fun schedulePlan(): SchedulePlan {
+        val local = readLocal()
+        val remoteSchedules = remote.fetchSchedules().getOrNull()
+
+        val last = buildList {
+            local.forEach { item -> item.schedule?.at?.takeIf { it > 0L }?.let { add(it) } }
+            remoteSchedules?.values?.forEach { schedule ->
+                if (schedule.at > 0L) add(schedule.at)
+            }
+        }.maxOrNull()
+
+        return if (last == null) {
+            SchedulePlan.Manual
+        } else {
+            SchedulePlan.Auto(ScheduleSlots.nextAfter(last))
+        }
     }
 
     suspend fun delete(id: String) {
@@ -73,18 +105,32 @@ class SavedRepository(
      */
     suspend fun syncFromRemote(): Result<Unit> {
         val remoteItems = remote.fetchAll().getOrElse { return Result.failure(it) }
+        // المواعيد منفصلة عن سجل الريل حتى لا يمسحها PATCH من التطبيق.
+        val remoteSchedules = remote.fetchSchedules().getOrDefault(emptyMap())
         val remoteIds = remoteItems.map { it.id }.toSet()
         var pending: List<SavedItem> = emptyList()
         var toArchive: List<SavedItem> = emptyList()
 
         context.savedStore.edit { prefs ->
             val local = decode(prefs[SAVED_ITEMS_KEY])
+            val localById = local.associateBy { it.id }
             pending = local.filter { it.url != null && it.id !in remoteIds }
 
             // LinkedHashMap: سجلات Firebase أولاً ثم ما هو محلي فقط.
             val merged = LinkedHashMap<String, SavedItem>()
-            remoteItems.forEach { merged[it.id] = it.copy(registered = true) }
-            local.forEach { item -> merged.putIfAbsent(item.id, item) }
+            remoteItems.forEach { item ->
+                val schedule = remoteSchedules[item.id] ?: localById[item.id]?.schedule
+                merged[item.id] = item.copy(registered = true, schedule = schedule)
+            }
+            local.forEach { item ->
+                val existing = merged[item.id]
+                val schedule = remoteSchedules[item.id] ?: item.schedule
+                if (existing == null) {
+                    merged[item.id] = item.copy(schedule = schedule)
+                } else {
+                    merged[item.id] = existing.copy(schedule = existing.schedule ?: schedule)
+                }
+            }
 
             val next = merged.values
                 .sortedByDescending { it.createdAt }
@@ -101,7 +147,10 @@ class SavedRepository(
             if (next != local) prefs[SAVED_ITEMS_KEY] = json.encodeToString(next)
         }
 
-        pending.forEach { register(it) }
+        pending.forEach { item ->
+            register(item)
+            item.schedule?.let { remote.uploadSchedule(item.id, it) }
+        }
         toArchive.forEach { item ->
             scope.launch { archive.request(item, tiktok.resolve(item.url)) }
         }
@@ -215,10 +264,7 @@ class SavedRepository(
      * بحد أقصى 30 محاولة في كل فتح للتطبيق.
      */
     suspend fun ensureThumbnails() {
-        val local = runCatching { context.savedStore.data.first()[SAVED_ITEMS_KEY] }
-            .getOrNull()
-            ?.let(::decode)
-            .orEmpty()
+        val local = readLocal()
 
         local.asSequence()
             .filter { it.url != null && it.thumbnail == null }
@@ -277,6 +323,12 @@ class SavedRepository(
             prefs[SAVED_ITEMS_KEY] = json.encodeToString(next)
         }
     }
+
+    private suspend fun readLocal(): List<SavedItem> =
+        runCatching { context.savedStore.data.first()[SAVED_ITEMS_KEY] }
+            .getOrNull()
+            ?.let(::decode)
+            .orEmpty()
 
     private fun decode(raw: String?): List<SavedItem> {
         if (raw.isNullOrBlank()) return emptyList()

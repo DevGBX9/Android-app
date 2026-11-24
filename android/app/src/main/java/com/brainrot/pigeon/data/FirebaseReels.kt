@@ -9,6 +9,8 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -31,6 +33,7 @@ class FirebaseReels(
 ) {
 
     private val endpoint = databaseUrl.trim().trimEnd('/') + "/reels"
+    private val schedulesEndpoint = databaseUrl.trim().trimEnd('/') + "/schedules"
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -57,6 +60,57 @@ class FirebaseReels(
             false
         }
     }
+
+    /**
+     * يرفع موعد النشر إلى `/schedules/<id>` (نفس معرّف الريل). نفصله عن سجل
+     * الريل حتى لا يمسح PATCH حقول الحالة التي يكتبها الـWorker لاحقاً.
+     */
+    suspend fun uploadSchedule(id: String, schedule: PublishSchedule): Boolean =
+        withContext(Dispatchers.IO) {
+            val url = "$schedulesEndpoint/$id.json".toHttpUrlOrNull()
+                ?: return@withContext false
+            // نرسل الوقت والتوقيت فقط: `state` و`attempts` و`containerId` ملك
+            // الـWorker، وأي PATCH بها من التطبيق قد يعيد ريلاً منشوراً للجدولة.
+            val body = buildJsonObject {
+                put("at", schedule.at)
+                put("timezone", schedule.timezone)
+            }.toString().toRequestBody(JSON_MEDIA)
+
+            runCatching {
+                client.newCall(Request.Builder().url(url).patch(body).build()).execute().use {
+                    if (!it.isSuccessful) Log.w(LOG_TAG, "schedule HTTP ${it.code}")
+                    it.isSuccessful
+                }
+            }.getOrElse { error ->
+                Log.w(LOG_TAG, "schedule upload failed: ${error.message}")
+                false
+            }
+        }
+
+    /** يسحب كل المواعيد؛ عقدة فاضية تعني خريطة فاضية وليست خطأ. */
+    suspend fun fetchSchedules(): Result<Map<String, PublishSchedule>> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val url = "$schedulesEndpoint/.json".toHttpUrlOrNull()
+                    ?: error("bad database url")
+
+                client.newCall(
+                    Request.Builder()
+                        .url(url)
+                        .header("Accept", "application/json")
+                        .build(),
+                ).execute().use { response ->
+                    val body = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) error("firebase HTTP ${response.code}")
+                    if (body.isBlank() || body.trim() == "null") {
+                        return@use emptyMap<String, PublishSchedule>()
+                    }
+
+                    val records = json.decodeFromString<Map<String, RemoteSchedule>>(body)
+                    records.mapValues { (_, record) -> record.toSchedule() }
+                }
+            }.onFailure { error -> Log.w(LOG_TAG, "schedules fetch failed: ${error.message}") }
+        }
 
     /** يقرأ حالة الأرشيف لسجل واحد من نفس العقدة التي يكتبها الـWorker. */
     suspend fun fetchArchive(id: String): ArchiveStatus? = withContext(Dispatchers.IO) {
@@ -142,4 +196,31 @@ private data class RemoteReel(
             createdAt = if (item.createdAt > 0L) item.createdAt else System.currentTimeMillis(),
         )
     }
+}
+
+/**
+ * شكل عقدة `/schedules/<id>` في Firebase كما يقرأها التطبيق. الرفع لا يستعمل
+ * هذا الصنف بل JSON مصغّر (`at` و`timezone` فقط)، لأن حقول الحالة ملك الـWorker.
+ */
+@Serializable
+private data class RemoteSchedule(
+    val at: Long = 0L,
+    val timezone: String = ScheduleSlots.TIMEZONE,
+    val state: String = ScheduleSlots.STATE_SCHEDULED,
+    val error: String? = null,
+    val attempts: Int = 0,
+    val containerId: String? = null,
+    val mediaId: String? = null,
+    val publishedAt: Long = 0L,
+) {
+    fun toSchedule() = PublishSchedule(
+        at = at,
+        timezone = timezone,
+        state = state,
+        error = error,
+        attempts = attempts,
+        containerId = containerId,
+        mediaId = mediaId,
+        publishedAt = publishedAt,
+    )
 }

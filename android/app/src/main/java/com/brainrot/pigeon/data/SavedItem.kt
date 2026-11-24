@@ -29,5 +29,7 @@ data class SavedItem(
     val archiveState: String? = null,
     val archiveProgress: Int = 0,
     val downloadUrl: String? = null,
+    /** موعد النشر التلقائي من Cloudflare إلى إنستغرام (null = غير مجدول). */
+    val schedule: PublishSchedule? = null,
     val createdAt: Long = 0L,
 )

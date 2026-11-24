@@ -1,5 +1,5 @@
 {
-  // نقطة نشر Pigeon Reels API: Worker بايثون + مخزن R2.
+  // نقطة نشر Pigeon Reels API: Worker بايثون + مخزن R2 + نشر مجدول إلى إنستغرام.
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "brainrot-pigeon-reels",
   "main": "src/entry.py",
@@ -7,7 +7,17 @@
   "compatibility_flags": ["python_workers"],
   "observability": { "enabled": true },
   "vars": {
-    "FIREBASE_DB": "https://brainrotpigeon67-default-rtdb.europe-west1.firebasedatabase.app"
+    "FIREBASE_DB": "https://brainrotpigeon67-default-rtdb.europe-west1.firebasedatabase.app",
+    // حساب إنستغرام الذي ينشر عليه الـWorker.
+    "IG_USER_ID": "17841438848736931",
+    // العنوان العام الذي تعطيه Meta لتنزيل الريل من R2.
+    "PUBLIC_BASE_URL": "https://brainrot-pigeon-reels.brainrotpigeon.workers.dev"
+    // IG_ACCESS_TOKEN ليس هنا: يُضبط كسرّ من GitHub Actions
+    // (Settings → Secrets and variables → Actions → IG_ACCESS_TOKEN).
+  },
+  "triggers": {
+    // فحص المواعيد كل 5 دقائق؛ 19:00 الجزائر = 18:00 UTC.
+    "crons": ["*/5 * * * *"]
   },
   "r2_buckets": [
     {

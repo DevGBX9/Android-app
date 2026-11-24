@@ -69,7 +69,9 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.brainrot.pigeon.AppContainer
 import com.brainrot.pigeon.R
 import com.brainrot.pigeon.data.AvatarLoader
+import com.brainrot.pigeon.data.PublishSchedule
 import com.brainrot.pigeon.data.SavedItem
+import com.brainrot.pigeon.data.ScheduleSlots
 import com.brainrot.pigeon.ui.theme.Accent
 import com.brainrot.pigeon.ui.theme.Outline
 import com.brainrot.pigeon.ui.theme.TextMuted
@@ -290,8 +292,17 @@ private fun ReelCell(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier
                 .align(Alignment.BottomStart)
-                .padding(horizontal = 6.dp, vertical = 5.dp),
+                .padding(start = 6.dp, end = 30.dp, top = 5.dp, bottom = 5.dp),
         )
+
+        item.schedule?.let { schedule ->
+            ScheduleBadge(
+                schedule = schedule,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(5.dp),
+            )
+        }
 
         // نسبة معالجة الريل على Cloudflare (0..100) قبل أن يصير قابلاً للتحميل.
         if (processing && !busy) {
@@ -357,6 +368,23 @@ private fun ReelCell(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(7.dp),
                 ) {
+                    item.schedule?.let { schedule ->
+                        Text(
+                            text = when (schedule.state) {
+                                ScheduleSlots.STATE_PUBLISHED ->
+                                    stringResource(R.string.schedule_published)
+
+                                ScheduleSlots.STATE_FAILED ->
+                                    stringResource(R.string.schedule_failed)
+
+                                else -> ScheduleSlots.formatShort(schedule.at)
+                            },
+                            color = Color.White.copy(alpha = 0.9f),
+                            fontSize = 9.sp,
+                            textAlign = TextAlign.Center,
+                        )
+                    }
+
                     if (isArchivable(item)) {
                         Row(
                             modifier = Modifier
@@ -388,6 +416,41 @@ private fun ReelCell(
                     )
                 }
             }
+        }
+    }
+}
+
+/** شارة صغيرة أسفل الخانة: ساعة للمجدول، صح للناشر، تعجّب للفاشل. */
+@Composable
+private fun ScheduleBadge(schedule: PublishSchedule, modifier: Modifier = Modifier) {
+    val published = schedule.state == ScheduleSlots.STATE_PUBLISHED
+    val failed = schedule.state == ScheduleSlots.STATE_FAILED
+
+    Box(
+        modifier = modifier
+            .size(19.dp)
+            .clip(CircleShape)
+            .background(Color.Black.copy(alpha = 0.55f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        when {
+            published -> Icon(
+                imageVector = Icons.Filled.Check,
+                contentDescription = stringResource(R.string.schedule_published),
+                tint = Accent,
+                modifier = Modifier.size(12.dp),
+            )
+
+            failed -> Text(
+                text = "!",
+                color = Color(0xFFFF6B6B),
+                fontSize = 11.sp,
+            )
+
+            else -> ClockGlyph(
+                color = Color.White,
+                modifier = Modifier.size(11.dp),
+            )
         }
     }
 }
@@ -522,6 +585,35 @@ fun DownloadGlyph(color: Color, modifier: Modifier = Modifier) {
             color = color,
             start = Offset(w * 0.14f, h * 0.92f),
             end = Offset(w * 0.86f, h * 0.92f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+    }
+}
+
+/** ساعة بسيطة مرسومة: دائرة وعقربان، بلا مكتبة أيقونات إضافية. */
+@Composable
+private fun ClockGlyph(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val side = size.minDimension
+        val stroke = side * 0.1f
+
+        drawCircle(
+            color = color,
+            radius = side * 0.42f,
+            style = Stroke(stroke),
+        )
+        drawLine(
+            color = color,
+            start = Offset(side * 0.5f, side * 0.5f),
+            end = Offset(side * 0.5f, side * 0.27f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = color,
+            start = Offset(side * 0.5f, side * 0.5f),
+            end = Offset(side * 0.69f, side * 0.58f),
             strokeWidth = stroke,
             cap = StrokeCap.Round,
         )

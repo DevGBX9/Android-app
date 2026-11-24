@@ -5,7 +5,6 @@ import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
 import com.brainrot.pigeon.data.SavedItem
-import com.brainrot.pigeon.data.SavedRepository
 import java.io.File
 import java.io.IOException
 import java.util.UUID
@@ -15,58 +14,63 @@ import kotlinx.coroutines.withContext
 private const val MAX_SHARED_FILE_BYTES = 150L * 1024 * 1024
 
 /**
- * يحوّل محتوى Intent المشاركة إلى عناصر مجدولة:
+ * يحوّل محتوى Intent المشاركة إلى عناصر جاهزة للحفظ، بدون حفظها بعد:
  * نص فيه رابط، ملف واحد، عدة ملفات، أو رابط تم فتحه مباشرة.
  *
- * يعيد عناوين ما أُضيف فعلاً حتى تعرض النافذة الطافية اسم الريل.
+ * الفصل بين التحضير والحفظ يسمح بعرض خطوة اختيار الموعد أولاً، فلا يُسجَّل
+ * الريل في Firebase ولا يبدأ أرشفته إلا بعد تأكيد المستخدم.
  */
 class ShareIntake(
     private val context: Context,
-    private val saved: SavedRepository,
 ) {
 
-    suspend fun handle(intent: Intent?): List<String> = withContext(Dispatchers.IO) {
+    suspend fun prepare(intent: Intent?): List<SavedItem> = withContext(Dispatchers.IO) {
         if (intent == null) return@withContext emptyList()
 
-        val added = mutableListOf<String>()
+        val items = mutableListOf<SavedItem>()
         val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
 
         when (intent.action) {
             Intent.ACTION_SEND -> {
-                ShareParser.fromText(sharedText)?.let { target ->
-                    saved.add(target.toSavedItem())
-                    added += target.title
-                }
+                ShareParser.fromText(sharedText)?.let { items += it.toSavedItem() }
                 intent.singleStream()?.let { uri ->
-                    saveFile(uri)?.let { added += it }
+                    saveFile(uri)?.let { items += it }
                 }
             }
 
             Intent.ACTION_SEND_MULTIPLE -> {
-                ShareParser.fromText(sharedText)?.let { target ->
-                    saved.add(target.toSavedItem())
-                    added += target.title
-                }
+                ShareParser.fromText(sharedText)?.let { items += it.toSavedItem() }
                 intent.allStreams().forEach { uri ->
-                    saveFile(uri)?.let { added += it }
+                    saveFile(uri)?.let { items += it }
                 }
             }
 
             Intent.ACTION_VIEW -> {
                 intent.dataString?.let { raw ->
-                    ShareParser.classify(raw)?.let { target ->
-                        saved.add(target.toSavedItem())
-                        added += target.title
-                    }
+                    ShareParser.classify(raw)?.let { items += it.toSavedItem() }
                 }
             }
         }
 
-        added
+        items
     }
 
-    /** يعيد عنوان الملف بعد نسخه، أو null إذا فشل. */
-    private suspend fun saveFile(uri: Uri): String? = withContext(Dispatchers.IO) {
+    /**
+     * يحذف الملفات التي نُسخت أثناء التحضير إذا ألغى المستخدم الجدولة،
+     * حتى لا تبقى نسخ يتيمة في مجلد التطبيق.
+     */
+    fun discard(items: List<SavedItem>) {
+        items.forEach { item ->
+            val path = item.filePath ?: return@forEach
+            val file = File(path)
+            if (file.parentFile?.name == "saved") {
+                runCatching { file.delete() }
+            }
+        }
+    }
+
+    /** يعيد عنصر الملف بعد نسخه، أو null إذا فشل. */
+    private suspend fun saveFile(uri: Uri): SavedItem? = withContext(Dispatchers.IO) {
         var target: File? = null
         try {
             val resolver = context.contentResolver
@@ -96,19 +100,16 @@ class ShareIntake(
                 }
             } ?: throw IOException("cannot open stream")
 
-            saved.add(
-                SavedItem(
-                    id = UUID.randomUUID().toString(),
-                    platform = if (mime.startsWith("video/")) "video" else "file",
-                    kind = "file",
-                    title = displayName,
-                    filePath = file.absolutePath,
-                    fileName = displayName,
-                    mimeType = mime,
-                    createdAt = System.currentTimeMillis(),
-                ),
+            SavedItem(
+                id = UUID.randomUUID().toString(),
+                platform = if (mime.startsWith("video/")) "video" else "file",
+                kind = "file",
+                title = displayName,
+                filePath = file.absolutePath,
+                fileName = displayName,
+                mimeType = mime,
+                createdAt = System.currentTimeMillis(),
             )
-            displayName
         } catch (_: Exception) {
             target?.delete()
             null
