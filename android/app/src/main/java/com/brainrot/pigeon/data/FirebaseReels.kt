@@ -149,6 +149,29 @@ class FirebaseReels(
             }
         }.onFailure { error -> Log.w(LOG_TAG, "fetch failed: ${error.message}") }
     }
+
+    /** يحذف سجل الريل من القاعدة بعد نجاح نشره على إنستغرام. */
+    suspend fun deleteReel(id: String): Boolean = delete("$endpoint/$id.json", id)
+
+    /** يحذف موعد الريل مع سجله حتى لا يعيد الـWorker معالجته. */
+    suspend fun deleteSchedule(id: String): Boolean =
+        delete("$schedulesEndpoint/$id.json", id)
+
+    private suspend fun delete(url: String, id: String): Boolean =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val target = url.toHttpUrlOrNull() ?: return@withContext false
+                client.newCall(
+                    Request.Builder().url(target).delete().build(),
+                ).execute().use { response ->
+                    if (!response.isSuccessful) Log.w(LOG_TAG, "delete $id HTTP ${response.code}")
+                    response.isSuccessful
+                }
+            }.getOrElse { error ->
+                Log.w(LOG_TAG, "delete $id failed: ${error.message}")
+                false
+            }
+        }
 }
 
 @OptIn(ExperimentalSerializationApi::class)

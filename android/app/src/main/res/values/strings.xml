@@ -12,10 +12,13 @@
     <string name="action_close">Close</string>
 
     <string name="schedule_title">Schedule this reel</string>
-    <string name="schedule_time_step">First pick the hour and minute it goes live.</string>
+    <string name="schedule_time_step">Pick the hour, the minute, and AM or PM.</string>
     <string name="schedule_date_step">Now pick the date.</string>
     <string name="schedule_hour">Hour</string>
     <string name="schedule_minute">Minute</string>
+    <string name="schedule_meridiem">AM / PM</string>
+    <string name="schedule_am">AM</string>
+    <string name="schedule_pm">PM</string>
     <string name="schedule_next">Next</string>
     <string name="schedule_back">Back</string>
     <string name="schedule_confirm">Schedule</string>

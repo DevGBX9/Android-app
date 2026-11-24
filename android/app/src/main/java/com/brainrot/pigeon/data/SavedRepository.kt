@@ -110,15 +110,28 @@ class SavedRepository(
         val remoteIds = remoteItems.map { it.id }.toSet()
         var pending: List<SavedItem> = emptyList()
         var toArchive: List<SavedItem> = emptyList()
+        val localBefore = readLocal()
+
+        // الريلز التي نجح نشرها تُحذف من القائمة ومن Firebase. نتحقق من الموعد
+        // نفسه (publishedAt) أو من الحالة، حتى لو تأخر تحديث سجل الريل.
+        val publishedIds = buildSet {
+            remoteSchedules.forEach { (id, schedule) ->
+                if (schedule.isPublished) add(id)
+            }
+            localBefore.forEach { item ->
+                if (item.schedule?.isPublished == true) add(item.id)
+            }
+        }
+        val liveRemote = remoteItems.filterNot { it.id in publishedIds }
 
         context.savedStore.edit { prefs ->
-            val local = decode(prefs[SAVED_ITEMS_KEY])
+            val local = decode(prefs[SAVED_ITEMS_KEY]).filterNot { it.id in publishedIds }
             val localById = local.associateBy { it.id }
             pending = local.filter { it.url != null && it.id !in remoteIds }
 
             // LinkedHashMap: سجلات Firebase أولاً ثم ما هو محلي فقط.
             val merged = LinkedHashMap<String, SavedItem>()
-            remoteItems.forEach { item ->
+            liveRemote.forEach { item ->
                 val schedule = remoteSchedules[item.id] ?: localById[item.id]?.schedule
                 merged[item.id] = item.copy(registered = true, schedule = schedule)
             }
@@ -153,6 +166,12 @@ class SavedRepository(
         }
         toArchive.forEach { item ->
             scope.launch { archive.request(item, tiktok.resolve(item.url)) }
+        }
+        // بعد النشر: حذف السجل والموعد من القاعدة حتى لا يعيد الـWorker معالجته.
+        // لو فشل الحذف تُعاد المحاولة في المزامنة القادمة (الحالة ما زالت published).
+        publishedIds.forEach { id ->
+            remote.deleteReel(id)
+            remote.deleteSchedule(id)
         }
         return Result.success(Unit)
     }

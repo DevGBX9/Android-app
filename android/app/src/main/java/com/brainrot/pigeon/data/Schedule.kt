@@ -28,6 +28,10 @@ data class PublishSchedule(
     val publishedAt: Long = 0L,
 )
 
+/** الريل نُشر فعلاً على إنستغرام: يُحذف من القائمة بعدها. */
+val PublishSchedule.isPublished: Boolean
+    get() = state == ScheduleSlots.STATE_PUBLISHED || publishedAt > 0L
+
 /** خطة الموعد التي تظهر في نافذة المشاركة. */
 sealed interface SchedulePlan {
     /** لا يوجد أي ريل مجدول بعد: المستخدم يختار الوقت ثم التاريخ. */
@@ -59,11 +63,14 @@ object ScheduleSlots {
     private val zone: ZoneId = ZoneId.of(TIMEZONE)
 
     private val fullFormat =
-        DateTimeFormatter.ofPattern("EEE, d MMM yyyy · HH:mm", Locale.ENGLISH)
+        DateTimeFormatter.ofPattern("EEE, d MMM yyyy · h:mm a", Locale.ENGLISH)
     private val shortFormat =
-        DateTimeFormatter.ofPattern("d MMM · HH:mm", Locale.ENGLISH)
+        DateTimeFormatter.ofPattern("d MMM · h:mm a", Locale.ENGLISH)
     private val dateFormat =
         DateTimeFormatter.ofPattern("EEE, d MMM yyyy", Locale.ENGLISH)
+    // الوقت يظهر بنظام 12 ساعة مع AM/PM: 7:00 PM و 7:00 AM.
+    private val timeFormat =
+        DateTimeFormatter.ofPattern("h:mm a", Locale.ENGLISH)
 
     fun at(date: LocalDate, hour: Int, minute: Int): Long =
         ZonedDateTime.of(date, LocalTime.of(hour, minute), zone)
@@ -100,6 +107,22 @@ object ScheduleSlots {
         Instant.ofEpochMilli(epochMillis).atZone(zone).format(shortFormat)
 
     fun formatDate(date: LocalDate): String = date.format(dateFormat)
+
+    /** "7:00 PM" لساعة 24 داخلية (19, 0) مثلًا. */
+    fun formatTime(hour24: Int, minute: Int): String =
+        LocalTime.of(hour24.coerceIn(0, 23), minute.coerceIn(0, 59)).format(timeFormat)
+
+    /** 19 → 7، و 0 → 12، و 12 → 12. */
+    fun hour12(hour24: Int): Int {
+        val hour = hour24.coerceIn(0, 23) % 12
+        return if (hour == 0) 12 else hour
+    }
+
+    fun isPm(hour24: Int): Boolean = hour24 >= 12
+
+    /** 7 PM → 19، و 12 AM → 0، و 12 PM → 12. */
+    fun hour24(hour12: Int, pm: Boolean): Int =
+        (hour12.coerceIn(1, 12) % 12) + (if (pm) 12 else 0)
 }
 
 /**

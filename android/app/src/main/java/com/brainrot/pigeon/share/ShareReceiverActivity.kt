@@ -488,7 +488,8 @@ private fun TimeStep(
     )
     Spacer(Modifier.height(10.dp))
     Text(
-        text = String.format(Locale.US, "%02d:%02d", hour, minute),
+        // الوقت بنظام 12 ساعة: 7:00 PM مساءً أو 7:00 AM صباحاً.
+        text = ScheduleSlots.formatTime(hour, minute),
         color = TextPrimary,
         fontSize = 34.sp,
         fontWeight = FontWeight.Bold,
@@ -517,14 +518,17 @@ private fun TimeStep(
                     .fillMaxWidth()
                     .height(148.dp),
                 state = rememberLazyListState(
-                    initialFirstVisibleItemIndex = (hour - 1).coerceAtLeast(0),
+                    initialFirstVisibleItemIndex = ScheduleSlots.hour12(hour) - 1,
                 ),
             ) {
-                items(24) { value ->
+                items(12) { index ->
+                    val value = index + 1
                     ChoiceChip(
                         text = String.format(Locale.US, "%02d", value),
-                        selected = value == hour,
-                        onClick = { onHour(value) },
+                        selected = value == ScheduleSlots.hour12(hour),
+                        onClick = {
+                            onHour(ScheduleSlots.hour24(value, ScheduleSlots.isPm(hour)))
+                        },
                     )
                 }
             }
@@ -542,7 +546,7 @@ private fun TimeStep(
                     .fillMaxWidth()
                     .height(148.dp),
                 state = rememberLazyListState(
-                    initialFirstVisibleItemIndex = (minute - 1).coerceAtLeast(0),
+                    initialFirstVisibleItemIndex = minute,
                 ),
             ) {
                 items(60) { value ->
@@ -553,6 +557,28 @@ private fun TimeStep(
                     )
                 }
             }
+        }
+
+        // AM / PM: يبدّل بين صباح ومساء مع بقاء الساعة الظاهرة كما هي.
+        Column(Modifier.weight(0.85f)) {
+            Text(
+                text = stringResource(R.string.schedule_meridiem),
+                color = TextMuted,
+                fontSize = 10.sp,
+            )
+            Spacer(Modifier.height(4.dp))
+            val pm = ScheduleSlots.isPm(hour)
+            val hour12 = ScheduleSlots.hour12(hour)
+            ChoiceChip(
+                text = stringResource(R.string.schedule_am),
+                selected = !pm,
+                onClick = { onHour(ScheduleSlots.hour24(hour12, false)) },
+            )
+            ChoiceChip(
+                text = stringResource(R.string.schedule_pm),
+                selected = pm,
+                onClick = { onHour(ScheduleSlots.hour24(hour12, true)) },
+            )
         }
     }
 
@@ -597,7 +623,7 @@ private fun DateStep(
     )
     Spacer(Modifier.height(4.dp))
     Text(
-        text = String.format(Locale.US, "%02d:%02d", hour, minute) +
+        text = ScheduleSlots.formatTime(hour, minute) +
             " · " + stringResource(R.string.schedule_zone),
         color = TextMuted,
         fontSize = 11.sp,
