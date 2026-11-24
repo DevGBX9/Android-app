@@ -18,7 +18,7 @@
 import json
 import re
 import time
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse
 
 from workers import Response, WorkerEntrypoint, fetch
 
@@ -30,11 +30,6 @@ RTDB_FALLBACK = (
 MAX_BYTES = 48 * 1024 * 1024
 CHUNK_BYTES = 2 * 1024 * 1024
 PROGRESS_STEP = 4
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
 
 INSTAGRAM_HOSTS = (
     "instagram.com",
@@ -52,12 +47,20 @@ MEDIA_HOST_SUFFIXES = (
 
 SHORTCODE_RE = re.compile(r"/(?:reel|reels|p|tv)/([A-Za-z0-9_-]{5,40})")
 
-VIDEO_URL_PATTERNS = (
-    re.compile(r'"video_url":"([^"]+)"'),
-    re.compile(r'video_url\\":\\"([^"\\]+)\\"'),
-    re.compile(r'<meta[^>]+property="og:video"[^>]+content="([^"]+)"'),
-    re.compile(r'"contentUrl":"([^"]+)"'),
-    re.compile(r'"video_url":"([^"]+)"'),
+# إنستغرام يخدم الصفحة الكاملة فقط لزوار غير المتصفحات؛ متصفح عادي يحصل على شاشة تسجيل دخول.
+CRAWLER_UA = (
+    "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
+)
+
+OG_VIDEO_RE = re.compile(
+    r'<meta[^>]+(?:property|name)="og:video(?::\w+)?"[^>]+content="([^"]+)"'
+)
+
+MEDIA_MARKERS = (
+    '"video_url"',
+    'video_url\\"',
+    '"contentUrl"',
+    'contentUrl\\"',
 )
 
 
@@ -149,13 +152,35 @@ def _is_media_host(host):
 
 
 def _unescape_media(link):
-    text = (
-        link.replace("\\/", "/")
-        .replace("\\u0026", "&")
-        .replace("\\u003D", "=")
-        .replace("&amp;", "&")
-    )
-    return unquote(text) if "%" in text and "?" not in text else text
+    """يفكّ تهريب JS للروابط (`\\/`، `\\u0026`) حتى تصير روابط صحيحة."""
+    text = str(link or "")
+    if "\\" in text:
+        text = (
+            text.replace("\\u0026", "&")
+            .replace("\\u003D", "=")
+            .replace("\\u002F", "/")
+            .replace("\\", "")
+        )
+    return text.replace("&amp;", "&").strip()
+
+
+def _media_urls(html):
+    """يستخرج كل روابط الفيديو المرشّحة من صفحة إنستغرام (حتى المُهرَّبة)."""
+    found = []
+    for marker in MEDIA_MARKERS:
+        index = html.find(marker)
+        while index != -1:
+            window = html[index : index + 4000]
+            start = window.find("http")
+            if start != -1:
+                end = window.find('"', start)
+                if end == -1:
+                    end = start + 2500
+                found.append(_unescape_media(window[start:end]))
+            index = html.find(marker, index + 1)
+    for match in OG_VIDEO_RE.finditer(html):
+        found.append(_unescape_media(match.group(1)))
+    return found
 
 
 def _safe_id(value):
@@ -202,11 +227,12 @@ async def _resolve_media_url(code):
     يرجّع `(url, attempts)`: الرابط إن وُجد، ووصف قصير لما أعادته إنستغرام.
     """
     pages = (
+        f"https://www.instagram.com/reel/{code}/embed/",
         f"https://www.instagram.com/reel/{code}/embed/captioned/",
-        f"https://www.instagram.com/p/{code}/embed/captioned/",
+        f"https://www.instagram.com/p/{code}/embed/",
     )
     headers = {
-        "user-agent": USER_AGENT,
+        "user-agent": CRAWLER_UA,
         "accept": "text/html,application/xhtml+xml",
         "accept-language": "en-US,en;q=0.9",
     }
@@ -224,20 +250,13 @@ async def _resolve_media_url(code):
             attempts.append(f"embed -> HTTP {status}")
             continue
         html = await response.text()
-        found = False
-        for pattern in VIDEO_URL_PATTERNS:
-            match = pattern.search(html)
-            if not match:
-                continue
-            candidate = _unescape_media(match.group(1))
+        candidates = _media_urls(html)
+        for candidate in candidates:
             host = (urlparse(candidate).hostname or "").lower()
             if _is_media_host(host):
                 return candidate, attempts
-            found = True
         attempts.append(
-            f"embed -> HTTP 200, no media url (len {len(html)}, video tag: {'<video' in html})"
-            if not found
-            else "embed -> HTTP 200, media url on a foreign host"
+            f"embed -> HTTP {status}, {len(candidates)} candidate(s), {len(html)} bytes"
         )
 
     return None, attempts
@@ -247,7 +266,7 @@ async def _media_size(media_url):
     response = await fetch(
         media_url,
         method="HEAD",
-        headers={"user-agent": USER_AGENT, "referer": "https://www.instagram.com/"},
+        headers={"user-agent": CRAWLER_UA, "referer": "https://www.instagram.com/"},
         redirect="follow",
     )
     try:
@@ -263,7 +282,7 @@ async def _download_bytes(media_url, on_progress):
         raise RuntimeError(f"reel too large ({size} bytes)")
 
     headers = {
-        "user-agent": USER_AGENT,
+        "user-agent": CRAWLER_UA,
         "referer": "https://www.instagram.com/",
     }
 
