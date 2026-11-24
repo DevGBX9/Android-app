@@ -909,7 +909,7 @@ class Default(WorkerEntrypoint):
                 {
                     "ok": True,
                     "service": "pigeon-reels",
-                    "version": 4,
+                    "version": 5,
                     "routes": [
                         "POST /reels",
                         "GET /reels/<id>",
@@ -999,6 +999,18 @@ class Default(WorkerEntrypoint):
                 status=503,
             )
 
+        # نحفظ الرابط الذي حلّه الهاتف حتى يستطيع cron إعادة الأرشفة بنفسه
+        # لو انقطعت الأرشفة الأولى قبل أن يُخزّن الملف في R2.
+        if app_media:
+            try:
+                await _firebase_patch(
+                    db,
+                    f"reels/{reel_id}.json",
+                    {"media": app_media, "source": source},
+                )
+            except Exception:  # noqa: BLE001 - تحسين فقط
+                pass
+
         job = self._archive(
             reel_id=reel_id,
             code=code,
@@ -1008,13 +1020,16 @@ class Default(WorkerEntrypoint):
             thumbnail=thumbnail,
             app_media=app_media if source == "tiktok" else None,
         )
+        # ننتظر الأرشفة داخل الطلب: `waitUntil` تُلغى بعد انتهاء الاستجابة،
+        # وهذا هو سبب أن الملف كان لا يصل R2 إلا عند إعادة الطلب من زر التنزيل.
         try:
-            self.ctx.waitUntil(job)
-        except BaseException:  # noqa: BLE001 - لو تعذّر التشغيل في الخلفية نكمل الطلب
-            try:
-                await job
-            except BaseException:  # noqa: BLE001
-                pass
+            await asyncio.wait_for(job, ARCHIVE_BUDGET_S + 8)
+        except BaseException:  # noqa: BLE001 - نكمل بالحالة المسجلة
+            pass
+
+        stored = await _object_exists(self.env, self._key(reel_id))
+        if stored is True:
+            return _json({"ok": True, "id": reel_id, "state": "ready"}, status=202)
 
         return _json({"ok": True, "id": reel_id, "state": "queued"}, status=202)
 
@@ -1138,6 +1153,63 @@ class Default(WorkerEntrypoint):
         except Exception:  # noqa: BLE001 - تشخيص فقط، لا نُفشل التشغيل
             pass
 
+    async def _archive_missing(self, db):
+        """يؤرشف ريلاً مجدولاً ما زال ملفه غائباً عن R2.
+
+        الأرشفة وقت المشاركة قد لا تكتمل (الهاتف أغلق التطبيق أو المهمة أُلغيت)،
+        فيصل الموعد بلا فيديو في التخزين ولا ينشر شيء. نعيد المحاولة من cron
+        قبل الموعد بوقت كافٍ.
+        """
+        schedules = await _firebase_get(db, "schedules.json") or {}
+        if not isinstance(schedules, dict):
+            return 0
+
+        candidates = []
+        for schedule_id, schedule in schedules.items():
+            if not isinstance(schedule, dict):
+                continue
+            try:
+                at = int(schedule.get("at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if at <= 0:
+                continue
+            if _clean(schedule.get("state"), "scheduled") != "scheduled":
+                continue
+            if _clean(schedule.get("containerId")):
+                continue  # الحاوية موجودة: الملف سبق أن وصل R2
+            candidates.append((at, schedule_id))
+
+        candidates.sort()
+        started = 0
+        for _at, schedule_id in candidates[:1]:
+            clean_id = _safe_id(schedule_id)
+            if not clean_id:
+                continue
+            if await _object_exists(self.env, self._key(clean_id)) is True:
+                continue
+            reel = await _firebase_get(db, f"reels/{clean_id}.json") or {}
+            if not isinstance(reel, dict):
+                continue
+            link = _clean(reel.get("url"))
+            if not link:
+                continue
+            code = _instagram_code(link)
+            tiktok = None if code else _tiktok_link(link)
+            if not code and not tiktok:
+                continue
+            await self._archive(
+                reel_id=clean_id,
+                code=code,
+                tiktok=tiktok,
+                source="instagram" if code else "tiktok",
+                origin=_ig_public_base(self.env),
+                thumbnail=_clean(reel.get("thumbnail")) or None,
+                app_media=_safe_media_url(reel.get("media")),
+            )
+            started += 1
+        return started
+
     async def _publish_due(self):
         db = self._db()
         now = int(time.time() * 1000)
@@ -1180,6 +1252,13 @@ class Default(WorkerEntrypoint):
             if at - now > PREPARE_LEAD_MS:
                 continue
             prepare.append((schedule_id, schedule, at))
+
+        # لا شيء مستحق الآن: نستغل التشغيل في تجهيز أرشيف ريل قادم ناقص.
+        if not due:
+            try:
+                report["archived"] = await self._archive_missing(db)
+            except Exception as exc:  # noqa: BLE001 - ليس حرجاً
+                print(f"pigeon archive retry failed: {exc}")
 
         # تجهيز الحاويات القريبة أولاً (الأقرب موعداً أولاً).
         prepare.sort(key=lambda entry: entry[2])
