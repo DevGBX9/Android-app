@@ -112,8 +112,19 @@ brainrot.pigeon — تطبيق أندرويد أصلي
 - الخانات: fillMaxWidth + aspectRatio(9/16) صراحةً (مستطيل قائم مضمون).
 
 2.7 اللغة
-- كل نصوص الواجهة بالإنجليزية فقط (strings.xml كلها إنجليزية، ورسائل
-  R2Uploader كذلك). العربية باقية فقط في تعليقات الكود والتوثيق.
+- كل نصوص الواجهة بالإنجليزية فقط (strings.xml كلها إنجليزية). العربية باقية
+  فقط في تعليقات الكود والتوثيق.
+
+2.8 تنظيف المشروع (24 نوفمبر)
+- انحذف كل شي له علاقة بالموقع/صفحة الويب القديمة: index.html، index - Copy.html،
+  script.js، style.css، assets/، firebase.json، .firebaserc، functions/،
+  worker/ (مصدر البروكسي)، و .firebase/ المحلي.
+- انحذف كود R2 الميت: R2Uploader.kt، وحقل r2UploadEnabled/R2 keys في
+  SettingsRepository و DEFAULT_R2_ENDPOINT في build.gradle.kts، وقسم R2 في
+  التوثيق. لا شي منها كان مستخدماً في الواجهة.
+- المستودع الآن فيه: android/ + docs/ + .github/ + README + ملف الحالة هذا.
+  ملاحظة: البروكسي المنشور على Cloudflare لسا يخدم كاحتياط للتطبيق
+  (DEFAULT_API_ENDPOINT)، ومصدره صار بذاكرة Git فقط (commit 69a42e2 وما قبله).
 
 
 --------------------------------------------------------------------
@@ -133,7 +144,6 @@ android/app/src/main/java/com/brainrot/pigeon/
     ReelThumbnails.kt        oEmbed + استخراج كود الريل
     AvatarLoader.kt          تحميل صور + كاش LRU
     Stores.kt                DataStores الثلاثة
-    R2Uploader.kt            رفع اختياري لـR2 (غير مستخدم في الواجهة حالياً)
   share/
     ShareParser.kt           تنقية/تصنيف الروابط (نقي وقابل للاختبار)
     ShareIntake.kt           تحويل Intent إلى SavedItem + نسخ الملفات
@@ -150,10 +160,11 @@ android/app/src/main/java/com/brainrot/pigeon/
   src/test/.../ShareParserTest.kt   اختبار JVM للروابط (يعمل على CI)
 
 docs/
-  ANDROID.md                 التوثيق الكامل (بنية، بناء، مشاركة، Firebase، R2)
+  ANDROID.md                 التوثيق الكامل (بنية، بناء، مشاركة، Firebase)
   tools/check_android.py     الفحص الساكن الوحيد المسموح محلياً
 .github/workflows/android.yml  ينفّذ testDebugUnitTest + assembleDebug + نشر latest
-worker/src/index.js            بروكسي البروفايل (CACHE_TTL = 20 ثانية)
+
+ملاحظة: لا يوجد في المستودع موقع ولا functions/ ولا worker/ — التطبيق فقط.
 
 
 --------------------------------------------------------------------
@@ -209,15 +220,16 @@ worker/src/index.js            بروكسي البروفايل (CACHE_TTL = 20 �
    فوق التطبيق، View/Close، ظهور الريل بغلافه في خانة 9:16، وظهور نفس السجل
    في Firebase تحت /reels مع حقل thumbnail.
 2. نظام التنزيل (الخطوة الكبيرة القادمة): تنزيل فيديو الريل نفسه وتخزينه
-   محلياً (أو رفعه لـR2)، ثم تشغيله داخل التطبيق بدل فتحه في إنستغرام.
-   ملاحظة: تنزيل فيديو إنستغرام يحتاج مسار موثوق (Worker/طرف ثالث) — نحتاج
-   نقرر الطريقة قبل البدء.
+   محلياً، ثم تشغيله داخل التطبيق بدل فتحه في إنستغرام.
+   ملاحظة: تنزيل فيديو إنستغرام يحتاج مسار موثوق (بروكسي/طرف ثالث) — نحتاج
+   نقرر الطريقة قبل البدء، ونحتاج نرجّع مصدر البروكسي من تاريخ Git إذا احتجناه.
 3. تأمين Firebase: إضافة مصادقة (Sign in / Anonymous Auth) وقواعد تقيّد
    القراءة والكتابة، لأن القواعد الحالية مفتوحة.
 4. إدارة القائمة: حذف/إعادة ترتيب/تعديل جدولة الريلز من داخل الشبكة (ضغط مطوّل
    مثلاً) — غير موجود حالياً، الإضافة فقط عبر المشاركة.
-5. تحسين التحديث: نشر worker/src/index.js بـ CACHE_TTL أقصر (5 ثوانٍ) إذا بقي
-   إحساس التأخر — يحتاج صلاحية Cloudflare/dl wrangler + سر IG_ACCESS_TOKEN.
+5. تحسين التحديث: لو بقي إحساس تأخر مع البروكسي، نرجّع مصدر الـWorker من
+   تاريخ Git وننشره بـ CACHE_TTL أقصر (5 ثوانٍ) — يحتاج صلاحية Cloudflare
+   وwrangler + سر IG_ACCESS_TOKEN.
 6. تفاصيل صغيرة: عرض عدد الريلز، ومؤشر مزامنة، وإشعار فشل الرفع (اختياري).
 
 

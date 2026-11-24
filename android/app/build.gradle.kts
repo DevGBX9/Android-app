@@ -47,7 +47,7 @@ android {
             "DEFAULT_IG_ACCESS_TOKEN",
             "\"${configValue("pigeon.igAccessToken", "EAAXjGpto53wBTMVsnQQjeqVKWIWJAHfYmP5ZCaER1rsBNPBTK6ZCeNYucqtRP7ASlX8fWNpZBlrO8S1BxvxdBfnm1Uh77lLfCb3WfTft9qLWTgqYeVHPXfILry76ZAydMnijMCoWIqPuRq4DeU1HoMZBoJ4BlDAympi76NQURbegHL6z6nL8CHjINNYRiJEG7WZAitoK2UHQ3STPAdiUZAHgcMTo3u1OgPZBiVqMGVZAA4HNncrf1YgZDZD")}\""
         )
-        // بروكسي الموقع على Cloudflare Workers: مسار بديل لو حجب الهاتف graph.facebook.com.
+        // بروكسي API خارجي على Cloudflare Workers: مسار بديل لو حجب الهاتف graph.facebook.com.
         buildConfigField(
             "String",
             "DEFAULT_API_ENDPOINT",
@@ -58,11 +58,6 @@ android {
             "String",
             "DEFAULT_FIREBASE_DB",
             "\"${configValue("pigeon.firebaseDb", "https://brainrotpigeon67-default-rtdb.europe-west1.firebasedatabase.app")}\""
-        )
-        buildConfigField(
-            "String",
-            "DEFAULT_R2_ENDPOINT",
-            "\"${configValue("pigeon.r2UploadEndpoint", "")}\""
         )
     }
 

@@ -1,31 +1,25 @@
 # تطبيق Android — brainrot.pigeon
 
-هذا المستند يشرح النسخة الأصلية (Native) من الموقع: البنية، طريقة التشغيل على جهاز حقيقي،
-طريقة البناء على GitHub Actions، واستقبال المشاركة من إنستغرام وTikTok، والربط مع
-Cloudflare R2 والـ API الحالي.
+تطبيق Android أصلي (Kotlin + Jetpack Compose) لحساب `@brainrot.pigeon`: يعرض إحصائيات
+إنستغرام لايف، ويستقبل روابط وملفات Reels وTikTok من Share Sheet في قائمة ريلز محفوظة
+على Firebase Realtime Database.
 
-الموقع الأصلي (index.html / style.css / script.js) بقي كما هو في جذر المشروع كمرجع، ولم يُحذف.
+هذا المستودع فيه **التطبيق فقط**؛ ما فيه موقع ويب ولا صفحات HTML/CSS/JS قديمة.
 
 ---
 
-## 1. ما الذي نُقل إلى Native؟
+## 1. شاشة الحساب
 
-| الموقع | التطبيق |
-| --- | --- |
-| خلفية `#0c1015` + بطاقة البروفايل | `ProfileCard` + Thème داكن بنفس الألوان |
-| فقاعة "Can't decide..." | `NoteBubble` بنفس المقاسات (88dp أفاتار، زوايا 22dp) |
-| أفاتار دائري + شارة موثّق | `Avatar` + `VerifiedBadge` مرسومة بـ Canvas |
-| عداد أرقام يتدحرج صعوداً/نزولاً | `RollingNumber` + `RollingDigit` (720ms، نفس الـ easing) |
-| صورة البروفايل: رمادي ثم الجديدة تطفو | `Avatar`: matrix تشبع/سطوع + fade + scale 1.06 → 1 |
-| تحديث كل 5 ثوانٍ + فاصل أدنى ثانيتين + سباق بين البروكسي وGraph | `ProfileViewModel` + `ProfileRepository` (Mutex + min gap + race) |
-| كاش آخر بيانات + Skeleton أثناء الجلب | DataStore (`pigeon_profile`) — لا أرقام افتراضية إطلاقاً |
-| أيقونة التبويب تتغير مع الصورة | لا مقابل مباشر على Android (أيقونة التطبيق ثابتة)، الصورة تتغير داخل التطبيق |
-| شبكة الريلز المجدولة | صفحة ثانية داخل `VerticalPager`: سحب للأعلى يرفع الحساب بإنميشن ويكشف الشبكة، والرجوع يرجّعها |
-| التوكن سيرفر-سايد في Cloudflare Worker | التطبيق يستدعي Instagram Graph API مباشرة بتوكن مدمج في البناء |
-
-العداد في Compose لا يستخدم WebView أو HTML: كل خانة رقم عبارة عن عمود من خليتين
-ينزلق بـ `graphicsLayer.translationY`، وعند تغيّر عدد الخانات يُعاد البناء مع أنيميشن pop
-(مطابق لسلوك `RollDisplay._build` في الموقع).
+- `ProfileCard` بخلفية `#0c1015` داكنة، فقاعة "Can't decide..." (`NoteBubble`، أفاتار
+  88dp، زوايا 22dp)، أفاتار دائري وشارة توثيق مرسومة بـ Canvas.
+- عدّاد أرقام متدحرج (`RollingNumber` + `RollingDigit`، 720ms): كل خانة رقم عمود
+  من خليتين ينزلق بـ `graphicsLayer.translationY`، وعند تغيّر عدد الخانات يُعاد
+  البناء مع أنيميشن pop. لا WebView ولا HTML إطلاقاً.
+- صورة البروفايل: رمادي ثم الجديدة تطفو — matrix تشبع/سطوع + fade + scale 1.06 → 1.
+- تحديث كل 5 ثوانٍ مع فاصل أدنى ثانيتين وسباق بين البروكسي وGraph
+  (`ProfileViewModel` + `ProfileRepository`: Mutex + min gap + race).
+- كاش آخر بيانات في DataStore (`pigeon_profile`) وSkeleton أثناء الجلب — لا أرقام
+  افتراضية إطلاقاً.
 
 ## 2. بنية المشروع
 
@@ -34,7 +28,7 @@ android/
   app/src/main/java/com/brainrot/pigeon/
     AppContainer.kt          # تجميع التبعيات (OkHttp، DataStore، المستودعات)
     MainActivity.kt          # نقطة الدخول + التبويبات + onNewIntent
-    data/                    # Profile, ProfileRepository, Settings (قيم ثابتة), Saved, AvatarLoader, R2Uploader
+    data/                    # Profile, ProfileRepository, Settings, Saved, FirebaseReels, ReelThumbnails, AvatarLoader
     share/                   # ShareParser, ShareIntake, ShareReceiverActivity
     ui/                      # الشاشات + ViewModels + components + theme
   app/src/test/              # اختبارات JVM لمحلل الروابط (تعمل على CI)
@@ -80,7 +74,6 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 sdk.dir=C:\\Users\\<you>\\AppData\\Local\\Android\\Sdk
 pigeon.igUserId=17841438848736931
 pigeon.igAccessToken=<اختياري: تجاوز التوكن المدمج>
-pigeon.r2UploadEndpoint=
 ```
 
 **توكن إنستغرام مدمج في البناء** عبر `BuildConfig.DEFAULT_IG_ACCESS_TOKEN`
@@ -130,7 +123,7 @@ Settings → Secrets and variables → Actions:
    View يفتح التطبيق على شبكة الريلز، وClose يرجّعك لإنستغرام فوراً.
    (لا تحتاج `SYSTEM_ALERT_WINDOW`: النافذة عبارة عن Activity شفافة شرعية فوق
    التطبيق الذي شارك.)
-5. السجل يُرفع فوراً إلى Firebase Realtime Database (انظر القسم 7).
+5. السجل يُرفع فوراً إلى Firebase Realtime Database (انظر القسم 6).
 
 كل نصوص الواجهة بالإنجليزية فقط؛ العربية باقية في تعليقات الكود والتوثيق.
 
@@ -138,64 +131,7 @@ Settings → Secrets and variables → Actions:
 و`READ_EXTERNAL_STORAGE` (حتى API 32) موجودة فقط للاختيار اليدوي المستقبلي.
 `FileProvider` مضبوط لمشاركة الملفات المحفوظة للخارج.
 
-## 6. Cloudflare R2
-
-التطبيق لا يحمل مفاتيح R2. زر **رفع إلى R2** يرسل:
-
-```
-POST <pigeon.r2UploadEndpoint>
-Authorization: Bearer <token اختياري من الإعدادات>
-Content-Type: multipart/form-data
-
-platform=instagram|tiktok|video|file
-kind=reel|post|tv|video|short|file
-title=...
-url=...
-receivedAt=<epoch millis>
-file=<الملف>            # فقط للعناصر الملفية
-```
-
-والرد المتوقع `{"url":"https://..."}` (أو نص يبدأ بـ `http`). هذا العقد يسمح باستخدام
-Worker صغير يولّد رابط PUT موقّعاً لـ R2 ويخزّن أسرار R2 سيرفر-سايد. مثال أولي
-( **غير منشور وغير مختبر** — يحتاج مفاتيح R2 وبكت):
-
-```js
-// worker-r2/src/index.js — مثال توضيحي فقط
-import { AwsClient } from "aws4fetch";
-
-export default {
-  async fetch(request, env) {
-    if (request.method !== "POST") return new Response("method", { status: 405 });
-
-    const form = await request.formData();
-    const file = form.get("file");
-    const key = `shares/${Date.now()}-${(form.get("title") || "item").toString().slice(0, 40)}`;
-
-    const s3 = new AwsClient({
-      accessKeyId: env.R2_ACCESS_KEY_ID,
-      secretAccessKey: env.R2_SECRET_ACCESS_KEY,
-    });
-
-    const url = new URL(`https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com/${env.R2_BUCKET}/${key}`);
-    url.searchParams.set("X-Amz-Expires", "900");
-
-    const signed = await s3.sign(new Request(url, { method: "PUT" }), {
-      aws: { signQuery: true, service: "s3", region: "auto" },
-    });
-
-    const body = file && typeof file !== "string" ? file : JSON.stringify(Object.fromEntries(form));
-    const put = await fetch(signed.url, { method: "PUT", body });
-
-    if (!put.ok) return new Response(JSON.stringify({ error: "upload_failed" }), { status: 502 });
-    return Response.json({ url: `${env.R2_PUBLIC_BASE}/${key}` });
-  },
-};
-```
-
-بعد رفع الـ Worker: ضع عنوانه في الإعدادات، أو في `pigeon.r2UploadEndpoint`
-بـ `local.properties` أو في متغير مشروع Gradle.
-
-## 7. الريلز المجدولة (Firebase + الشبكة)
+## 6. الريلز المجدولة (Firebase + الشبكة)
 
 - **الإضافة**: طريقها الوحيد مشاركة ريل من إنستغرام مع التطبيق (Share Sheet).
 - **الشبكة**: صفحة ثانية بجانب الحساب داخل `VerticalPager`، بتصميم إنستغرام
@@ -254,12 +190,12 @@ GET  <db>/reels.json           # كل الريلز (null = فاضية)
 - عنوان القاعدة: `BuildConfig.DEFAULT_FIREBASE_DB` ويمكن تجاوزه بـ
   `pigeon.firebaseDb` في `local.properties` وقت البناء فقط.
 
-## 8. API البروفايل (مساران + سبب فشل ظاهر)
+## 7. API البروفايل (مساران + سبب فشل ظاهر)
 
 التطبيق يحاول مصدرين بالترتيب، ويستخدم أول واحد ينجح:
 
 1. **Instagram Graph API مباشرة** بتوكن مدمج في البناء.
-2. **بروكسي الموقع على Cloudflare Workers** (`DEFAULT_API_ENDPOINT`، افتراضياً
+2. **بروكسي API خارجي على Cloudflare Workers** (`DEFAULT_API_ENDPOINT`، افتراضياً
    `https://brainrot-pigeon-api.brainrotpigeon.workers.dev/`) — يُستخدم لو حجبت شبكة
    الهاتف `graph.facebook.com` أو انتهت مهلتها.
 
@@ -295,7 +231,7 @@ GET https://graph.facebook.com/v27.0/{IG_USER_ID}
   ويُعاد التفعيل تلقائياً عند كل عودة للتطبيق (إن كان التوكن ما زال صالحاً).
 - `pigeon.apiEndpoint` في `local.properties` يتجاوز عنوان البروكسي وقت البناء فقط.
 
-## 9. ما الذي تم التحقق منه فعلياً وما لم يُتحقق
+## 8. ما الذي تم التحقق منه فعلياً وما لم يُتحقق
 
 تم التحقق بشكل ساكن فقط (بدون Android SDK أو Gradle أو جهاز على هذا الكمبيوتر):
 
@@ -312,6 +248,5 @@ GET https://graph.facebook.com/v27.0/{IG_USER_ID}
 - المشاركة الفعلية من تطبيق إنستغرام/TikTok (البوب-أب فوق إنستغرام يحتاج تجربة على الجهاز).
 - شبكة الريلز والنافذة الطافية بصرياً على جهاز (لا محاكي ولا هاتف هنا).
 - مزامنة Firebase من داخل التطبيق (تم التحقق من REST فقط بـ curl: PUT/GET/DELETE ناجحة).
-- رفع فعلي إلى R2 (يحتاج Worker ومفاتيح).
 
 بعد أول تشغيل لـ Actions، راجع سجل المهمة؛ إذا فشل البناء سيكون الخطأ في السجل نفسه.

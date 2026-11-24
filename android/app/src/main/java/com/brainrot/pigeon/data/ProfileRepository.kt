@@ -45,7 +45,7 @@ private const val MAX_ERROR_LENGTH = 90
 /**
  * يجيب بيانات الحساب بالتوكن المدمج في البناء، بمسارين:
  * 1. Instagram Graph API مباشرة (`graph.facebook.com`).
- * 2. عند فشل الأول: بروكسي Cloudflare Worker المنشور (نفس بيانات الموقع)،
+ * 2. عند فشل الأول: بروكسي Cloudflare Worker المنشور (بديل خارجي)،
  *    لأن بعض الشبكات تحجب `graph.facebook.com` من الهاتف.
  *
  * سبب الفشل يُسجَّل في logcat (PigeonProfile) ويُعرض للمستخدم بدل ما تنعرض

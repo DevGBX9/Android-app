@@ -1,8 +1,10 @@
 # Android-app — brainrot.pigeon
 
-تطبيق Android أصلي (Kotlin + Jetpack Compose) يعرض إحصائيات حساب
-إنستغرام `@brainrot.pigeon` لايف مباشرة من Instagram Graph API بتوكن مدمج
-في البناء، ويستقبل روابط وملفات Reels وTikTok من Share Sheet.
+تطبيق Android أصلي (Kotlin + Jetpack Compose) لحساب إنستغرام `@brainrot.pigeon`:
+يعرض الإحصائيات لايف من Instagram Graph API بتوكن مدمج في البناء، ويستقبل روابط
+وملفات Reels وTikTok من Share Sheet في قائمة ريلز محفوظة على Firebase.
+
+المستودع يحتوي **التطبيق فقط** — لا يوجد موقع ويب ولا صفحات HTML قديمة.
 
 ## تحميل التطبيق
 
@@ -26,9 +28,8 @@
 
 ```
 android/            تطبيق Android (Kotlin + Compose)
-worker/             بروكسي Instagram Graph API على Cloudflare
-docs/ANDROID.md     البنية، ADB، R2، وطريقة التشغيل المحلي
-index.html ...      نسخة الويب الأصلية (مرجع)
+docs/ANDROID.md     البنية، المشاركة، Firebase، وطريقة التثبيت
+.github/            سير عمل البناء على GitHub Actions
 ```
 
 ## ملاحظات

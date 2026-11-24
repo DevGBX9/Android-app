@@ -1,9 +1,6 @@
 # انسخ هذا الملف إلى local.properties محلياً (لا ترفعه إلى Git).
 # مسار Android SDK على جهازك:
-sdk.dir=C:\\Users\\<you>\\AppData\\Local\\Android\\Sdk
+sdk.dir=C:\\\\Users\\\\<you>\\\\AppData\\\\Local\\\\Android\\\\Sdk
 
-# عنوان بروكسي البروفايل (Cloudflare Worker الحالي)
+# عنوان بروكسي البروفايل (Cloudflare Worker المنشور).
 pigeon.apiEndpoint=https://brainrot-pigeon-api.brainrotpigeon.workers.dev/
-
-# عنوان رفع R2 (Worker أو رابط موقّع). اتركه فارغاً إذا ما بدك الرفع.
-pigeon.r2UploadEndpoint=
