@@ -35,13 +35,16 @@ class FirebaseReels(
         encodeDefaults = true
     }
 
-    /** يرفع سجلاً واحداً (أو يستبدله بنفس المفتاح). */
+    /**
+     * يرفع سجلاً واحداً. نستخدم PATCH لا PUT حتى لا يمسح حقول الأرشيف
+     * التي يكتبها Worker على Cloudflare تحت نفس السجل.
+     */
     suspend fun upload(item: SavedItem): Boolean = withContext(Dispatchers.IO) {
         val url = "$endpoint/${item.id}.json".toHttpUrlOrNull() ?: return@withContext false
         val body = json.encodeToString(RemoteReel.from(item)).toRequestBody(JSON_MEDIA)
 
         runCatching {
-            client.newCall(Request.Builder().url(url).put(body).build()).execute().use { response ->
+            client.newCall(Request.Builder().url(url).patch(body).build()).execute().use { response ->
                 if (!response.isSuccessful) {
                     Log.w(LOG_TAG, "upload HTTP ${response.code}")
                 }
@@ -51,6 +54,21 @@ class FirebaseReels(
             Log.w(LOG_TAG, "upload failed: ${error.message}")
             false
         }
+    }
+
+    /** يقرأ حالة الأرشيف لسجل واحد من نفس العقدة التي يكتبها الـWorker. */
+    suspend fun fetchArchive(id: String): ArchiveStatus? = withContext(Dispatchers.IO) {
+        runCatching {
+            val url = "$endpoint/$id/archive.json".toHttpUrlOrNull() ?: return@runCatching null
+
+            client.newCall(Request.Builder().url(url).build()).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful || body.isBlank() || body.trim() == "null") {
+                    return@use null
+                }
+                json.decodeFromString<ArchiveStatus>(body)
+            }
+        }.getOrNull()
     }
 
     /** يسحب كل الريلز؛ القيمة `null` تعني قائمة فاضية وليست خطأ. */
@@ -86,6 +104,7 @@ private data class RemoteReel(
     val thumbnail: String? = null,
     val registered: Boolean = true,
     val source: String = "android",
+    val archive: ArchiveStatus? = null,
     val createdAt: Long = 0L,
 ) {
     fun toSavedItem(id: String): SavedItem? {
@@ -98,6 +117,9 @@ private data class RemoteReel(
             title = title,
             thumbnail = thumbnail?.takeIf { it.isNotBlank() },
             registered = registered,
+            archiveState = archive?.state,
+            archiveProgress = archive?.progress ?: 0,
+            downloadUrl = archive?.url?.takeIf { it.isNotBlank() },
             createdAt = if (createdAt > 0L) createdAt else System.currentTimeMillis(),
         )
     }

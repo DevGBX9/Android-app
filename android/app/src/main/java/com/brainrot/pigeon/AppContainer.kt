@@ -4,6 +4,7 @@ import android.content.Context
 import com.brainrot.pigeon.data.AvatarLoader
 import com.brainrot.pigeon.data.FirebaseReels
 import com.brainrot.pigeon.data.ProfileRepository
+import com.brainrot.pigeon.data.ReelArchive
 import com.brainrot.pigeon.data.ReelThumbnails
 import com.brainrot.pigeon.data.SavedRepository
 import com.brainrot.pigeon.data.SettingsRepository
@@ -33,7 +34,14 @@ class AppContainer(context: Context) {
     val settings = SettingsRepository(appContext)
     val reels = FirebaseReels(httpClient, BuildConfig.DEFAULT_FIREBASE_DB)
     val thumbnails = ReelThumbnails(httpClient)
-    val saved = SavedRepository(appContext, reels, thumbnails, workScope)
+    // أرشيف الريلز على Cloudflare (Worker + R2): طلب الأرشفة والتحميل للجهاز.
+    val archive = ReelArchive(
+        context = appContext,
+        baseClient = httpClient,
+        endpoint = BuildConfig.DEFAULT_ARCHIVE_ENDPOINT,
+        token = BuildConfig.DEFAULT_ARCHIVE_TOKEN,
+    )
+    val saved = SavedRepository(appContext, reels, thumbnails, archive, workScope)
     val avatars = AvatarLoader(httpClient)
     // صور أغلفة الريلز في الشبكة: كاش أكبر لأن الشبكة تعرض عشرات الصور.
     val reelImages = AvatarLoader(httpClient, cacheSize = 90)

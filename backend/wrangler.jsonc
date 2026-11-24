@@ -1,0 +1,18 @@
+{
+  // نقطة نشر Pigeon Reels API: Worker بايثون + مخزن R2.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "brainrot-pigeon-reels",
+  "main": "src/entry.py",
+  "compatibility_date": "2026-11-24",
+  "compatibility_flags": ["python_workers"],
+  "observability": { "enabled": true },
+  "vars": {
+    "FIREBASE_DB": "https://brainrotpigeon67-default-rtdb.europe-west1.firebasedatabase.app"
+  },
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "pigeon-reels"
+    }
+  ]
+}

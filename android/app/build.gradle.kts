@@ -33,8 +33,8 @@ android {
         applicationId = "com.brainrot.pigeon"
         minSdk = 26
         targetSdk = 35
-        versionCode = 13
-        versionName = "1.6.1"
+        versionCode = 14
+        versionName = "1.7.0"
 
         buildConfigField(
             "String",
@@ -52,6 +52,18 @@ android {
             "String",
             "DEFAULT_API_ENDPOINT",
             "\"${configValue("pigeon.apiEndpoint", "https://brainrot-pigeon-api.brainrotpigeon.workers.dev/")}\""
+        )
+        // Pigeon Reels API على Cloudflare: ينزّل الريل ويخزنه في R2 ويقدّمه للتحميل.
+        buildConfigField(
+            "String",
+            "DEFAULT_ARCHIVE_ENDPOINT",
+            "\"${configValue("pigeon.archiveEndpoint", "https://brainrot-pigeon-reels.brainrotpigeon.workers.dev")}\""
+        )
+        // اختياري: يطابق السر API_TOKEN في الـWorker؛ اتركه فاضياً إذا ما ضبطته.
+        buildConfigField(
+            "String",
+            "DEFAULT_ARCHIVE_TOKEN",
+            "\"${configValue("pigeon.archiveToken", "")}\""
         )
         // قاعدة بيانات الريلز المجدولة (Firebase Realtime Database) — قراءة/كتابة REST.
         buildConfigField(

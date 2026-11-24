@@ -1,0 +1,9 @@
+[project]
+name = "pigeon-reels-api"
+version = "1.0.0"
+description = "Pigeon Reels API — archives Instagram reels into Cloudflare R2"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = ["workers-py"]

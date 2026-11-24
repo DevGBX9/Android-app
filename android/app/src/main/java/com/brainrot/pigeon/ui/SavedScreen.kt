@@ -2,15 +2,20 @@ package com.brainrot.pigeon.ui
 
 import android.content.Context
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -31,8 +36,10 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -43,6 +50,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -76,7 +85,8 @@ private const val GRID_COLUMNS = 3
 
 /**
  * صفحة الريلز: شريط أيقونة الشبكة مثل إنستغرام ثم خانات ريلز قائمة (9:16)
- * بصور غلاف حقيقية من إنستغرام. كل ريل يُفتح بالضغط عليه.
+ * بصور غلاف حقيقية من إنستغرام. الضغط يفتح الريل، والضغط المطوّل يعرض
+ * زر تحميل الريل المخزّن على Cloudflare مع نسبة 0..100.
  */
 @Composable
 fun ReelsRoute(container: AppContainer) {
@@ -86,8 +96,10 @@ fun ReelsRoute(container: AppContainer) {
         },
     )
     val items by viewModel.items.collectAsStateWithLifecycle()
+    val downloads by viewModel.downloads.collectAsStateWithLifecycle()
     val images = remember { container.reelImages }
     val context = LocalContext.current
+    var expandedId by remember { mutableStateOf<String?>(null) }
 
     Column(
         Modifier
@@ -114,7 +126,15 @@ fun ReelsRoute(container: AppContainer) {
                     ReelCell(
                         item = item,
                         images = images,
+                        download = downloads[item.id],
+                        expanded = expandedId == item.id,
                         onClick = { openReel(context, item) },
+                        onLongClick = { expandedId = item.id },
+                        onDismiss = { expandedId = null },
+                        onDownload = {
+                            expandedId = null
+                            viewModel.download(item)
+                        },
                     )
                 }
             }
@@ -143,11 +163,17 @@ private fun ReelsHeader() {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ReelCell(
     item: SavedItem,
     images: AvatarLoader,
+    download: DownloadUi?,
+    expanded: Boolean,
     onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    onDismiss: () -> Unit,
+    onDownload: () -> Unit,
 ) {
     val thumbnail by produceState<ImageBitmap?>(initialValue = null, item.thumbnail) {
         value = item.thumbnail
@@ -156,6 +182,10 @@ private fun ReelCell(
     }
 
     val bitmap = thumbnail
+    val processing = item.archiveState == "queued" ||
+        item.archiveState == "downloading" ||
+        item.archiveState == "storing"
+    val busy = download?.running == true
 
     Box(
         modifier = Modifier
@@ -163,7 +193,7 @@ private fun ReelCell(
             .aspectRatio(REEL_ASPECT)
             .clip(RoundedCornerShape(4.dp))
             .background(Brush.linearGradient(listOf(CellTop, CellBottom)))
-            .clickable(onClick = onClick),
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick),
     ) {
         if (bitmap != null) {
             Image(
@@ -214,6 +244,35 @@ private fun ReelCell(
             }
         }
 
+        // تم التحميل على الجهاز.
+        if (download?.done == true) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(5.dp)
+                    .size(19.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.55f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                DownloadGlyph(color = Color.White, modifier = Modifier.size(11.dp))
+            }
+        }
+
+        if (download?.error != null) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .padding(5.dp)
+                    .size(19.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.55f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(text = "!", color = Color(0xFFFF6B6B), fontSize = 11.sp)
+            }
+        }
+
         Text(
             text = reelLabel(item),
             color = if (bitmap != null) Color.White else TextMuted,
@@ -224,6 +283,131 @@ private fun ReelCell(
                 .align(Alignment.BottomStart)
                 .padding(horizontal = 6.dp, vertical = 5.dp),
         )
+
+        // نسبة معالجة الريل على Cloudflare (0..100) قبل أن يصير قابلاً للتحميل.
+        if (processing && !busy) {
+            ProcessingBar(
+                progress = item.archiveProgress,
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(start = 5.dp, end = 5.dp, bottom = 19.dp),
+            )
+        }
+
+        // نزيل التحميل من الخادم إلى الجهاز: النسبة فوق البطاقة.
+        if (busy) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.66f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(horizontal = 10.dp),
+                ) {
+                    Text(
+                        text = "${download?.percent ?: 0}%",
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(3.dp)
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(Color.White.copy(alpha = 0.26f)),
+                    ) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth(((download?.percent ?: 0).coerceIn(0, 100)) / 100f)
+                                .fillMaxHeight()
+                                .background(Accent),
+                        )
+                    }
+                }
+            }
+        }
+
+        // ضغطة مطوّلة: زر تحميل الريل المخزّن.
+        if (expanded && !busy) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.55f))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onDismiss,
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(7.dp),
+                ) {
+                    if (isInstagram(item)) {
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(Color.White)
+                                .clickable(onClick = onDownload)
+                                .padding(horizontal = 11.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            DownloadGlyph(color = Color.Black, modifier = Modifier.size(11.dp))
+                            Spacer(Modifier.width(5.dp))
+                            Text(
+                                text = stringResource(R.string.reel_download),
+                                color = Color.Black,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                        }
+                    }
+
+                    Text(
+                        text = stringResource(R.string.action_close),
+                        color = Color.White.copy(alpha = 0.85f),
+                        fontSize = 9.sp,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .clickable(onClick = onDismiss)
+                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProcessingBar(progress: Int, modifier: Modifier = Modifier) {
+    val clamped = progress.coerceIn(0, 100)
+
+    Column(modifier.fillMaxWidth()) {
+        Text(
+            text = "$clamped%",
+            color = Color.White.copy(alpha = 0.9f),
+            fontSize = 8.sp,
+        )
+        Spacer(Modifier.height(3.dp))
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(2.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(Color.White.copy(alpha = 0.25f)),
+        ) {
+            Box(
+                Modifier
+                    .fillMaxWidth(clamped / 100f)
+                    .fillMaxHeight()
+                    .background(Accent),
+            )
+        }
     }
 }
 
@@ -298,6 +482,43 @@ fun ReelGlyph(color: Color, modifier: Modifier = Modifier) {
     }
 }
 
+/** سهم نزول فوق خط: أيقونة تحميل مرسومة بدون مكتبات. */
+@Composable
+fun DownloadGlyph(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        val stroke = w * 0.13f
+
+        drawLine(
+            color = color,
+            start = Offset(w * 0.5f, h * 0.08f),
+            end = Offset(w * 0.5f, h * 0.62f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+
+        val arrow = Path().apply {
+            moveTo(w * 0.24f, h * 0.42f)
+            lineTo(w * 0.5f, h * 0.70f)
+            lineTo(w * 0.76f, h * 0.42f)
+        }
+        drawPath(
+            arrow,
+            color = color,
+            style = Stroke(stroke, cap = StrokeCap.Round, join = StrokeJoin.Round),
+        )
+
+        drawLine(
+            color = color,
+            start = Offset(w * 0.14f, h * 0.92f),
+            end = Offset(w * 0.86f, h * 0.92f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+    }
+}
+
 private fun reelLabel(item: SavedItem): String {
     val code = item.url
         ?.trimEnd('/')
@@ -306,6 +527,9 @@ private fun reelLabel(item: SavedItem): String {
 
     return code ?: item.title?.takeIf { it.isNotBlank() } ?: item.platform
 }
+
+private fun isInstagram(item: SavedItem): Boolean =
+    item.url?.contains("instagram.com") == true || item.platform == "instagram"
 
 private fun openReel(context: Context, item: SavedItem) {
     val url = item.url ?: item.remoteUrl

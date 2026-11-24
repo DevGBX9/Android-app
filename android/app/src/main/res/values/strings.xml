@@ -14,6 +14,7 @@
     <string name="reels_empty_title">No reels scheduled yet</string>
     <string name="reels_empty_body">Open Instagram, tap Share on any reel, and pick brainrot.pigeon — it lands here instantly.</string>
     <string name="reels_registered">Registered in the app</string>
+    <string name="reel_download">Download</string>
 
     <string name="saved_no_app">No app can open this link</string>
     <string name="saved_no_content">Nothing to open</string>

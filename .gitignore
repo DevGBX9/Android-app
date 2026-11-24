@@ -11,6 +11,12 @@ android/.kotlin/
 *.iml
 captures/
 
+# Python Worker (backend/)
+backend/.venv/
+backend/__pycache__/
+backend/src/__pycache__/
+.python_modules/
+
 # Local tooling
 .tools/
 .cloud-attachments/
