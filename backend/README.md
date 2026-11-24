@@ -26,9 +26,13 @@
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Dashboard → Workers & Pages → Account ID |
 | `CLOUDFLARE_API_TOKEN` | My Profile → API Tokens → Create Token بصلاحيات **Workers Scripts: Edit** و **R2: Edit** |
 
+بديل للتوكن: `CLOUDFLARE_EMAIL` (بريد حساب Cloudflare) مع `CLOUDFLARE_API_KEY`
+(Global API Key من My Profile → API Tokens → Global API Key). يكفي واحد من
+الخيارين.
+
 بعدها: Actions → **Deploy Pigeon Reels API** → Run workflow. السكربت ينشئ
-bucket باسم `pigeon-reels` (مرة وحدة) ثم ينشر الـWorker على
-`https://brainrot-pigeon-reels.<account-subdomain>.workers.dev`.
+bucket باسم `water` (مرة وحدة) ثم ينشر الـWorker على
+`https://brainrot-pigeon-reels.brainrotpigeon.workers.dev`.
 
 مطلوب تفعيل R2 من لوحة Cloudflare أول مرة (يحتاج بطاقة، والاستخدام المجاني
 10GB تخزين).
