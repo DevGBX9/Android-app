@@ -705,7 +705,9 @@ class Default(WorkerEntrypoint):
 
             data = None
             last_error = "no media url"
+            hosts = []
             for candidate in candidates:
+                hosts.append((urlparse(candidate["url"]).hostname or "?")[:60])
                 try:
                     try:
                         data = await _download_bytes(
@@ -727,7 +729,14 @@ class Default(WorkerEntrypoint):
                     data = None
 
             if not data:
-                raise RuntimeError("media download failed: " + last_error)
+                raise RuntimeError(
+                    "media download failed: %s (hosts: %s) (%s)"
+                    % (
+                        last_error,
+                        ", ".join(dict.fromkeys(hosts)),
+                        " | ".join(attempts)[:200],
+                    )
+                )
 
             await report("storing", 95)
             await self.env.FILES.put(self._key(reel_id), data)
