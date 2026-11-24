@@ -14,6 +14,7 @@ Instagram Graph API، من cron داخلي، وليس من جدولة إنستغ
 | `GET /` | معلومات الخدمة |
 | `POST /reels` | `{"id","url","thumbnail"}` → 202 ويبدأ التنزيل والتخزين |
 | `GET /reels/<id>` | حالة الأرشفة (`state`, `progress`, `url`, `bytes`, `error`) |
+| `DELETE /reels/<id>` | حذف الريل: يمسح ملفه من R2 وكل معلوماته من Firebase (409 أثناء النشر) |
 | `GET /download/<id>` | ملف الـmp4 من R2 بـ`Content-Disposition: attachment` |
 | `GET /media/<id>` | نفس الملف للعرض العام (تقرأه Meta وقت النشر، بلا مفتاح) |
 
@@ -24,15 +25,28 @@ Instagram Graph API، من cron داخلي، وليس من جدولة إنستغ
 - التطبيق يكتب الموعد في Firebase تحت `/schedules/<id>` (منفصل عن سجل الريل
   حتى لا يمسحه PATCH):
   `{"at": 1764000000000, "timezone": "Africa/Algiers", "state": "scheduled"}`.
-- `wrangler.jsonc` فيه cron كل 5 دقائق (`*/5 * * * *`). عند حلول الموعد:
-  1. يتأكد أن الفيديو موجود في R2 (`reels/<id>.mp4`).
-  2. ينشئ Instagram media container بـ`media_type=REELS` ورابط
-     `PUBLIC_BASE_URL/media/<id>`.
-  3. يفحص حالة الحاوية كل تشغيل حتى `FINISHED` (أو `ERROR`/`EXPIRED`).
-  4. ينادي `media_publish` ويحفظ `mediaId` و`publishedAt`.
-- حالات الموعد: `scheduled` → `creating` → `publishing` → `published`، أو
-  `failed` مع `error`. لو انقطع الـWorker بعد `media_publish` لا يعيد النشر
-  تلقائياً (حتى لا يتكرر الريل)، بل يعلّم الحالة `failed` للمراجعة.
+- `wrangler.jsonc` فيه cron كل دقيقة (`* * * * *`).
+- السلسلة ثابتة ومرتّبة، ولكل خطوة حالتها وحدها؛ لا تبدأ خطوة إلا بعد أن
+  تنتهي التي قبلها بنتيجة (نجاح أو فشل):
+
+  | الحالة | الخطوة | نتيجتها |
+  | --- | --- | --- |
+  | `scheduled` | انتظار الموعد | `preparing` عند دخول نافذة الـ45 دقيقة |
+  | `preparing` | إنشاء حاوية إنستغرام | `prepared` أو `scheduled` (إعادة) أو `failed` |
+  | `prepared` | انتظار الموعد ثم فحص الحاوية | `publishing` عند `FINISHED` |
+  | `publishing` | `media_publish` | `verifying` أو `prepared` (إعادة) أو `failed` |
+  | `verifying` | `GET /<media_id>` من Graph API | `cleaning` أو `unverified` |
+  | `cleaning` | تأكيد ثانٍ ← حذف R2 ← حذف Firebase | تُحذف السجلات (نهاية ناجحة) |
+
+- منع التداخل: كل انتقال يُكتب بـ`PATCH` مشروط بـ`if-match` (ETag من Firebase)،
+  وكل خطوة تحجز نفسها قبل النداء الخارجي. تشغيلان في نفس اللحظة: الثاني يفشل
+  بـ412 ولا ينشر ولا يحذف شيئاً (مُختبر).
+- لو انقطع الـWorker بعد `media_publish` لا يعيد النشر أبداً: يسأل الحساب عن
+  آخر منشور أولاً. ولو بقي النشر غير مؤكد (`unverified`) يبقى الملف في R2
+  وسجلات Firebase كما هي — لا حذف بلا تأكيد من إنستغرام.
+- التنظيف: بعد نجاح النشر بتأكيد Graph API ينتظر 5 ثوانٍ، يتأكد مرة أخرى،
+  يحذف `reels/<id>.mp4` من R2، يتأكد أنه غاب (`head`)، ثم يحذف `reels/<id>`
+  و`schedules/<id>` من Firebase. كل ذلك في نفس تشغيل cron.
 - الوقت ثابت 19:00 بتوقيت الجزائر (`Africa/Algiers` = UTC+1) أي 18:00 UTC.
 - `IG_ACCESS_TOKEN` سرّ في GitHub Actions وليس في `wrangler.jsonc`؛ يحتاج
   صلاحية `instagram_content_publish`. `IG_USER_ID` و`PUBLIC_BASE_URL` في

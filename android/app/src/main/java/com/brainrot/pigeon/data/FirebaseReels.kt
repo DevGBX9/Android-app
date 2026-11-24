@@ -1,10 +1,15 @@
 package com.brainrot.pigeon.data
 
 import android.util.Log
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.ExperimentalSerializationApi
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -18,6 +23,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 
 private const val LOG_TAG = "PigeonReels"
+private const val STREAM_RETRY_MS = 2_000L
 private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
 /**
@@ -32,8 +38,17 @@ class FirebaseReels(
     databaseUrl: String,
 ) {
 
-    private val endpoint = databaseUrl.trim().trimEnd('/') + "/reels"
-    private val schedulesEndpoint = databaseUrl.trim().trimEnd('/') + "/schedules"
+    private val root = databaseUrl.trim().trimEnd('/')
+    private val endpoint = "$root/reels"
+    private val schedulesEndpoint = "$root/schedules"
+
+    // بث حيّ بلا مهلة قراءة: الاتصال يبقى مفتوحاً حتى يقطعه الخادم أو التطبيق.
+    private val streamClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .readTimeout(0, TimeUnit.SECONDS)
+            .callTimeout(0, TimeUnit.SECONDS)
+            .build()
+    }
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -150,28 +165,51 @@ class FirebaseReels(
         }.onFailure { error -> Log.w(LOG_TAG, "fetch failed: ${error.message}") }
     }
 
-    /** يحذف سجل الريل من القاعدة بعد نجاح نشره على إنستغرام. */
-    suspend fun deleteReel(id: String): Boolean = delete("$endpoint/$id.json", id)
+    /**
+     * بث حيّ لعقدة القاعدة كاملة (Server-Sent Events): كل ما يكتبه الـWorker
+     * — نشر ريل، تغيّر حالته، أو حذفه بعد النشر — يصل هنا لحظياً بدل انتظار
+     * دورة مزامنة. لا ترجع الدالة أبداً، وتعيد الاتصال بعد أي انقطاع.
+     */
+    suspend fun streamChanges(onChange: suspend () -> Unit) = withContext(Dispatchers.IO) {
+        val url = "$root/.json"
+        while (currentCoroutineContext().isActive) {
+            try {
+                val request = Request.Builder()
+                    .url(url)
+                    .header("Accept", "text/event-stream")
+                    .build()
 
-    /** يحذف موعد الريل مع سجله حتى لا يعيد الـWorker معالجته. */
-    suspend fun deleteSchedule(id: String): Boolean =
-        delete("$schedulesEndpoint/$id.json", id)
+                streamClient.newCall(request).execute().use { response ->
+                    val body = response.body
+                    if (!response.isSuccessful || body == null) {
+                        error("live stream HTTP ${response.code}")
+                    }
 
-    private suspend fun delete(url: String, id: String): Boolean =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                val target = url.toHttpUrlOrNull() ?: return@withContext false
-                client.newCall(
-                    Request.Builder().url(target).delete().build(),
-                ).execute().use { response ->
-                    if (!response.isSuccessful) Log.w(LOG_TAG, "delete $id HTTP ${response.code}")
-                    response.isSuccessful
+                    val source = body.source()
+                    var event = ""
+                    while (currentCoroutineContext().isActive) {
+                        // readUtf8Line يرمي عند قطع الخادم للاتصال، فنعيد الفتح.
+                        val line = source.readUtf8Line() ?: break
+                        when {
+                            line.startsWith("event:") ->
+                                event = line.removePrefix("event:").trim()
+
+                            line.startsWith("data:") -> {
+                                // keep-alive لا يحمل تغييراً، وput/patch يحملان.
+                                if (event == "put" || event == "patch") onChange()
+                            }
+                        }
+                    }
                 }
-            }.getOrElse { error ->
-                Log.w(LOG_TAG, "delete $id failed: ${error.message}")
-                false
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.w(LOG_TAG, "live stream lost: ${error.message}")
             }
+
+            if (currentCoroutineContext().isActive) delay(STREAM_RETRY_MS)
         }
+    }
 }
 
 @OptIn(ExperimentalSerializationApi::class)

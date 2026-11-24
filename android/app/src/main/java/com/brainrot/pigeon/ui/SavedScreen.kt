@@ -100,6 +100,7 @@ fun ReelsRoute(container: AppContainer) {
     )
     val items by viewModel.items.collectAsStateWithLifecycle()
     val downloads by viewModel.downloads.collectAsStateWithLifecycle()
+    val deleteError by viewModel.deleteError.collectAsStateWithLifecycle()
     val images = remember { container.reelImages }
     val context = LocalContext.current
     var expandedId by remember { mutableStateOf<String?>(null) }
@@ -110,6 +111,13 @@ fun ReelsRoute(container: AppContainer) {
             ?: return@LaunchedEffect
         toast(context, failure.value.error ?: "the download failed")
         viewModel.dismissDownload(failure.key)
+    }
+
+    // سبب فشل الحذف من الخادم (مثلاً: الريل يُنشر الآن).
+    LaunchedEffect(deleteError) {
+        val message = deleteError ?: return@LaunchedEffect
+        toast(context, message)
+        viewModel.dismissDeleteError()
     }
 
     Column(
@@ -145,6 +153,10 @@ fun ReelsRoute(container: AppContainer) {
                         onDownload = {
                             expandedId = null
                             viewModel.download(item)
+                        },
+                        onDelete = {
+                            expandedId = null
+                            viewModel.delete(item)
                         },
                     )
                 }
@@ -185,7 +197,11 @@ private fun ReelCell(
     onLongClick: () -> Unit,
     onDismiss: () -> Unit,
     onDownload: () -> Unit,
+    onDelete: () -> Unit,
 ) {
+    // الحذف لا رجعة فيه: ضغطة أولى تسأل، والثانية تحذف من Cloudflare وFirebase.
+    var confirmingDelete by remember(expanded) { mutableStateOf(false) }
+
     val thumbnail by produceState<ImageBitmap?>(initialValue = null, item.thumbnail) {
         value = item.thumbnail
             ?.takeIf { it.isNotBlank() }
@@ -404,6 +420,24 @@ private fun ReelCell(
                             )
                         }
                     }
+
+                    Text(
+                        text = if (confirmingDelete) {
+                            stringResource(R.string.reel_delete_confirm)
+                        } else {
+                            stringResource(R.string.reel_delete)
+                        },
+                        color = Color(0xFFFF6B6B),
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(Color.White.copy(alpha = 0.12f))
+                            .clickable {
+                                if (confirmingDelete) onDelete() else confirmingDelete = true
+                            }
+                            .padding(horizontal = 11.dp, vertical = 7.dp),
+                    )
 
                     Text(
                         text = stringResource(R.string.action_close),

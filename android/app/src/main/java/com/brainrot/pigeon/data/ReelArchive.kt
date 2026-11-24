@@ -122,6 +122,36 @@ class ReelArchive(
     }
 
     /**
+     * يحذف الريل من الخادم: ملفه من R2 وكل معلوماته من Firebase.
+     * لا يُقبل الحذف أثناء خطوة نشر جارية (يردّ الخادم 409).
+     */
+    suspend fun deleteRemote(id: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!configured) return@runCatching
+
+            val request = Request.Builder()
+                .url("$base/reels/$id")
+                .header("Accept", "application/json")
+                .apply { if (token.isNotBlank()) header("X-Api-Key", token) }
+                .delete()
+                .build()
+
+            http.newCall(request).execute().use { response ->
+                // 404: لا شيء متبقٍ على الخادم أصلاً، فالحذف ناجح.
+                if (response.code == 404) return@runCatching
+                if (!response.isSuccessful) {
+                    val detail = runCatching { response.body?.string().orEmpty() }
+                        .getOrDefault("")
+                        .take(160)
+                    throw IOException(
+                        "server HTTP ${response.code}" + if (detail.isBlank()) "" else ": $detail",
+                    )
+                }
+            }
+        }
+    }
+
+    /**
      * ينزّل الملف المخزّن إلى Downloads (أو إلى مجلد التطبيق على أندرويد قديم).
      * [onProgress] تستقبل نسبة 0..1 من التحميل المحلي.
      */

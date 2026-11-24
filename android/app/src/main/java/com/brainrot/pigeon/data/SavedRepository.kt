@@ -22,6 +22,9 @@ private const val REQUEST_RETRY_MS = 12_000L
 private const val STALL_MS = 25_000L
 private const val MAX_ARCHIVE_FAILURES = 3
 
+// البث الحيّ يرسل عدة أحداث متتالية لنفس التغيير؛ نُطبّق مزامنة واحدة لكل نافذة.
+private const val LIVE_SYNC_DEBOUNCE_MS = 300L
+
 /**
  * مصدر الحقيقة المحلي للريلز (DataStore) مع نسخة على Firebase:
  * الإضافة تُكتب محلياً فوراً ثم تُرفع في الخلفية، وعند كل فتح للتطبيق
@@ -101,6 +104,33 @@ class SavedRepository(
     }
 
     /**
+     * حذف ريل مجدول من التطبيق: الخادم يحذف ملف R2 ومعلومات Firebase أولاً،
+     * ثم يُمحى محلياً. لو فشل الخادم يبقى العنصر في القائمة مع رسالة الخطأ بدل
+     * أن يبقى فيديو في التخزين بلا سجل.
+     */
+    suspend fun deleteReel(item: SavedItem): Result<Unit> {
+        val remoteResult = archive.deleteRemote(item.id)
+        if (remoteResult.isFailure) return remoteResult
+        delete(item.id)
+        return Result.success(Unit)
+    }
+
+    /**
+     * متابعة حيّة: كل تغيير من الـWorker (نشر ناجح، حذف السجل، أرشففة) يُطبّق
+     * فوراً بلا انتظار. تُستدعى من الـViewModel وتبقى ما دام التطبيق حياً.
+     */
+    suspend fun observeRemote() {
+        var lastSyncAt = 0L
+        remote.streamChanges {
+            val now = System.currentTimeMillis()
+            if (now - lastSyncAt >= LIVE_SYNC_DEBOUNCE_MS) {
+                lastSyncAt = now
+                syncFromRemote()
+            }
+        }
+    }
+
+    /**
      * يسحب القائمة من Firebase ويدمجها مع المحلي (سجلات Firebase تتقدّم)،
      * ثم يرفع أي عنصر محلي ما وصل للقاعدة بعد، ويطلب أرشفة ما لم يُؤرشف.
      */
@@ -128,7 +158,9 @@ class SavedRepository(
         context.savedStore.edit { prefs ->
             val local = decode(prefs[SAVED_ITEMS_KEY]).filterNot { it.id in publishedIds }
             val localById = local.associateBy { it.id }
-            pending = local.filter { it.url != null && it.id !in remoteIds }
+            // فقط ما فشل رفعه يُعاد رفعه: السجل الذي رُفع ثم اختفى من الخادم
+            // حُذف هناك (بعد النشر أو يدوياً) ولا يجوز أن يعود للحياة.
+            pending = local.filter { it.url != null && !it.registered }
 
             // LinkedHashMap: سجلات Firebase أولاً ثم ما هو محلي فقط.
             val merged = LinkedHashMap<String, SavedItem>()
@@ -137,6 +169,8 @@ class SavedRepository(
                 merged[item.id] = item.copy(registered = true, schedule = schedule)
             }
             local.forEach { item ->
+                // مسجّل في الخادم ثم غاب منه = حُذف بعد النشر: يُمحى من الجهاز.
+                if (item.registered && item.id !in remoteIds) return@forEach
                 val existing = merged[item.id]
                 val schedule = remoteSchedules[item.id] ?: item.schedule
                 if (existing == null) {
@@ -169,12 +203,8 @@ class SavedRepository(
         toArchive.forEach { item ->
             scope.launch { archive.request(item, tiktok.resolve(item.url)) }
         }
-        // بعد النشر: حذف السجل والموعد من القاعدة حتى لا يعيد الـWorker معالجته.
-        // لو فشل الحذف تُعاد المحاولة في المزامنة القادمة (الحالة ما زالت published).
-        publishedIds.forEach { id ->
-            remote.deleteReel(id)
-            remote.deleteSchedule(id)
-        }
+        // تنظيف Firebase وR2 بعد النشر ملك الـWorker وحده (خطوة cleaning) حتى
+        // لا يحذف التطبيق سجلاً في منتصف عملية النشر؛ هنا نزيله من القائمة فقط.
         return Result.success(Unit)
     }
 

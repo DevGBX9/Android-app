@@ -37,12 +37,31 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
     private val _downloads = MutableStateFlow<Map<String, DownloadUi>>(emptyMap())
     val downloads: StateFlow<Map<String, DownloadUi>> = _downloads.asStateFlow()
 
+    /** رسالة فشل حذف ريل (تُعرض مرة واحدة ثم تُمسح). */
+    private val _deleteError = MutableStateFlow<String?>(null)
+    val deleteError: StateFlow<String?> = _deleteError.asStateFlow()
+
     init {
         viewModelScope.launch {
             repository.ensureThumbnails()
             repository.syncFromRemote()
         }
+        // متابعة حيّة: الريل يختفي من الشاشة لحظة حذف الـWorker له بعد النشر.
+        viewModelScope.launch { repository.observeRemote() }
         pollArchives()
+    }
+
+    /** يحذف الريل من التطبيق ومن Firebase وR2 (الـWorker ينفّذ الحذف). */
+    fun delete(item: SavedItem) {
+        viewModelScope.launch {
+            repository.deleteReel(item).onFailure { error ->
+                _deleteError.value = error.message ?: "delete failed"
+            }
+        }
+    }
+
+    fun dismissDeleteError() {
+        _deleteError.value = null
     }
 
     /** ينزّل الريل من R2 إلى Downloads مع نسبة 0..100 على البطاقة. */
@@ -81,7 +100,8 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
                 // نزامن دائماً: الريل المنشور يختفي من القائمة والقاعدة بلا حاجة
                 // لإغلاق التطبيق وفتحه من جديد.
                 repository.syncFromRemote()
-                delay(if (processing) 1_500 else 15_000)
+                // احتياط فقط لو انقطع البث الحيّ؛ التحديث اللحظي يأتي منه.
+                delay(if (processing) 1_500 else 30_000)
             }
         }
     }

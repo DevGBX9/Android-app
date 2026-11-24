@@ -69,6 +69,39 @@ MAX_PUBLISH_PER_RUN = 3
 # Meta، ولو انتظرنا لحظة الموعد لظهر الريل متأخراً عن الوقت المعروض في التطبيق.
 PREPARE_LEAD_MS = 45 * 60 * 1000
 
+# --------------------------------------------------------------------------
+# سلسلة النشر: حالات ثابتة بالترتيب، ولكل خطوة مساحتها وحدها
+# --------------------------------------------------------------------------
+# كل حالة تعني: "الخطوة السابقة انتهت بنتيجة، وهذه الخطوة هي التي يحق لها العمل
+# الآن". الانتقال بين الحالات لا يتم إلا بكتابة مشروطة (if-match ETag)، فلو كان
+# تشغيلان يعملان في نفس اللحظة يفشل الثاني (412) ولا يتكرر النشر ولا يُحذف ملف
+# تحت إنستغرام وهو ما زال ينشر.
+STAGE_SCHEDULED = "scheduled"  # بانتظار الموعد
+STAGE_PREPARING = "preparing"  # إنشاء حاوية إنستغرام
+STAGE_PREPARED = "prepared"  # الحاوية جاهزة، بانتظار الموعد
+STAGE_PUBLISHING = "publishing"  # media_publish في الطريق
+STAGE_VERIFYING = "verifying"  # التأكد أن الريل ظهر فعلاً على الحساب
+STAGE_CLEANING = "cleaning"  # حذف الملف ثم سجلات Firebase بعد التأكيد
+STAGE_PUBLISHED = "published"  # نجاح نهائي (يبقى فقط لو تعذّر التنظيف)
+STAGE_UNVERIFIED = "unverified"  # نُشر؟ غير مؤكد: لا يُحذف الملف أبداً
+STAGE_FAILED = "failed"  # فشل نهائي مع سبب واضح
+
+# رسالة خاصة: الخطوة تنتظر ملفاً لم يصل R2 بعد، وليست محاولة فاشلة.
+ARCHIVE_WAIT = "waiting for the reel archive"
+
+# حدود المحاولات لكل خطوة على حدة.
+PREPARE_RETRY_LIMIT = 10
+PUBLISH_RETRY_LIMIT = 5
+VERIFY_RETRY_LIMIT = 10
+CLEAN_RETRY_LIMIT = 10
+
+# حجز الخطوة: لو مات التشغيل في منتصفها تبقى محجوزة حتى هذه المدة ثم يستأنفها
+# التشغيل القادم من حيث توقفت.
+STAGE_LEASE_MS = 2 * 60 * 1000
+
+# الفاصل بين نجاح النشر وحذف الملف من التخزين (يُتحقق من النشر قبله وبعده).
+CLEANUP_DELAY_MS = 5 * 1000
+
 # media_publish ينشر الريل فعلًا في ثوانٍ لكن استجابته قد تتأخر؛ المهلة القصيرة
 # كانت تجعل الـWorker يظن أن النشر فشل والريل منشور أصلًا.
 PUBLISH_TIMEOUT_S = 30
@@ -194,6 +227,29 @@ def _clean(value, default=""):
         return default
     text = str(value).strip()
     return text or default
+
+
+def _int_of(data, name, default=0):
+    """حقل رقمي من سجل Firebase، وأي قيمة غائبة أو غير رقمية تعطي [default]."""
+    try:
+        value = data.get(name)
+    except Exception:  # noqa: BLE001 - ليس dict
+        return default
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _stage_of(schedule):
+    """حالة الموعد الحالية في سلسلة النشر (scheduled افتراضاً)."""
+    try:
+        state = schedule.get("state")
+    except Exception:  # noqa: BLE001 - ليس dict
+        state = None
+    return _clean(state, STAGE_SCHEDULED)
 
 
 def _path_of(raw_url):
@@ -384,6 +440,52 @@ async def _firebase_get(base, path):
     if not text or text == "null":
         return None
     return json.loads(text)
+
+
+async def _firebase_read(base, path):
+    """يقرأ السجل مع بصمته (ETag): بها نمنع أي كتابة متداخلة على نفس الموعد."""
+    response = await _fetch(
+        f"{base.rstrip('/')}/{path.lstrip('/')}",
+        headers={"accept": "application/json", "x-firebase-etag": "true"},
+    )
+    etag = None
+    try:
+        etag = _clean(response.headers.get("etag")) or None
+    except Exception:  # noqa: BLE001 - استجابة بلا ترويسات
+        etag = None
+    if int(response.status) != 200:
+        return None, etag
+    text = await response.text()
+    if not text or text == "null":
+        return None, etag
+    try:
+        return json.loads(text), etag
+    except Exception:  # noqa: BLE001
+        return None, etag
+
+
+async def _firebase_compare_patch(base, path, etag, payload):
+    """PATCH مشروط: ينجح فقط إن لم يتغيّر السجل منذ قراءته (412 يعني سبقنا أحد)."""
+    headers = {"content-type": "application/json; charset=utf-8"}
+    if etag:
+        headers["if-match"] = etag
+    response = await _fetch(
+        f"{base.rstrip('/')}/{path.lstrip('/')}",
+        method="PATCH",
+        headers=headers,
+        body=json.dumps(payload, ensure_ascii=False),
+    )
+    return int(response.status)
+
+
+async def _firebase_delete(base, path):
+    """حذف عقدة كاملة من Firebase (DELETE)."""
+    response = await _fetch(
+        f"{base.rstrip('/')}/{path.lstrip('/')}",
+        method="DELETE",
+        headers={"accept": "application/json"},
+    )
+    return int(response.status)
 
 
 # --------------------------------------------------------------------------
@@ -828,6 +930,29 @@ async def _ig_published_media(user_id, token, since_ms):
     return None
 
 
+async def _ig_media_exists(user_id, token, media_id):
+    """هل المنشور موجود فعلاً على الحساب؟ True / False، أو None إذا تعذّر الفحص.
+
+    نستعملها قبل حذف ملف R2: لا يُحذف فيديو إلا وInstagram يؤكد أن منشوره قائم.
+    """
+    query = urlencode(
+        {"fields": "id,media_type,permalink", "access_token": token}
+    )
+    try:
+        response = await _fetch(
+            f"{IG_GRAPH}/{media_id}?{query}", timeout=GRAPH_READ_TIMEOUT_S
+        )
+    except Exception:  # noqa: BLE001 - الفحص غير مؤكد
+        return None
+    status = int(response.status)
+    if status == 200:
+        data = await _ig_json(response)
+        return bool(_clean(data.get("id")))
+    if status in (400, 404):
+        return False
+    return None
+
+
 async def _ig_create_container(user_id, token, media_url, caption):
     """ينشئ Reels media container من رابط عام؛ Meta تنزّل الفيديو بنفسها."""
     payload = {
@@ -909,10 +1034,11 @@ class Default(WorkerEntrypoint):
                 {
                     "ok": True,
                     "service": "pigeon-reels",
-                    "version": 5,
+                    "version": 6,
                     "routes": [
                         "POST /reels",
                         "GET /reels/<id>",
+                        "DELETE /reels/<id>",
                         "GET /download/<id>",
                         "GET /media/<id>",
                         "GET|POST /publish",
@@ -938,6 +1064,10 @@ class Default(WorkerEntrypoint):
         if parts[0] == "reels" and len(parts) == 2 and method == "GET":
             return await self._status(parts[1])
 
+        # حذف ريل مجدول من التطبيق: يمسح ملفه من R2 وكل معلوماته من Firebase.
+        if parts[0] == "reels" and len(parts) == 2 and method == "DELETE":
+            return await self._delete_reel(parts[1])
+
         if parts[0] == "download" and len(parts) == 2 and method == "GET":
             return await self._download(parts[1])
 
@@ -955,7 +1085,7 @@ class Default(WorkerEntrypoint):
                 headers={
                     "access-control-allow-origin": "*",
                     "access-control-allow-headers": "content-type,x-api-key",
-                    "access-control-allow-methods": "GET,POST,OPTIONS",
+                    "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
                 },
             )
 
@@ -1174,7 +1304,11 @@ class Default(WorkerEntrypoint):
                 continue
             if at <= 0:
                 continue
-            if _clean(schedule.get("state"), "scheduled") != "scheduled":
+            if _stage_of(schedule) not in (
+                STAGE_SCHEDULED,
+                STAGE_PREPARING,
+                STAGE_PREPARED,
+            ):
                 continue
             if _clean(schedule.get("containerId")):
                 continue  # الحاوية موجودة: الملف سبق أن وصل R2
@@ -1211,6 +1345,11 @@ class Default(WorkerEntrypoint):
         return started
 
     async def _publish_due(self):
+        """يمرّ على المواعيد وينفّذ لكل موعد خطوة واحدة من سلسلته.
+
+        لا يوجد "نشر مباشر" هنا: الموعد يتحرك في حالاته بالترتيب، وكل تشغيل
+        يبدأ من الحالة التي انتهت عندها الخطوة السابقة (نجاحاً أو فشلاً).
+        """
         db = self._db()
         now = int(time.time() * 1000)
         report = {
@@ -1220,6 +1359,7 @@ class Default(WorkerEntrypoint):
             "total": 0,
             "due": 0,
             "results": [],
+            "archived": 0,
         }
 
         schedules = await _firebase_get(db, "schedules.json") or {}
@@ -1229,374 +1369,592 @@ class Default(WorkerEntrypoint):
             return report
 
         report["total"] = len(schedules)
-        due = []
-        prepare = []
+        work = []
         for schedule_id, schedule in schedules.items():
             if not isinstance(schedule, dict):
                 continue
-            try:
-                at = int(schedule.get("at") or 0)
-            except (TypeError, ValueError):
+            state = _stage_of(schedule)
+            # الحالات النهائية لا تُعاد تلقائياً أبداً.
+            if state in (STAGE_PUBLISHED, STAGE_FAILED, STAGE_UNVERIFIED):
                 continue
+            at = _int_of(schedule, "at")
             if at <= 0:
                 continue
-            state = _clean(schedule.get("state"), "scheduled")
-            if at <= now:
-                if state in ("scheduled", "creating", "publishing"):
-                    due.append((schedule_id, schedule, at))
-                continue
-            # لم يحن الموعد بعد: نُجهّز الحاوية مسبقاً حتى يُنشر الريل في دقيقته
-            # بدل أن يبدأ تنزيل الفيديو عند Meta بعد مرور الوقت المعروض.
-            if state != "scheduled" or _clean(schedule.get("containerId")):
-                continue
-            if at - now > PREPARE_LEAD_MS:
-                continue
-            prepare.append((schedule_id, schedule, at))
+            work.append((at, _safe_id(schedule_id), schedule))
 
-        # لا شيء مستحق الآن: نستغل التشغيل في تجهيز أرشيف ريل قادم ناقص.
-        if not due:
+        work.sort(key=lambda entry: entry[0])
+        report["due"] = len(work)
+
+        for at, clean_id, schedule in work[:MAX_PUBLISH_PER_RUN]:
+            if not clean_id:
+                continue
+            entry = {"id": clean_id, "at": at, "state": _stage_of(schedule)}
+            try:
+                state, error = await self._advance(db, clean_id, schedule, now)
+                entry["state"] = state
+                if error:
+                    entry["error"] = error
+            except Exception as exc:  # noqa: BLE001 - لا نُسقط بقية المواعيد
+                print(f"pigeon schedule {clean_id} failed: {exc}")
+                entry["error"] = str(exc)[:300]
+            report["results"].append(entry)
+
+        # تشغيل واحد لأرشفة ريل ناقص: إما لأن لا موعد مستحقاً، أو لأن موعداً
+        # وصل إلى خطوة التجهيز وملفه ما زال غائباً عن R2.
+        waiting_archive = any(
+            entry.get("error") == ARCHIVE_WAIT for entry in report["results"]
+        )
+        if not work or waiting_archive:
             try:
                 report["archived"] = await self._archive_missing(db)
             except Exception as exc:  # noqa: BLE001 - ليس حرجاً
                 print(f"pigeon archive retry failed: {exc}")
 
-        # تجهيز الحاويات القريبة أولاً (الأقرب موعداً أولاً).
-        prepare.sort(key=lambda entry: entry[2])
-        report["prepared"] = 0
-        for schedule_id, _schedule, _at in prepare[:MAX_PUBLISH_PER_RUN]:
-            clean_id = _safe_id(schedule_id)
-            if not clean_id:
-                continue
-            try:
-                if await self._prepare_container(db, clean_id) is None:
-                    report["prepared"] += 1
-            except Exception as exc:  # noqa: BLE001 - التجهيز ليس حرجاً
-                print(f"pigeon prepare {clean_id} failed: {exc}")
-
-        # الأقدم أولاً، وبحد 3 في التشغيل الواحد حتى تبقى مدة cron قصيرة.
-        due.sort(key=lambda entry: entry[2])
-        report["due"] = len(due)
-        for schedule_id, schedule, at in due[:MAX_PUBLISH_PER_RUN]:
-            clean_id = _safe_id(schedule_id)
-            if not clean_id:
-                continue
-            entry = {
-                "id": clean_id,
-                "at": at,
-                "state": _clean(schedule.get("state"), "scheduled"),
-            }
-            try:
-                state, error = await self._publish_one(db, clean_id, schedule, now)
-                entry["state"] = state
-                if error:
-                    entry["error"] = error
-            except Exception as exc:  # noqa: BLE001
-                print(f"pigeon schedule {clean_id} failed: {exc}")
-                entry["error"] = str(exc)[:300]
-                try:
-                    await _firebase_patch(
-                        db,
-                        f"schedules/{clean_id}.json",
-                        {
-                            "error": entry["error"],
-                            "updatedAt": int(time.time() * 1000),
-                        },
-                    )
-                except Exception:
-                    pass
-            report["results"].append(entry)
-
         return report
 
-    async def _prepare_container(self, db, schedule_id):
-        """ينشئ حاوية إنستغرام (media container) قبل الموعد.
+    async def _advance(self, db, schedule_id, schedule, now):
+        """خطوة واحدة لهذا الموعد، حسب حالته وحدها.
 
-        الحاوية تنزّل الفيديو من رابط `GET /media/<id>` وتصير FINISHED بعد
-        دقائق. بإنشائها مسبقاً يصبح النشر في دقيقة الموعد مجرد `media_publish`
-        يأخذ ثوانٍ، فلا يظهر الريل بعد الوقت المعروض في التطبيق.
-        يرجّع None عند النجاح أو رسالة الخطأ.
+        كل خطوة تقرأ السجل مع بصمته (ETag) ثم تحجز نفسها بكتابة مشروطة قبل أن
+        تلمس إنستغرام أو R2: لو كان تشغيل آخر يعمل على نفس الخطوة تفشل
+        المطالبة (412) فلا يتداخل تشغيلان ولا يتكرر النشر.
         """
+        state = _stage_of(schedule)
+        # الحجز يُقرأ من stageAt وحده: updatedAt يتغيّر مع كل تحديث حالة، فلو
+        # اعتمدناه لتوقف التأكيد والتنظيف دقيقتين بعد كل كتابة.
+        stage_at = _int_of(schedule, "stageAt")
+        busy = stage_at > 0 and now - stage_at < STAGE_LEASE_MS
+
+        if busy and state in (
+            STAGE_PREPARING,
+            STAGE_PUBLISHING,
+            STAGE_VERIFYING,
+            STAGE_CLEANING,
+        ):
+            # الخطوة محجوزة لتشغيل آخر لم ينته بعد: لا نلمس شيئاً.
+            return state, None
+
+        if state == STAGE_SCHEDULED:
+            at = _int_of(schedule, "at")
+            if at > now and at - now > PREPARE_LEAD_MS:
+                return state, None  # موعد بعيد: لا خطوة بعد
+            return await self._stage_prepare(db, schedule_id)
+
+        if state == STAGE_PREPARING:
+            return await self._stage_prepare(db, schedule_id)
+
+        if state == STAGE_PREPARED:
+            if _int_of(schedule, "at") > now:
+                return state, None  # الحاوية جاهزة، ننتظر الموعد
+            return await self._stage_publish(db, schedule_id)
+
+        if state == STAGE_PUBLISHING:
+            return await self._stage_publish(db, schedule_id)
+
+        if state == STAGE_VERIFYING:
+            return await self._stage_verify(db, schedule_id)
+
+        if state == STAGE_CLEANING:
+            return await self._stage_clean(db, schedule_id)
+
+        return state, None
+
+    async def _claim(self, db, path, etag, to_state, extra=None):
+        """يحجز خطوة: لا تنجح إلا إن كان السجل ما زال كما قرأناه (if-match)."""
+        if not etag:
+            return False
+        moment = int(time.time() * 1000)
+        payload = {
+            "state": to_state,
+            "stageAt": moment,
+            "updatedAt": moment,
+        }
+        if extra:
+            payload.update(extra)
+        status = await _firebase_compare_patch(db, path, etag, payload)
+        return status == 200
+
+    async def _stage_prepare(self, db, schedule_id):
+        """الخطوة 1: إنشاء حاوية إنستغرام قبل الموعد.
+
+        نتيجتها واحدة من: prepared (نجاح) / scheduled (إعادة لاحقة) / failed.
+        """
+        path = f"schedules/{schedule_id}.json"
+        current, etag = await _firebase_read(db, path)
+        if not isinstance(current, dict):
+            return STAGE_SCHEDULED, "the schedule record disappeared"
+
+        state = _stage_of(current)
+        if state not in (STAGE_SCHEDULED, STAGE_PREPARING):
+            return state, None
+
+        if _clean(current.get("containerId")):
+            moment = int(time.time() * 1000)
+            await _firebase_patch(
+                db, path, {"state": STAGE_PREPARED, "error": None, "updatedAt": moment}
+            )
+            return STAGE_PREPARED, None
+
+        # الملف ليس في R2 بعد: ننتظر الأرشفة، وهذه ليست محاولة فاشلة.
+        if await _object_exists(self.env, self._key(schedule_id)) is not True:
+            return STAGE_SCHEDULED, ARCHIVE_WAIT
+
+        if not await self._claim(db, path, etag, STAGE_PREPARING, {"error": None}):
+            return state, None  # تشغيل آخر حجز خطوة التجهيز
+
+        container_id, error = await self._prepare_container(schedule_id)
+        moment = int(time.time() * 1000)
+
+        if error is None and container_id:
+            await _firebase_patch(
+                db,
+                path,
+                {
+                    "state": STAGE_PREPARED,
+                    "containerId": container_id,
+                    "preparedAt": moment,
+                    "attempts": 0,
+                    "error": None,
+                    "stageAt": moment,
+                    "updatedAt": moment,
+                },
+            )
+            return STAGE_PREPARED, None
+
+        attempts = _int_of(current, "attempts") + 1
+        error = error or "instagram did not return a container id"
+        if attempts >= PREPARE_RETRY_LIMIT:
+            await _firebase_patch(
+                db,
+                path,
+                {
+                    "state": STAGE_FAILED,
+                    "attempts": attempts,
+                    "error": error,
+                    "stageAt": moment,
+                    "updatedAt": moment,
+                },
+            )
+            return STAGE_FAILED, error
+
+        await _firebase_patch(
+            db,
+            path,
+            {
+                "state": STAGE_SCHEDULED,
+                "attempts": attempts,
+                "error": error,
+                "stageAt": moment,
+                "updatedAt": moment,
+            },
+        )
+        return STAGE_SCHEDULED, error
+
+    async def _prepare_container(self, schedule_id):
+        """ينشئ الحاوية فقط. يرجّع (container_id, error) ولا يكتب في Firebase."""
         token = _ig_token(self.env)
         if not token:
-            return "IG_ACCESS_TOKEN is not configured"
-
-        if await _object_exists(self.env, self._key(schedule_id)) is not True:
-            return "the reel is not archived yet"
+            return None, "IG_ACCESS_TOKEN is not configured"
 
         media_url = f"{_ig_public_base(self.env)}/media/{schedule_id}"
         try:
             container_id = await _ig_create_container(
                 _ig_user(self.env), token, media_url, ""
             )
-        except Exception as exc:  # noqa: BLE001 - نعيد المحاولة في cron القادم
-            return _describe(exc)[:300]
+        except Exception as exc:  # noqa: BLE001 - يعيد المتصل المحاولة
+            return None, _describe(exc)[:300]
+        return container_id, None
 
-        moment = int(time.time() * 1000)
-        await _firebase_patch(
-            db,
-            f"schedules/{schedule_id}.json",
-            {
-                "containerId": container_id,
-                "preparedAt": moment,
-                "attempts": 0,
-                "updatedAt": moment,
-            },
-        )
-        return None
-
-    async def _publish_one(self, db, schedule_id, schedule, now):
+    async def _stage_publish(self, db, schedule_id):
+        """الخطوة 2: media_publish. نتيجتها: verifying / prepared / failed."""
         path = f"schedules/{schedule_id}.json"
+        current, etag = await _firebase_read(db, path)
+        if not isinstance(current, dict):
+            return STAGE_SCHEDULED, "the schedule record disappeared"
+
+        state = _stage_of(current)
+        if state not in (STAGE_PREPARED, STAGE_PUBLISHING):
+            return state, None
+
         token = _ig_token(self.env)
         if not token:
-            error = "IG_ACCESS_TOKEN is not configured"
+            moment = int(time.time() * 1000)
             await _firebase_patch(
                 db,
                 path,
                 {
-                    "error": error,
-                    "updatedAt": now,
+                    "state": STAGE_FAILED,
+                    "error": "IG_ACCESS_TOKEN is not configured",
+                    "updatedAt": moment,
                 },
             )
-            return _clean(schedule.get("state"), "scheduled"), error
+            return STAGE_FAILED, "IG_ACCESS_TOKEN is not configured"
 
-        state = _clean(schedule.get("state"), "scheduled")
-        try:
-            attempts = int(schedule.get("attempts") or 0)
-        except (TypeError, ValueError):
-            attempts = 0
         user_id = _ig_user(self.env)
+        moment = int(time.time() * 1000)
 
-        if state == "publishing":
-            updated = 0
-            try:
-                updated = int(schedule.get("updatedAt") or 0)
-            except (TypeError, ValueError):
-                updated = 0
-            if now - updated < PUBLISH_STUCK_MS:
-                return state, None
-            # قبل الحكم بالفشل: قد يكون النشر نجح وضاعت الاستجابة.
-            published_id = await _ig_published_media(user_id, token, updated)
+        # تشغيل سابق بدأ media_publish ثم انقطع: لا نعيد النشر أبداً، بل
+        # نسأل الحساب أولاً إن كان الريل ظهر فعلاً.
+        if state == STAGE_PUBLISHING:
+            stage_at = _int_of(current, "stageAt") or moment
+            published_id = await _ig_published_media(
+                user_id, token, stage_at - 180_000
+            )
             if published_id:
-                finished = int(time.time() * 1000)
-                await _firebase_patch(
-                    db,
-                    path,
-                    {
-                        "state": "published",
-                        "mediaId": published_id,
-                        "publishedAt": finished,
-                        "error": None,
-                        "updatedAt": finished,
-                    },
+                await self._enter_verifying(
+                    db, path, published_id, moment, stage_at
                 )
-                return "published", None
+                # نُكمل السلسلة في نفس التشغيل: تأكيد ثم تنظيف بعد 5 ثوانٍ.
+                return await self._stage_verify(db, schedule_id)
+            if moment - stage_at < PUBLISH_STUCK_MS:
+                return state, None
             error = "publishing was interrupted; check Instagram before retrying"
             await _firebase_patch(
                 db,
                 path,
-                {
-                    "state": "failed",
-                    "error": error,
-                    "updatedAt": now,
-                },
+                {"state": STAGE_FAILED, "error": error, "updatedAt": moment},
             )
-            return "failed", error
+            return STAGE_FAILED, error
 
-        # الحاوية قد تكون مُجهّزة مسبقاً (أُنشئت قبل الموعد): حينها لا ننشئها من
-        # جديد، بل نفحص حالتها وننشر فوراً في دقيقة الموعد.
-        container_id = _clean(schedule.get("containerId"))
-
-        if state == "scheduled" and not container_id:
-            # لازم يكون الملف في R2 قبل ما تعطيه Meta رابطاً عاماً.
-            # لو تعذّر الفحص (None) نكمل: Meta هي التي تنزّل الرابط، وفشلها
-            # يظهر كخطأ حاوية واضح بدل أن يبقى الموعد معلقاً للأبد.
-            exists = await _object_exists(self.env, self._key(schedule_id))
-            if exists is False:
-                attempts += 1
-                if attempts >= SCHEDULE_RETRY_LIMIT:
-                    error = "the reel was not archived before its publish time"
-                    await _firebase_patch(
-                        db,
-                        path,
-                        {
-                            "state": "failed",
-                            "attempts": attempts,
-                            "error": error,
-                            "updatedAt": now,
-                        },
-                    )
-                    return "failed", error
-                error = "waiting for the reel archive"
-                await _firebase_patch(
-                    db,
-                    path,
-                    {
-                        "attempts": attempts,
-                        "error": error,
-                        "updatedAt": now,
-                    },
-                )
-                return "scheduled", error
-
-            media_url = f"{_ig_public_base(self.env)}/media/{schedule_id}"
-            try:
-                container_id = await _ig_create_container(
-                    user_id, token, media_url, ""
-                )
-            except Exception as exc:  # noqa: BLE001 - خطأ واضح في سجل الموعد
-                error = str(exc)[:300]
-                await _firebase_patch(
-                    db,
-                    path,
-                    {
-                        "state": "failed",
-                        "error": error,
-                        "updatedAt": now,
-                    },
-                )
-                return "failed", error
-
+        container_id = _clean(current.get("containerId"))
+        if not container_id:
             await _firebase_patch(
                 db,
                 path,
                 {
-                    "state": "creating",
-                    "containerId": container_id,
-                    "attempts": 0,
-                    "error": None,
-                    "updatedAt": now,
+                    "state": STAGE_SCHEDULED,
+                    "error": "the Instagram container id is missing",
+                    "updatedAt": moment,
                 },
             )
-            return "creating", None
+            return STAGE_SCHEDULED, "the Instagram container id is missing"
 
-        if state in ("scheduled", "creating"):
-            if state == "scheduled":
-                # حان الموعد والحاوية مُجهّزة: نبدأ الفحص والنشر في هذا التشغيل.
-                await _firebase_patch(
-                    db,
-                    path,
-                    {
-                        "state": "creating",
-                        "attempts": 0,
-                        "error": None,
-                        "updatedAt": now,
-                    },
-                )
-            if not container_id:
-                error = "the Instagram container id is missing"
-                await _firebase_patch(
-                    db,
-                    path,
-                    {
-                        "state": "failed",
-                        "error": error,
-                        "updatedAt": now,
-                    },
-                )
-                return "failed", error
-
-            try:
-                status_code, status_text = await _ig_container_status(
-                    container_id, token
-                )
-            except Exception as exc:  # noqa: BLE001 - نعيد المحاولة في cron القادم
-                attempts += 1
-                payload = {
-                    "attempts": attempts,
-                    "error": _describe(exc)[:300],
-                    "updatedAt": now,
-                }
-                if attempts >= SCHEDULE_RETRY_LIMIT:
-                    payload["state"] = "failed"
-                await _firebase_patch(db, path, payload)
-                return _clean(payload.get("state"), "creating"), payload["error"]
-
-            if status_code == "FINISHED":
-                await _firebase_patch(
-                    db,
-                    path,
-                    {
-                        "state": "publishing",
-                        "attempts": 0,
-                        "error": None,
-                        "updatedAt": now,
-                    },
-                )
-                try:
-                    media_id = await _ig_publish(user_id, token, container_id)
-                except Exception as exc:  # noqa: BLE001
-                    # قد يكون النشر نجح والرد ضاع؛ لا نعيده تلقائياً حتى لا
-                    # يتكرر الريل. بعد PUBLISH_STUCK_MS تصير الحالة failed.
-                    error = _describe(exc)[:300]
-                    # نتحقق من الحساب نفسه قبل اعتبار الموعد معلقاً.
-                    published_id = await _ig_published_media(
-                        user_id, token, int(time.time() * 1000) - 180_000
-                    )
-                    if published_id:
-                        finished = int(time.time() * 1000)
-                        await _firebase_patch(
-                            db,
-                            path,
-                            {
-                                "state": "published",
-                                "mediaId": published_id,
-                                "publishedAt": finished,
-                                "error": None,
-                                "updatedAt": finished,
-                            },
-                        )
-                        return "published", None
-                    await _firebase_patch(
-                        db,
-                        path,
-                        {
-                            "state": "publishing",
-                            "error": error,
-                            "updatedAt": int(time.time() * 1000),
-                        },
-                    )
-                    return "publishing", error
-
-                finished = int(time.time() * 1000)
-                await _firebase_patch(
-                    db,
-                    path,
-                    {
-                        "state": "published",
-                        "mediaId": media_id,
-                        "publishedAt": finished,
-                        "error": None,
-                        "updatedAt": finished,
-                    },
-                )
-                return "published", None
-
-            if status_code in ("ERROR", "EXPIRED"):
-                error = f"instagram container {status_code.lower()}: {status_text}"[:300]
-                await _firebase_patch(
-                    db,
-                    path,
-                    {
-                        "state": "failed",
-                        "error": error,
-                        "updatedAt": now,
-                    },
-                )
-                return "failed", error
-
-            # IN_PROGRESS: الحاوية تنزّل الفيديو؛ نفحصها في cron القادم، وبعد
-            # ساعة بلا نتيجة نعلّمها فاشلة بدل الانتظار بلا نهاية.
-            attempts += 1
-            payload = {
-                "attempts": attempts,
-                "error": None,
-                "updatedAt": now,
-            }
+        # 2أ) لا ننشر إلا حاوية FINISHED: الحاوية ما زالت تنزّل الفيديو.
+        try:
+            status_code, status_text = await _ig_container_status(
+                container_id, token
+            )
+        except Exception as exc:  # noqa: BLE001 - نعيد المحاولة في التشغيل القادم
+            error = _describe(exc)[:300]
+            attempts = _int_of(current, "attempts") + 1
+            payload = {"attempts": attempts, "error": error, "updatedAt": moment}
             if attempts >= SCHEDULE_RETRY_LIMIT:
-                payload["state"] = "failed"
+                payload["state"] = STAGE_FAILED
+            await _firebase_patch(db, path, payload)
+            return _clean(payload.get("state"), state), error
+
+        if status_code in ("ERROR", "EXPIRED"):
+            error = f"instagram container {status_code.lower()}: {status_text}"[:300]
+            await _firebase_patch(
+                db,
+                path,
+                {"state": STAGE_FAILED, "error": error, "updatedAt": moment},
+            )
+            return STAGE_FAILED, error
+
+        if status_code != "FINISHED":
+            attempts = _int_of(current, "attempts") + 1
+            payload = {"attempts": attempts, "error": None, "updatedAt": moment}
+            if attempts >= SCHEDULE_RETRY_LIMIT:
+                payload["state"] = STAGE_FAILED
                 payload["error"] = "instagram did not finish processing the video"
             await _firebase_patch(db, path, payload)
-            return _clean(payload.get("state"), "creating"), payload.get("error")
+            return _clean(payload.get("state"), state), payload.get("error")
+
+        # 2ب) نحجز خطوة النشر قبل النداء الخارجي نفسه.
+        if not await self._claim(
+            db, path, etag, STAGE_PUBLISHING, {"error": None, "attempts": 0}
+        ):
+            return state, None
+
+        started = int(time.time() * 1000)
+        media_id = None
+        error = None
+        try:
+            media_id = await _ig_publish(user_id, token, container_id)
+        except Exception as exc:  # noqa: BLE001 - قد يكون النشر نجح والرد ضاع
+            error = _describe(exc)[:300]
+
+        if not media_id:
+            media_id = await _ig_published_media(
+                user_id, token, started - 180_000
+            )
+
+        moment = int(time.time() * 1000)
+        if media_id:
+            await self._enter_verifying(db, path, media_id, moment, started)
+            # التأكيد والتنظيف في نفس التشغيل حتى تُحذف المخلفات بعد 5 ثوانٍ
+            # من نجاح النشر، لا مع cron لاحق.
+            return await self._stage_verify(db, schedule_id)
+
+        attempts = _int_of(current, "attempts") + 1
+        error = error or "media_publish returned no id"
+        payload = {"attempts": attempts, "error": error, "updatedAt": moment}
+        if attempts >= PUBLISH_RETRY_LIMIT:
+            payload["state"] = STAGE_FAILED
+        else:
+            payload["state"] = STAGE_PREPARED
+        await _firebase_patch(db, path, payload)
+        return _clean(payload.get("state"), state), error
+
+    async def _enter_verifying(self, db, path, media_id, moment, published_at):
+        """ينقل السجل من publishing إلى verifying مع موعد التنظيف (بعد 5 ثوانٍ)."""
+        if published_at <= 0 or published_at > moment:
+            published_at = moment
+        await _firebase_patch(
+            db,
+            path,
+            {
+                "state": STAGE_VERIFYING,
+                "mediaId": media_id,
+                "publishedAt": published_at,
+                "cleanupAt": published_at + CLEANUP_DELAY_MS,
+                "attempts": 0,
+                "error": None,
+                "stageAt": moment,
+                "updatedAt": moment,
+            },
+        )
+        return STAGE_VERIFYING, None
+
+    async def _stage_verify(self, db, schedule_id):
+        """الخطوة 3: تأكيد أن المنشور موجود فعلاً على الحساب (Graph API)."""
+        path = f"schedules/{schedule_id}.json"
+        current, etag = await _firebase_read(db, path)
+        if not isinstance(current, dict):
+            return STAGE_SCHEDULED, "the schedule record disappeared"
+
+        state = _stage_of(current)
+        if state != STAGE_VERIFYING:
+            return state, None
+
+        media_id = _clean(current.get("mediaId"))
+        token = _ig_token(self.env)
+        moment = int(time.time() * 1000)
+
+        if not media_id or not token:
+            error = "cannot confirm the published reel"
+            await _firebase_patch(
+                db,
+                path,
+                {"state": STAGE_UNVERIFIED, "error": error, "updatedAt": moment},
+            )
+            return STAGE_UNVERIFIED, error
+
+        confirmed = await _ig_media_exists(
+            _ig_user(self.env), token, media_id
+        )
+        if confirmed is True:
+            if not await self._claim(
+                db, path, etag, STAGE_CLEANING, {"error": None, "attempts": 0}
+            ):
+                return state, None
+            published_at = _int_of(current, "publishedAt") or moment
+            await _firebase_patch(
+                db,
+                path,
+                {
+                    "cleanupAt": published_at + CLEANUP_DELAY_MS,
+                    "stageAt": moment,
+                    "updatedAt": moment,
+                },
+            )
+            return await self._stage_clean(db, schedule_id)
+
+        attempts = _int_of(current, "attempts") + 1
+        if confirmed is False:
+            error = "instagram did not confirm the published reel"
+        else:
+            error = "could not confirm the published reel with instagram"
+        if attempts >= VERIFY_RETRY_LIMIT:
+            # بلا تأكيد لا نحذف الملف أبداً: نترك الريل والمعلومات للمراجعة.
+            await _firebase_patch(
+                db,
+                path,
+                {
+                    "state": STAGE_UNVERIFIED,
+                    "attempts": attempts,
+                    "error": error,
+                    "updatedAt": moment,
+                },
+            )
+            return STAGE_UNVERIFIED, error
+        await _firebase_patch(
+            db, path, {"attempts": attempts, "error": error, "updatedAt": moment}
+        )
+        return state, error
+
+    async def _stage_clean(self, db, schedule_id):
+        """الخطوة 4: حذف الملف من R2 ثم كل معلومات الريل من Firebase.
+
+        لا حذف قبل تأكيد ثانٍ من إنستغرام، ولا مسح لسجلات Firebase قبل التأكد
+        أن الملف غاب فعلاً من R2: هكذا لا يضيع فيديو نُشر أو ما زال يُنشر.
+        """
+        path = f"schedules/{schedule_id}.json"
+        current, etag = await _firebase_read(db, path)
+        if not isinstance(current, dict):
+            return STAGE_PUBLISHED, None
+
+        state = _stage_of(current)
+        if state != STAGE_CLEANING:
+            return state, None
+
+        media_id = _clean(current.get("mediaId"))
+        token = _ig_token(self.env)
+        now = int(time.time() * 1000)
+
+        # 4أ) مهلة 5 ثوانٍ بعد النشر لتستقر الحاوية عند Meta.
+        target = _int_of(current, "cleanupAt") or (
+            _int_of(current, "publishedAt") + CLEANUP_DELAY_MS
+        )
+        remaining = target - now
+        if remaining > 0:
+            await asyncio.sleep(min(CLEANUP_DELAY_MS, remaining) / 1000)
+
+        key = self._key(schedule_id)
+
+        # 4ب) تأكيد أخير قبل الحذف (لأن الحذف لا رجعة فيه).
+        if not media_id or not token:
+            error = "cannot confirm the published reel before deleting its file"
+            await _firebase_patch(
+                db,
+                path,
+                {"state": STAGE_UNVERIFIED, "error": error, "updatedAt": int(time.time() * 1000)},
+            )
+            return STAGE_UNVERIFIED, error
+
+        confirmed = await _ig_media_exists(_ig_user(self.env), token, media_id)
+        moment = int(time.time() * 1000)
+        if confirmed is not True:
+            attempts = _int_of(current, "attempts") + 1
+            error = "instagram did not confirm the published reel; the file was kept"
+            if attempts >= CLEAN_RETRY_LIMIT:
+                await _firebase_patch(
+                    db,
+                    path,
+                    {
+                        "state": STAGE_UNVERIFIED,
+                        "attempts": attempts,
+                        "error": error,
+                        "updatedAt": moment,
+                    },
+                )
+                return STAGE_UNVERIFIED, error
+            await _firebase_patch(
+                db, path, {"attempts": attempts, "error": error, "updatedAt": moment}
+            )
+            return state, error
+
+        # 4ج) حذف الملف من R2.
+        try:
+            await self.env.FILES.delete(key)
+        except Exception as exc:  # noqa: BLE001 - نعيد المحاولة في التشغيل القادم
+            return await self._clean_failed(
+                db, path, current, "could not delete the archived file: %s" % _describe(exc)[:200]
+            )
+
+        if await _object_exists(self.env, key) is True:
+            return await self._clean_failed(
+                db, path, current, "the archived file is still in R2 after delete"
+            )
+
+        # 4د) بعد التأكد من الحذف فقط: تُمسح معلومات الريل كاملة من Firebase.
+        if not await self._forget_reel(db, schedule_id):
+            return STAGE_CLEANING, "the file is gone but the database records are still there"
+        return STAGE_PUBLISHED, None
+
+    async def _clean_failed(self, db, path, current, error):
+        """تسجيل فشل خطوة الحذف: محاولات محدودة ثم تُترك الحالة للمراجعة."""
+        attempts = _int_of(current, "attempts") + 1
+        moment = int(time.time() * 1000)
+        if attempts >= CLEAN_RETRY_LIMIT:
+            await _firebase_patch(
+                db,
+                path,
+                {
+                    "state": STAGE_PUBLISHED,
+                    "attempts": attempts,
+                    "error": error,
+                    "cleanupError": error,
+                    "updatedAt": moment,
+                },
+            )
+            return STAGE_PUBLISHED, error
+        await _firebase_patch(
+            db, path, {"attempts": attempts, "error": error, "updatedAt": moment}
+        )
+        return STAGE_CLEANING, error
+
+    async def _forget_reel(self, db, reel_id):
+        """يحذف سجل الريل كاملاً (عنوانه وروابطه وغلافه) وموعده من Firebase."""
+        clean_id = _safe_id(reel_id)
+        if not clean_id:
+            return False
+        ok = True
+        for path in (f"reels/{clean_id}.json", f"schedules/{clean_id}.json"):
+            try:
+                status = await _firebase_delete(db, path)
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                print(f"pigeon cleanup {path} failed: {exc}")
+                continue
+            if status not in (200, 204):
+                ok = False
+                print(f"pigeon cleanup {path} -> HTTP {status}")
+        return ok
+
+    async def _delete_reel(self, reel_id):
+        """حذف ريل مجدول من التطبيق: ملف R2 أولاً ثم سجلات Firebase.
+
+        يُرفض أثناء خطوة نشر جارية حتى لا يُحذف الفيديو من تحت إنستغرام.
+        """
+        reel_id = _safe_id(reel_id)
+        if not reel_id:
+            return _error("bad id", 404)
+
+        db = self._db()
+        schedule = await _firebase_get(db, f"schedules/{reel_id}.json")
+        if isinstance(schedule, dict):
+            state = _stage_of(schedule)
+            if state in (STAGE_PUBLISHING, STAGE_VERIFYING, STAGE_CLEANING):
+                return _json(
+                    {
+                        "ok": False,
+                        "error": "the reel is being published right now",
+                        "state": state,
+                    },
+                    status=409,
+                )
+
+        key = self._key(reel_id)
+        try:
+            await self.env.FILES.delete(key)
+        except Exception as exc:  # noqa: BLE001
+            return _json(
+                {
+                    "ok": False,
+                    "error": "could not delete the archived file: %s"
+                    % _describe(exc)[:200],
+                },
+                status=503,
+            )
+
+        if await _object_exists(self.env, key) is True:
+            return _json(
+                {"ok": False, "error": "the archived file is still in R2"},
+                status=503,
+            )
+
+        if not await self._forget_reel(db, reel_id):
+            return _json(
+                {
+                    "ok": False,
+                    "error": "the file is gone but the database records could not be removed",
+                },
+                status=503,
+            )
+
+        return _json({"ok": True, "id": reel_id, "deleted": True})
 
     async def _archive(
         self, reel_id, code, tiktok, source, origin, thumbnail, app_media=None
