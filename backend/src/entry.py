@@ -796,8 +796,11 @@ class Default(WorkerEntrypoint):
         )
         try:
             self.ctx.waitUntil(job)
-        except Exception:  # noqa: BLE001 - لو تعذّر التشغيل في الخلفية نكمل الطلب
-            await job
+        except BaseException:  # noqa: BLE001 - لو تعذّر التشغيل في الخلفية نكمل الطلب
+            try:
+                await job
+            except BaseException:  # noqa: BLE001
+                pass
 
         return _json({"ok": True, "id": reel_id, "state": "queued"}, status=202)
 
@@ -862,3 +865,164 @@ class Default(WorkerEntrypoint):
 
     def _key(self, reel_id):
         return f"reels/{reel_id}.mp4"
+
+    async def _archive(
+        self, reel_id, code, tiktok, source, origin, thumbnail, app_media=None
+    ):
+        db = self._db()
+        state_path = f"reels/{reel_id}/archive.json"
+        started = int(time.time() * 1000)
+        deadline = time.monotonic() + ARCHIVE_BUDGET_S
+
+        def remaining():
+            return deadline - time.monotonic()
+
+        async def report(state, progress, **extra):
+            payload = {
+                "state": state,
+                "progress": int(progress),
+                "updatedAt": int(time.time() * 1000),
+            }
+            payload.update(extra)
+            try:
+                await _firebase_put(db, state_path, payload)
+            except Exception:
+                pass
+
+        try:
+            await report("downloading", 3)
+
+            info = {}
+            attempts = []
+            hosts = []
+            last_error = "no media url"
+
+            # تيك توك: كل مرشّح يحمل ترويساته. روابط `*.tiktokcdn.com` التي
+            # يحلّها التطبيق من شبكة الهاتف تعمل على Cloudflare، بينما روابط
+            # صفحة الويب (`*-prime.tiktok.com`) ترد 403 دائماً.
+            if source == "tiktok":
+                base_headers = {"user-agent": BROWSER_UA, "accept": "*/*"}
+            else:
+                base_headers = {
+                    "user-agent": CRAWLER_UA,
+                    "referer": "https://www.instagram.com/",
+                }
+
+            async def on_progress(percent):
+                await report("downloading", percent)
+
+            async def attempt(items):
+                """يجرّب المرشّحين بالترتيب ويرجّع بايتات الفيديو أو None."""
+                nonlocal last_error
+                for candidate in items:
+                    if remaining() <= 6:
+                        last_error = last_error or "the download budget ran out"
+                        return None
+                    hosts.append((urlparse(candidate["url"]).hostname or "?")[:60])
+                    media_headers = dict(base_headers)
+                    media_headers.update(candidate.get("headers") or {})
+                    try:
+                        if candidate.get("whole"):
+                            return await asyncio.wait_for(
+                                _fetch_whole(
+                                    candidate["url"], on_progress, media_headers
+                                ),
+                                max(6.0, remaining()),
+                            )
+                        try:
+                            return await asyncio.wait_for(
+                                _download_bytes(
+                                    candidate["url"],
+                                    on_progress,
+                                    media_headers,
+                                    candidate.get("bytes") or 0,
+                                ),
+                                max(6.0, remaining()),
+                            )
+                        except RuntimeError as exc:
+                            if "media HTTP" not in str(exc):
+                                raise
+                            # احتياطي: طلب كامل واحد بدل النطاقات.
+                            return await asyncio.wait_for(
+                                _fetch_whole(
+                                    candidate["url"], on_progress, media_headers
+                                ),
+                                max(6.0, remaining()),
+                            )
+                    except Exception as exc:  # noqa: BLE001 - نجرّب الرابط التالي
+                        last_error = str(exc)[:120] or exc.__class__.__name__
+                return None
+
+            async def resolve(budget):
+                nonlocal info, attempts
+                try:
+                    if source == "tiktok":
+                        found, resolved_info, log = await asyncio.wait_for(
+                            _resolve_tiktok(tiktok, deadline=time.monotonic() + budget),
+                            budget,
+                        )
+                    else:
+                        media, log = await asyncio.wait_for(
+                            _resolve_media_url(code), budget
+                        )
+                        found = [{"url": media, "bytes": 0}] if media else []
+                        resolved_info = {}
+                    info = resolved_info or info
+                    attempts = list(log) + attempts
+                    return found
+                except asyncio.TimeoutError:
+                    attempts.append(f"{source} -> no answer in {budget:.0f}s")
+                    return []
+
+            await report("downloading", 6)
+
+            # المسار السريع: رابط CDN النظيف القادم من التطبيق (بلا علامة مائية).
+            data = None
+            if app_media:
+                data = await attempt(
+                    [
+                        {
+                            "url": app_media,
+                            "bytes": 0,
+                            "headers": {"user-agent": BROWSER_UA, "accept": "*/*"},
+                            "label": "app/media",
+                        }
+                    ]
+                )
+
+            if data is None:
+                candidates = await resolve(max(4.0, remaining() - 12))
+                if candidates:
+                    data = await attempt(candidates)
+
+            if not data:
+                raise RuntimeError(
+                    "media download failed: %s (hosts: %s) (%s)"
+                    % (
+                        last_error,
+                        ", ".join(dict.fromkeys(hosts)),
+                        " | ".join(attempts)[:200],
+                    )
+                )
+
+            await report("storing", 95)
+            await self.env.FILES.put(self._key(reel_id), data)
+
+            download_url = f"{origin}/download/{reel_id}"
+            await report(
+                "ready",
+                100,
+                url=download_url,
+                bytes=len(data),
+                source=source,
+                title=info.get("title") or None,
+                thumbnail=thumbnail or info.get("thumbnail") or None,
+                videoDurationMs=info.get("durationMs") or None,
+                durationMs=int(time.time() * 1000) - started,
+            )
+        except Exception as exc:  # noqa: BLE001
+            await report(
+                "failed",
+                0,
+                error=("%s: %s" % (exc.__class__.__name__, exc))[:300],
+            )
