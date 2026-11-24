@@ -20,7 +20,6 @@ import re
 import time
 from urllib.parse import urlparse, unquote
 
-from js import URL
 from workers import Response, WorkerEntrypoint, fetch
 
 RTDB_FALLBACK = (
@@ -114,7 +113,25 @@ def _clean(value, default=""):
 
 
 def _path_of(raw_url):
-    return URL(raw_url).pathname
+    return urlparse(raw_url).path or "/"
+
+
+def _origin_of(raw_url):
+    parsed = urlparse(raw_url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+async def _read_bytes(response):
+    """يقرأ جسم الاستجابة كبايتات بايثون (Pyodide يعطي ArrayBuffer/JsProxy)."""
+    for reader in ("bytes", "arrayBuffer"):
+        method = getattr(response, reader, None)
+        if not callable(method):
+            continue
+        try:
+            return _as_bytes(await method())
+        except Exception:  # noqa: BLE001 - نجرّب القارئ الثاني
+            continue
+    raise RuntimeError("could not read the response body")
 
 
 def _instagram_code(link):
@@ -236,7 +253,7 @@ async def _download_bytes(media_url, on_progress):
         response = await fetch(media_url, headers=headers, redirect="follow")
         if int(response.status) not in (200, 206):
             raise RuntimeError(f"media HTTP {response.status}")
-        data = _as_bytes(await response.bytes())
+        data = await _read_bytes(response)
         if not data:
             raise RuntimeError("empty media")
         if len(data) > MAX_BYTES:
@@ -258,7 +275,7 @@ async def _download_bytes(media_url, on_progress):
         status = int(response.status)
         if status not in (200, 206):
             raise RuntimeError(f"media HTTP {status}")
-        chunk = _as_bytes(await response.bytes())
+        chunk = await _read_bytes(response)
         if not chunk:
             break
         buffer += chunk
@@ -353,7 +370,7 @@ class Default(WorkerEntrypoint):
         if not code:
             return _error("only instagram reel links are supported")
 
-        origin = f"{URL(str(request.url)).origin}"
+        origin = _origin_of(str(request.url))
         db = self._db()
         now = int(time.time() * 1000)
 
@@ -363,9 +380,13 @@ class Default(WorkerEntrypoint):
             {"state": "queued", "progress": 0, "updatedAt": now},
         )
 
-        self.ctx.waitUntil(
-            self._archive(reel_id=reel_id, code=code, origin=origin, thumbnail=thumbnail)
+        job = self._archive(
+            reel_id=reel_id, code=code, origin=origin, thumbnail=thumbnail
         )
+        try:
+            self.ctx.waitUntil(job)
+        except Exception:  # noqa: BLE001 - لو تعذّر التشغيل في الخلفية نكمل الطلب
+            await job
 
         return _json({"ok": True, "id": reel_id, "state": "queued"}, status=202)
 
