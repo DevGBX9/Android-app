@@ -4,7 +4,6 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.PagerSnapDistance
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.pager.PagerDefaults
@@ -69,7 +68,6 @@ fun PigeonRoot(
             beyondViewportPageCount = 1,
             flingBehavior = PagerDefaults.flingBehavior(
                 state = pagerState,
-                pagerSnapDistance = PagerSnapDistance.atMost(1),
                 snapPositionalThreshold = 0.16f,
                 snapAnimationSpec = tween(
                     durationMillis = 280,
