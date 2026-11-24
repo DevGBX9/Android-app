@@ -24,6 +24,7 @@ import asyncio
 import json
 import re
 import time
+from datetime import datetime
 from urllib.parse import quote, urlencode, urlparse
 
 from workers import Response, WorkerEntrypoint, fetch
@@ -63,6 +64,11 @@ SCHEDULE_RETRY_LIMIT = 12
 
 # أقصى عدد مواعيد تُعالج في تشغيل واحد حتى تبقى مدة cron قصيرة.
 MAX_PUBLISH_PER_RUN = 3
+
+# media_publish ينشر الريل فعلًا في ثوانٍ لكن استجابته قد تتأخر؛ المهلة القصيرة
+# كانت تجعل الـWorker يظن أن النشر فشل والريل منشور أصلًا.
+PUBLISH_TIMEOUT_S = 30
+GRAPH_READ_TIMEOUT_S = 15
 
 # لو توقّف الـWorker بعد إرسال media_publish وقبل كتابة النتيجة، لا نعيد النشر
 # تلقائياً حتى لا يتكرر الريل؛ ننتظر هذه المدة ثم نعلّم الحالة فاشلة للمراجعة.
@@ -197,7 +203,8 @@ def _origin_of(raw_url):
 
 async def _fetch(url, **options):
     """طلب شبكة بمهلة قصوى، لأن fetch في الـWorker بلا مهلة افتراضية."""
-    return await asyncio.wait_for(fetch(url, **options), FETCH_TIMEOUT_S)
+    timeout = options.pop("timeout", None) or FETCH_TIMEOUT_S
+    return await asyncio.wait_for(fetch(url, **options), timeout)
 
 
 async def _read_bytes(response):
@@ -769,6 +776,54 @@ async def _ig_json(response):
     return parsed if isinstance(parsed, dict) else {"raw": text[:300]}
 
 
+def _describe(exc):
+    """رسالة الخطأ؛ بعض استثناءات المهلة لا تحمل نصاً فنستخدم نوعها."""
+    text = str(exc).strip()
+    return text or exc.__class__.__name__
+
+
+async def _ig_published_media(user_id, token, since_ms):
+    """هل نُشر ريل جديد على الحساب بعد `since_ms`؟ يرجّع معرّفه أو None.
+
+    استدعاء media_publish قد ينشر الريل ثم تتأخر الاستجابة أو تضيع، فلا يصح
+    الحكم بالفشل قبل السؤال عن آخر опублиك على الحساب.
+    """
+    query = urlencode(
+        {"fields": "id,timestamp", "limit": "5", "access_token": token}
+    )
+    try:
+        response = await _fetch(
+            f"{IG_GRAPH}/{user_id}/media?{query}", timeout=GRAPH_READ_TIMEOUT_S
+        )
+    except Exception:  # noqa: BLE001 - فحص احتياطي فقط
+        return None
+    if int(response.status) != 200:
+        return None
+    data = await _ig_json(response)
+    items = data.get("data")
+    if not isinstance(items, list):
+        return None
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            published = int(
+                datetime.strptime(
+                    _clean(item.get("timestamp")), "%Y-%m-%dT%H:%M:%S%z"
+                ).timestamp()
+                * 1000
+            )
+        except Exception:  # noqa: BLE001 - نسخة بلا وقت صالح
+            continue
+        # هامش دقيقتين لتعديلات توقيت Meta.
+        if published >= since_ms - 120_000:
+            media_id = _clean(item.get("id"))
+            if media_id:
+                return media_id
+    return None
+
+
 async def _ig_create_container(user_id, token, media_url, caption):
     """ينشئ Reels media container من رابط عام؛ Meta تنزّل الفيديو بنفسها."""
     payload = {
@@ -785,6 +840,7 @@ async def _ig_create_container(user_id, token, media_url, caption):
         method="POST",
         headers={"content-type": "application/x-www-form-urlencoded"},
         body=urlencode(payload),
+        timeout=GRAPH_READ_TIMEOUT_S + 10,
     )
     data = await _ig_json(response)
     if int(response.status) != 200 or not data.get("id"):
@@ -795,7 +851,9 @@ async def _ig_create_container(user_id, token, media_url, caption):
 async def _ig_container_status(container_id, token):
     """يرجّع (status_code, status) للحاوية: IN_PROGRESS / FINISHED / ERROR…"""
     query = urlencode({"fields": "status_code,status", "access_token": token})
-    response = await _fetch(f"{IG_GRAPH}/{container_id}?{query}")
+    response = await _fetch(
+        f"{IG_GRAPH}/{container_id}?{query}", timeout=GRAPH_READ_TIMEOUT_S
+    )
     data = await _ig_json(response)
     if int(response.status) != 200:
         raise RuntimeError(_ig_message(data, int(response.status)))
@@ -811,6 +869,7 @@ async def _ig_publish(user_id, token, container_id):
         method="POST",
         headers={"content-type": "application/x-www-form-urlencoded"},
         body=urlencode({"creation_id": container_id, "access_token": token}),
+        timeout=PUBLISH_TIMEOUT_S,
     )
     data = await _ig_json(response)
     if int(response.status) != 200 or not data.get("id"):
@@ -1174,6 +1233,22 @@ class Default(WorkerEntrypoint):
                 updated = 0
             if now - updated < PUBLISH_STUCK_MS:
                 return state, None
+            # قبل الحكم بالفشل: قد يكون النشر نجح وضاعت الاستجابة.
+            published_id = await _ig_published_media(user_id, token, updated)
+            if published_id:
+                finished = int(time.time() * 1000)
+                await _firebase_patch(
+                    db,
+                    path,
+                    {
+                        "state": "published",
+                        "mediaId": published_id,
+                        "publishedAt": finished,
+                        "error": None,
+                        "updatedAt": finished,
+                    },
+                )
+                return "published", None
             error = "publishing was interrupted; check Instagram before retrying"
             await _firebase_patch(
                 db,
@@ -1272,7 +1347,7 @@ class Default(WorkerEntrypoint):
                 attempts += 1
                 payload = {
                     "attempts": attempts,
-                    "error": str(exc)[:300],
+                    "error": _describe(exc)[:300],
                     "updatedAt": now,
                 }
                 if attempts >= SCHEDULE_RETRY_LIMIT:
@@ -1296,7 +1371,25 @@ class Default(WorkerEntrypoint):
                 except Exception as exc:  # noqa: BLE001
                     # قد يكون النشر نجح والرد ضاع؛ لا نعيده تلقائياً حتى لا
                     # يتكرر الريل. بعد PUBLISH_STUCK_MS تصير الحالة failed.
-                    error = str(exc)[:300]
+                    error = _describe(exc)[:300]
+                    # نتحقق من الحساب نفسه قبل اعتبار الموعد معلقاً.
+                    published_id = await _ig_published_media(
+                        user_id, token, int(time.time() * 1000) - 180_000
+                    )
+                    if published_id:
+                        finished = int(time.time() * 1000)
+                        await _firebase_patch(
+                            db,
+                            path,
+                            {
+                                "state": "published",
+                                "mediaId": published_id,
+                                "publishedAt": finished,
+                                "error": None,
+                                "updatedAt": finished,
+                            },
+                        )
+                        return "published", None
                     await _firebase_patch(
                         db,
                         path,
