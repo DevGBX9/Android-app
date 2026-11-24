@@ -15,10 +15,11 @@ R2، ويحدّث حالة المعالجة والتقدّم في Firebase Realt
 `X-Api-Key` مطابقة.
 """
 
+import asyncio
 import json
 import re
 import time
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, urlparse
 
 from workers import Response, WorkerEntrypoint, fetch
 
@@ -361,8 +362,13 @@ async def _resolve_tiktok(link):
                 duration_s = int(data.get("duration") or 0)
             except Exception:  # noqa: BLE001
                 duration_s = 0
+            try:
+                known_size = int(data.get("size") or 0)
+            except Exception:  # noqa: BLE001
+                known_size = 0
             info = {
                 "durationMs": duration_s * 1000,
+                "bytes": known_size,
                 "thumbnail": _clean(data.get("cover")) or None,
                 "title": _clean(data.get("title"))[:200] or None,
             }
@@ -427,16 +433,35 @@ async def _media_size(media_url, headers):
     return 0
 
 
-async def _download_bytes(media_url, on_progress, headers):
+async def _fetch_media(media_url, headers, range_header=None):
+    """طلب وسائط مع إعادة محاولة قصيرة: شبكة تيك توك ترد 403/429 عند التكرار السريع."""
+    request_headers = dict(headers)
+    if range_header:
+        request_headers["range"] = range_header
+
+    status = 0
+    for attempt in range(3):
+        response = await fetch(media_url, headers=request_headers, redirect="follow")
+        status = int(response.status)
+        if status in (200, 206):
+            return response
+        if status not in (403, 429, 503):
+            break
+        await asyncio.sleep(0.5 * (attempt + 1))
+
+    raise RuntimeError(f"media HTTP {status}")
+
+
+async def _download_bytes(media_url, on_progress, headers, known_size=0):
     """ينزّل الفيديو على دفعات ليعطي تقدّماً حقيقياً بين 0 و100."""
-    size = await _media_size(media_url, headers)
+    size = int(known_size or 0)
+    if size <= 1:
+        size = await _media_size(media_url, headers)
     if size > MAX_BYTES:
         raise RuntimeError(f"reel too large ({size} bytes)")
 
     if size <= 0:
-        response = await fetch(media_url, headers=headers, redirect="follow")
-        if int(response.status) not in (200, 206):
-            raise RuntimeError(f"media HTTP {response.status}")
+        response = await _fetch_media(media_url, headers)
         data = await _read_bytes(response)
         if not data:
             raise RuntimeError("empty media")
@@ -451,14 +476,9 @@ async def _download_bytes(media_url, on_progress, headers):
 
     while offset < size:
         end = min(offset + CHUNK_BYTES, size) - 1
-        response = await fetch(
-            media_url,
-            headers={**headers, "range": f"bytes={offset}-{end}"},
-            redirect="follow",
+        response = await _fetch_media(
+            media_url, headers, f"bytes={offset}-{end}"
         )
-        status = int(response.status)
-        if status not in (200, 206):
-            raise RuntimeError(f"media HTTP {status}")
         chunk = await _read_bytes(response)
         if not chunk:
             break
@@ -514,8 +534,6 @@ class Default(WorkerEntrypoint):
         if parts[0] == "health":
             return _json({"ok": True, "time": int(time.time() * 1000)})
 
-        if parts[0] == "probe" and method == "GET":
-            return await self._probe(str(request.url))
 
         if not self._authorized(request):
             return _error("unauthorized", 401)
@@ -584,47 +602,6 @@ class Default(WorkerEntrypoint):
             await job
 
         return _json({"ok": True, "id": reel_id, "state": "queued"}, status=202)
-
-    async def _probe(self, raw_url):
-        """تشخيص مؤقت: يجيب ماذا يرى الـWorker من عنوان الوسائط."""
-        query = urlparse(raw_url).query
-        target = ""
-        for pair in query.split("&"):
-            key, _, value = pair.partition("=")
-            if key == "url":
-                target = unquote(value)
-        if not target.startswith("http"):
-            return _error("missing url")
-
-        variants = {
-            "plain": {},
-            "browser": {
-                "user-agent": BROWSER_UA,
-                "referer": "https://www.tiktok.com/",
-            },
-            "range": {"user-agent": BROWSER_UA, "range": "bytes=0-1023"},
-            "video-accept": {
-                "user-agent": BROWSER_UA,
-                "accept": "video/webm,video/ogg,video/*;q=0.9,*/*;q=0.8",
-                "accept-language": "en-US,en;q=0.9",
-            },
-        }
-
-        results = {}
-        for name, headers in variants.items():
-            try:
-                response = await fetch(target, headers=headers, redirect="follow")
-                body = await _read_bytes(response)
-                results[name] = {
-                    "status": int(response.status),
-                    "type": _clean(response.headers.get("content-type")),
-                    "bytes": len(body),
-                    "head": body[:32].decode("latin-1", "replace"),
-                }
-            except Exception as exc:  # noqa: BLE001
-                results[name] = {"error": str(exc)[:120]}
-
-        return _json({"ok": True, "target": target[:120], "results": results})
 
     async def _status(self, reel_id):
         reel_id = _safe_id(reel_id)
@@ -717,7 +694,12 @@ class Default(WorkerEntrypoint):
             async def on_progress(percent):
                 await report("downloading", percent)
 
-            data = await _download_bytes(media_url, on_progress, media_headers)
+            data = await _download_bytes(
+                media_url,
+                on_progress,
+                media_headers,
+                info.get("bytes") or 0,
+            )
 
             await report("storing", 95)
             await self.env.FILES.put(self._key(reel_id), data)
