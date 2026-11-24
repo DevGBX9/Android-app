@@ -184,6 +184,12 @@ def _tiktok_link(link):
     return link
 
 
+def _tiktok_video_id(link):
+    """رقم الفيديو من `/video/<id>` أو `/v/<id>.html`."""
+    match = TIKTOK_VIDEO_RE.search(urlparse(link or "").path or "")
+    return match.group(1) if match else None
+
+
 def _tiktok_media_urls(html):
     """يستخرج روابط الفيديو من بيانات تشغيل صفحة تيك توك."""
     found = []
@@ -332,6 +338,9 @@ async def _resolve_tiktok(link):
     except Exception as exc:  # noqa: BLE001
         attempts.append(f"page -> {str(exc)[:80]}")
 
+    video_id = _tiktok_video_id(final) or _tiktok_video_id(link)
+
+    payload = None
     for candidate in dict.fromkeys((final, link)):
         try:
             response = await fetch(
@@ -346,51 +355,63 @@ async def _resolve_tiktok(link):
             attempts.append(f"resolver -> HTTP {response.status}")
             continue
         try:
-            payload = json.loads(await response.text())
+            parsed = json.loads(await response.text())
         except Exception:  # noqa: BLE001
             attempts.append("resolver -> invalid json")
             continue
-
-        data = payload.get("data") or {}
-        candidates = []
-        for key, size_key in (("play", "size"), ("hdplay", "hd_size"), ("wmplay", "")):
-            media_url = _clean(data.get(key))
-            if not media_url:
-                continue
-            if media_url.startswith("/"):
-                media_url = TIKTOK_RESOLVER_ORIGIN + media_url
-            if not media_url.startswith("http"):
-                continue
-            try:
-                known_size = int(data.get(size_key) or 0) if size_key else 0
-            except Exception:  # noqa: BLE001
-                known_size = 0
-            candidates.append({"url": media_url, "bytes": known_size})
-
-        if candidates:
-            try:
-                duration_s = int(data.get("duration") or 0)
-            except Exception:  # noqa: BLE001
-                duration_s = 0
-            info = {
-                "durationMs": duration_s * 1000,
-                "thumbnail": _clean(data.get("cover")) or None,
-                "title": _clean(data.get("title"))[:200] or None,
-            }
-            return candidates, info, attempts
-
+        if parsed.get("data"):
+            payload = parsed
+            break
         attempts.append(
             "resolver -> code %s %s"
-            % (payload.get("code"), str(payload.get("msg"))[:60])
+            % (parsed.get("code"), str(parsed.get("msg"))[:60])
         )
+
+    data = (payload or {}).get("data") or {}
+    candidates = []
+    for key, size_key in (("play", "size"), ("hdplay", "hd_size"), ("wmplay", "")):
+        media_url = _clean(data.get(key))
+        if not media_url:
+            continue
+        if media_url.startswith("/"):
+            media_url = TIKTOK_RESOLVER_ORIGIN + media_url
+        if not media_url.startswith("http"):
+            continue
+        try:
+            known_size = int(data.get(size_key) or 0) if size_key else 0
+        except Exception:  # noqa: BLE001
+            known_size = 0
+        candidates.append({"url": media_url, "bytes": known_size})
+
+    info = {}
+    if data:
+        try:
+            duration_s = int(data.get("duration") or 0)
+        except Exception:  # noqa: BLE001
+            duration_s = 0
+        info = {
+            "durationMs": duration_s * 1000,
+            "thumbnail": _clean(data.get("cover")) or None,
+            "title": _clean(data.get("title"))[:200] or None,
+        }
+
+    # مسار الوسائط المباشر: لا يحتاج تسجيلاً ولا حصة API، ويعيد تحويلاً إلى CDN.
+    if video_id:
+        for kind in ("play", "wmplay"):
+            candidates.append(
+                {
+                    "url": f"{TIKTOK_RESOLVER_ORIGIN}/video/media/{kind}/{video_id}.mp4",
+                    "bytes": 0,
+                }
+            )
 
     if html:
         found = _tiktok_media_urls(html)
-        if found:
-            return [{"url": url, "bytes": 0} for url in found], {}, attempts
-        attempts.append(f"page -> {len(html)} bytes, no media url")
+        candidates.extend({"url": url, "bytes": 0} for url in found)
+        if not found:
+            attempts.append(f"page -> {len(html)} bytes, no media url")
 
-    return [], {}, attempts
+    return candidates, info, attempts
 
 
 def _size_of(headers_obj):
