@@ -18,6 +18,8 @@ private val SAVED_ITEMS_KEY = stringPreferencesKey("saved_items_json")
 private const val MAX_SAVED_ITEMS = 300
 private const val MAX_THUMBNAIL_LOOKUPS = 30
 private const val ARCHIVE_TIMEOUT_MS = 210_000L
+private const val REQUEST_RETRY_MS = 12_000L
+private const val MAX_ARCHIVE_FAILURES = 3
 
 /**
  * مصدر الحقيقة المحلي للريلز (DataStore) مع نسخة على Firebase:
@@ -119,7 +121,7 @@ class SavedRepository(
         item: SavedItem,
         onProgress: (Int) -> Unit,
     ): Result<SavedItem> {
-        var current = item
+        val current = item
         if (current.archiveState == "ready" && !current.downloadUrl.isNullOrBlank()) {
             return Result.success(current)
         }
@@ -127,36 +129,51 @@ class SavedRepository(
             return Result.failure(IOException("the archive service is not configured"))
         }
 
-        if (current.archiveState == null || current.archiveState == "failed") {
-            archive.request(current)
-        }
-
         val deadline = System.currentTimeMillis() + ARCHIVE_TIMEOUT_MS
+        var lastRequestAt = 0L
+        var lastError: String? = null
+        var failures = 0
+
         while (System.currentTimeMillis() < deadline) {
+            // نطلب الأرشفة أول مرة ثم نعيد الطلب دورياً: طلب واحد قد يضيع
+            // (التطبيق يُغلق بعد المشاركة) أو تُلغى مهمته على الخادم.
+            val now = System.currentTimeMillis()
+            if (now - lastRequestAt >= REQUEST_RETRY_MS) {
+                lastRequestAt = now
+                archive.request(current)?.let { lastError = it }
+            }
+
             delay(1200)
             val status = remote.fetchArchive(current.id) ?: continue
             onProgress(status.progress.coerceIn(0, 100) * 85 / 100)
 
             when (status.state) {
                 "ready" -> {
-                    current = current.copy(
+                    val archived = current.copy(
                         archiveState = "ready",
                         archiveProgress = 100,
                         downloadUrl = status.url?.takeIf { it.isNotBlank() },
                     )
-                    updateArchive(current)
-                    return Result.success(current)
+                    updateArchive(archived)
+                    return Result.success(archived)
                 }
 
                 "failed" -> {
-                    return Result.failure(
-                        IOException(status.error ?: "the server could not archive this reel"),
-                    )
+                    lastError = status.error ?: lastError
+                        ?: "the server could not archive this reel"
+                    failures += 1
+                    if (failures >= MAX_ARCHIVE_FAILURES) {
+                        return Result.failure(IOException(lastError))
+                    }
+                    // نعيد الطلب فوراً في الدورة التالية.
+                    lastRequestAt = 0L
                 }
             }
         }
 
-        return Result.failure(IOException("the server is still processing this reel"))
+        return Result.failure(
+            IOException(lastError ?: "the server is still processing this reel"),
+        )
     }
 
     /**

@@ -35,6 +35,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -100,6 +101,14 @@ fun ReelsRoute(container: AppContainer) {
     val images = remember { container.reelImages }
     val context = LocalContext.current
     var expandedId by remember { mutableStateOf<String?>(null) }
+
+    // سبب فشل التحميل يظهر كرسالة بدل البقاء على 0% أو علامة تعجّب صامتة.
+    LaunchedEffect(downloads) {
+        val failure = downloads.entries.firstOrNull { it.value.error != null }
+            ?: return@LaunchedEffect
+        toast(context, failure.value.error ?: "the download failed")
+        viewModel.dismissDownload(failure.key)
+    }
 
     Column(
         Modifier

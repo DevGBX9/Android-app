@@ -32,6 +32,13 @@ MAX_BYTES = 48 * 1024 * 1024
 CHUNK_BYTES = 2 * 1024 * 1024
 PROGRESS_STEP = 4
 
+# طلبات Cloudflare بلا مهلة افتراضية، ومهام `waitUntil` تُلغى بعد ~30 ثانية من
+# انتهاء الاستجابة، فنجعل كل طلب محدوداً والمهمة كلها أقصر من ذلك: بدل أن
+# تُلغى المهمة بلا أثر، نفشل بخطأ واضح يقدر التطبيق يعيد المحاولة بعده.
+FETCH_TIMEOUT_S = 8
+ARCHIVE_BUDGET_S = 24
+STALE_JOB_MS = 75_000
+
 INSTAGRAM_HOSTS = (
     "instagram.com",
     "www.instagram.com",
@@ -148,6 +155,11 @@ def _origin_of(raw_url):
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+async def _fetch(url, **options):
+    """طلب شبكة بمهلة قصوى، لأن fetch في الـWorker بلا مهلة افتراضية."""
+    return await asyncio.wait_for(fetch(url, **options), FETCH_TIMEOUT_S)
+
+
 async def _read_bytes(response):
     """يقرأ جسم الاستجابة كبايتات بايثون (Pyodide يعطي ArrayBuffer/JsProxy)."""
     for reader in ("bytes", "arrayBuffer"):
@@ -243,7 +255,7 @@ def _safe_id(value):
 
 async def _firebase_put(base, path, payload):
     body = json.dumps(payload, ensure_ascii=False)
-    response = await fetch(
+    response = await _fetch(
         f"{base.rstrip('/')}/{path.lstrip('/')}",
         method="PUT",
         headers={"content-type": "application/json; charset=utf-8"},
@@ -253,7 +265,7 @@ async def _firebase_put(base, path, payload):
 
 
 async def _firebase_get(base, path):
-    response = await fetch(
+    response = await _fetch(
         f"{base.rstrip('/')}/{path.lstrip('/')}",
         headers={"accept": "application/json"},
     )
@@ -290,7 +302,7 @@ async def _resolve_media_url(code):
 
     for page in pages:
         try:
-            response = await fetch(page, headers=headers, redirect="follow")
+            response = await _fetch(page, headers=headers, redirect="follow")
         except Exception as exc:  # noqa: BLE001
             attempts.append(f"embed -> {str(exc)[:80]}")
             continue
@@ -329,7 +341,7 @@ async def _resolve_tiktok(link):
     }
 
     try:
-        response = await fetch(link, headers=page_headers, redirect="follow")
+        response = await _fetch(link, headers=page_headers, redirect="follow")
         final = _clean(_field(response, "url"), link) or link
         if int(response.status) == 200:
             html = await response.text()
@@ -343,7 +355,7 @@ async def _resolve_tiktok(link):
     payload = None
     for candidate in dict.fromkeys((final, link)):
         try:
-            response = await fetch(
+            response = await _fetch(
                 TIKTOK_RESOLVER + quote(candidate, safe=""),
                 headers={"accept": "application/json", "user-agent": BROWSER_UA},
                 redirect="follow",
@@ -432,7 +444,7 @@ def _size_of(headers_obj):
 async def _media_size(media_url, headers):
     """حجم الفيديو: HEAD أولاً، ثم طلب بايت واحد (بعض السيرفرات ترفض HEAD)."""
     try:
-        response = await fetch(
+        response = await _fetch(
             media_url,
             method="HEAD",
             headers=headers,
@@ -446,7 +458,7 @@ async def _media_size(media_url, headers):
         pass
 
     try:
-        response = await fetch(
+        response = await _fetch(
             media_url,
             headers={**headers, "range": "bytes=0-0"},
             redirect="follow",
@@ -467,7 +479,7 @@ async def _fetch_media(media_url, headers, range_header=None):
 
     status = 0
     for attempt in range(3):
-        response = await fetch(media_url, headers=request_headers, redirect="follow")
+        response = await _fetch(media_url, headers=request_headers, redirect="follow")
         status = int(response.status)
         if status in (200, 206):
             return response
@@ -613,11 +625,20 @@ class Default(WorkerEntrypoint):
         db = self._db()
         now = int(time.time() * 1000)
 
-        await _firebase_put(
-            db,
-            f"reels/{reel_id}/archive.json",
-            {"state": "queued", "progress": 0, "updatedAt": now},
-        )
+        try:
+            await _firebase_put(
+                db,
+                f"reels/{reel_id}/archive.json",
+                {"state": "queued", "progress": 0, "updatedAt": now},
+            )
+        except Exception as exc:  # noqa: BLE001 - نبلّغ التطبيق بدل 500 غامض
+            return _json(
+                {
+                    "ok": False,
+                    "error": "could not queue the archive: %s" % str(exc)[:160],
+                },
+                status=503,
+            )
 
         job = self._archive(
             reel_id=reel_id,
@@ -641,6 +662,23 @@ class Default(WorkerEntrypoint):
 
         archive = await _firebase_get(self._db(), f"reels/{reel_id}/archive.json")
         if archive:
+            # مهمة الخلفية قد تُلغى من المنصّة بلا أثر؛ نعتبر الحالة القديمة فاشلة
+            # حتى يقدر التطبيق يطلب الأرشفة من جديد بدل الانتظار بلا نهاية.
+            state = _clean(archive.get("state"))
+            updated = int(archive.get("updatedAt") or 0)
+            age = int(time.time() * 1000) - updated
+            if state in ("queued", "downloading", "storing") and age > STALE_JOB_MS:
+                return _json(
+                    {
+                        "ok": True,
+                        "id": reel_id,
+                        "archive": {
+                            "state": "failed",
+                            "progress": int(archive.get("progress") or 0),
+                            "error": "the server stopped before finishing, try again",
+                        },
+                    }
+                )
             return _json({"ok": True, "id": reel_id, "archive": archive})
 
         existing = await self.env.FILES.head(self._key(reel_id))
@@ -683,6 +721,10 @@ class Default(WorkerEntrypoint):
         db = self._db()
         state_path = f"reels/{reel_id}/archive.json"
         started = int(time.time() * 1000)
+        deadline = time.monotonic() + ARCHIVE_BUDGET_S
+
+        def remaining():
+            return deadline - time.monotonic()
 
         async def report(state, progress, **extra):
             payload = {
@@ -700,11 +742,22 @@ class Default(WorkerEntrypoint):
             await report("downloading", 3)
 
             info = {}
-            if source == "tiktok":
-                candidates, info, attempts = await _resolve_tiktok(tiktok)
-            else:
-                media_url, attempts = await _resolve_media_url(code)
-                candidates = [{"url": media_url, "bytes": 0}] if media_url else []
+            attempts = []
+            resolve_budget = max(4.0, remaining() - 12)
+            try:
+                if source == "tiktok":
+                    candidates, info, attempts = await asyncio.wait_for(
+                        _resolve_tiktok(tiktok), resolve_budget
+                    )
+                else:
+                    media_url, attempts = await asyncio.wait_for(
+                        _resolve_media_url(code), resolve_budget
+                    )
+                    candidates = [{"url": media_url, "bytes": 0}] if media_url else []
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"{source} page did not answer in time ({resolve_budget:.0f}s)"
+                )
             if not candidates:
                 raise RuntimeError(
                     f"could not resolve the {source} video url: " + " | ".join(attempts)
@@ -728,25 +781,32 @@ class Default(WorkerEntrypoint):
             last_error = "no media url"
             hosts = []
             for candidate in candidates:
+                if remaining() <= 6:
+                    last_error = last_error or "the download budget ran out"
+                    break
                 hosts.append((urlparse(candidate["url"]).hostname or "?")[:60])
                 try:
                     try:
-                        data = await _download_bytes(
-                            candidate["url"],
-                            on_progress,
-                            media_headers,
-                            candidate["bytes"],
+                        data = await asyncio.wait_for(
+                            _download_bytes(
+                                candidate["url"],
+                                on_progress,
+                                media_headers,
+                                candidate["bytes"],
+                            ),
+                            max(6.0, remaining()),
                         )
                     except RuntimeError as exc:
                         if "media HTTP" not in str(exc):
                             raise
                         # احتياطي: طلب كامل واحد بدل النطاقات.
-                        data = await _fetch_whole(
-                            candidate["url"], on_progress, media_headers
+                        data = await asyncio.wait_for(
+                            _fetch_whole(candidate["url"], on_progress, media_headers),
+                            max(6.0, remaining()),
                         )
                     break
                 except Exception as exc:  # noqa: BLE001 - نجرّب الرابط التالي
-                    last_error = str(exc)[:120]
+                    last_error = str(exc)[:120] or exc.__class__.__name__
                     data = None
 
             if not data:

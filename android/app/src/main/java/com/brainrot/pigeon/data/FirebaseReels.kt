@@ -2,6 +2,8 @@ package com.brainrot.pigeon.data
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -95,6 +97,7 @@ class FirebaseReels(
     }
 }
 
+@OptIn(ExperimentalSerializationApi::class)
 @Serializable
 private data class RemoteReel(
     val platform: String = "instagram",
@@ -104,6 +107,9 @@ private data class RemoteReel(
     val thumbnail: String? = null,
     val registered: Boolean = true,
     val source: String = "android",
+    // لا يُرسل أبداً: PATCH بقيمة null في Firebase يمسح حالة الأرشيف التي يكتبها
+    // الـWorker، وهذا يجعل شريط التقدّم يعود إلى 0% ولا يصل "ready" أبداً.
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
     val archive: ArchiveStatus? = null,
     val createdAt: Long = 0L,
 ) {

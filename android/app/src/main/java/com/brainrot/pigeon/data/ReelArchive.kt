@@ -10,6 +10,7 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -20,6 +21,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 
 private val ARCHIVE_MEDIA = "application/json; charset=utf-8".toMediaType()
+
+// إعادة محاولة قصيرة عند أخطاء الشبكة أو 5xx (الـWorker قد يكون يعيد النشر).
+private const val REQUEST_ATTEMPTS = 3
 
 /** حالة معالجة الريل على الـWorker (نفس الشكل المكتوب في Firebase). */
 @Serializable
@@ -66,25 +70,45 @@ class ReelArchive(
 
     val configured: Boolean get() = base.isNotBlank()
 
-    /** يطلب من الخادم تنزيل الريل وتخزينه. يعيد true إذا قُبل الطلب (202). */
-    suspend fun request(item: SavedItem): Boolean = withContext(Dispatchers.IO) {
-        val link = item.url?.takeIf { it.isNotBlank() } ?: return@withContext false
-        if (!configured) return@withContext false
+    /**
+     * يطلب من الخادم تنزيل الريل وتخزينه. يعيد `null` إذا قُبل الطلب،
+     * أو رسالة الخطأ القادمة من الشبكة/الخادم حتى تظهر للمستخدم.
+     */
+    suspend fun request(item: SavedItem): String? = withContext(Dispatchers.IO) {
+        val link = item.url?.takeIf { it.isNotBlank() } ?: return@withContext "the reel has no link"
+        if (!configured) return@withContext "the archive service is not configured"
 
         val body = json
             .encodeToString(ArchiveRequest(id = item.id, url = link, thumbnail = item.thumbnail))
             .toRequestBody(ARCHIVE_MEDIA)
+        val request = Request.Builder()
+            .url("$base/reels")
+            .header("Accept", "application/json")
+            .apply { if (token.isNotBlank()) header("X-Api-Key", token) }
+            .post(body)
+            .build()
 
-        runCatching {
-            http.newCall(
-                Request.Builder()
-                    .url("$base/reels")
-                    .header("Accept", "application/json")
-                    .apply { if (token.isNotBlank()) header("X-Api-Key", token) }
-                    .post(body)
-                    .build(),
-            ).execute().use { response -> response.isSuccessful }
-        }.getOrDefault(false)
+        var lastError = "the archive request failed"
+        for (attempt in 0 until REQUEST_ATTEMPTS) {
+            if (attempt > 0) delay(1_500L * attempt)
+
+            runCatching {
+                http.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) return@withContext null
+                    val detail = runCatching { response.body?.string().orEmpty() }
+                        .getOrDefault("")
+                        .take(160)
+                    "server HTTP ${response.code}" + if (detail.isBlank()) "" else ": $detail"
+                }
+            }.onSuccess { message ->
+                lastError = message
+                // 4xx يعني أن الطلب نفسه مرفوض: لا فائدة من التكرار.
+                if (!message.startsWith("server HTTP 5")) return@withContext message
+            }.onFailure { error ->
+                lastError = error.message?.let { "network: $it" } ?: "network error"
+            }
+        }
+        lastError
     }
 
     /**
