@@ -90,7 +90,7 @@ class SavedRepository(
                 it.url != null &&
                     it.registered &&
                     it.archiveState == null &&
-                    isInstagram(it.url)
+                    isArchivable(it.url)
             }
 
             // لا نكتب إذا ما تغيّر شيء، حتى لا تُعاد الواجهة كل ثانية.
@@ -186,8 +186,8 @@ class SavedRepository(
         if (!remote.upload(item.copy(thumbnail = thumb))) return
         markRegistered(item.id)
 
-        // الأرشفة في Cloudflare: ريلز إنستغرام فقط حالياً.
-        if (isInstagram(link)) archive.request(item.copy(thumbnail = thumb))
+        // الأرشفة في Cloudflare: ريلز إنستغرام وفيديوهات تيك توك.
+        if (isArchivable(link)) archive.request(item.copy(thumbnail = thumb))
     }
 
     private suspend fun markRegistered(id: String) {
@@ -231,6 +231,8 @@ class SavedRepository(
             .getOrDefault(emptyList())
     }
 
-    private fun isInstagram(link: String?): Boolean =
-        link != null && link.contains("instagram.com")
+    /** الأرشفة تعمل لروابط إنستغرام وتيك توك (نفس معرّفات الـWorker). */
+    private fun isArchivable(link: String?): Boolean =
+        link != null &&
+            (link.contains("instagram.com") || link.contains("tiktok.com"))
 }

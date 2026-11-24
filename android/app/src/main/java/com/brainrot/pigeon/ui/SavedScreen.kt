@@ -348,7 +348,7 @@ private fun ReelCell(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(7.dp),
                 ) {
-                    if (isInstagram(item)) {
+                    if (isArchivable(item)) {
                         Row(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(50))
@@ -528,8 +528,10 @@ private fun reelLabel(item: SavedItem): String {
     return code ?: item.title?.takeIf { it.isNotBlank() } ?: item.platform
 }
 
-private fun isInstagram(item: SavedItem): Boolean =
-    item.url?.contains("instagram.com") == true || item.platform == "instagram"
+private fun isArchivable(item: SavedItem): Boolean =
+    item.url?.let { it.contains("instagram.com") || it.contains("tiktok.com") } == true ||
+        item.platform == "instagram" ||
+        item.platform == "tiktok"
 
 private fun openReel(context: Context, item: SavedItem) {
     val url = item.url ?: item.remoteUrl

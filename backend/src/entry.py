@@ -1,8 +1,8 @@
 """Pigeon Reels API — Cloudflare Python Worker.
 
-المهمة: يستقبل رابط ريل إنستغرام، ينزّل الفيديو، يخزنه في R2، ويحدّث حالة
-المعالجة والتقدّم في Firebase Realtime Database تحت `/reels/<id>/archive`،
-ثم يقدّم الملف للتحميل من `GET /download/<id>`.
+المهمة: يستقبل رابط ريل إنستغرام أو فيديو تيك توك، ينزّل الفيديو، يخزنه في
+R2، ويحدّث حالة المعالجة والتقدّم في Firebase Realtime Database تحت
+`/reels/<id>/archive`، ثم يقدّم الملف للتحميل من `GET /download/<id>`.
 
 المسارات:
     GET  /                     معلومات الخدمة
@@ -18,7 +18,7 @@
 import json
 import re
 import time
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from workers import Response, WorkerEntrypoint, fetch
 
@@ -51,6 +51,29 @@ SHORTCODE_RE = re.compile(r"/(?:reel|reels|p|tv)/([A-Za-z0-9_-]{5,40})")
 CRAWLER_UA = (
     "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
 )
+
+TIKTOK_HOSTS = (
+    "tiktok.com",
+    "www.tiktok.com",
+    "m.tiktok.com",
+    "vt.tiktok.com",
+    "vm.tiktok.com",
+)
+
+# تيك توك يحجب أي طلب ليس من متصفح حقيقي، وما يعطيه للزوار هو بيانات التشغيل
+# داخل الصفحة (`playAddr`/`downloadAddr`).
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+TIKTOK_VIDEO_RE = re.compile(r"/(?:video|v)/(\d{6,30})")
+TIKTOK_MEDIA_RE = re.compile(r'"(?:playAddr|downloadAddr)":"(https:[^"]+)"')
+
+# مسار عام بدون تسجيل دخول يعطي رابط CDN لا يحتاج كوكيز (روابط playAddr
+# الموقّعة ترفض بـ403 من غير `tt_chain_token`).
+TIKTOK_RESOLVER = "https://www.tikwm.com/api/?url="
+TIKTOK_RESOLVER_ORIGIN = "https://www.tikwm.com"
 
 OG_VIDEO_RE = re.compile(
     r'<meta[^>]+(?:property|name)="og:video(?::\w+)?"[^>]+content="([^"]+)"'
@@ -149,6 +172,25 @@ def _instagram_code(link):
 def _is_media_host(host):
     host = (host or "").lower()
     return any(host.endswith(suffix) for suffix in MEDIA_HOST_SUFFIXES)
+
+
+def _tiktok_link(link):
+    """يرجّع الرابط إذا كان تيك توك (فيديو كامل أو رابط مختصر) وإلا None."""
+    parsed = urlparse(link)
+    host = (parsed.hostname or "").lower()
+    if host not in TIKTOK_HOSTS:
+        return None
+    return link
+
+
+def _tiktok_media_urls(html):
+    """يستخرج روابط الفيديو من بيانات تشغيل صفحة تيك توك."""
+    found = []
+    for match in TIKTOK_MEDIA_RE.finditer(html or ""):
+        link = _unescape_media(match.group(1))
+        if link.startswith("http"):
+            found.append(link)
+    return found
 
 
 def _unescape_media(link):
@@ -262,29 +304,134 @@ async def _resolve_media_url(code):
     return None, attempts
 
 
-async def _media_size(media_url):
-    response = await fetch(
-        media_url,
-        method="HEAD",
-        headers={"user-agent": CRAWLER_UA, "referer": "https://www.instagram.com/"},
-        redirect="follow",
-    )
+async def _resolve_tiktok(link):
+    """يجيب رابط فيديو تيك توك قابل للتنزيل مع غلافه ومدّته.
+
+    يرجّع `(url, info, attempts)`. الترتيب: تتبّع الرابط المختصر ثم المستخرج
+    العام (بدون كوكيز)، وإن فشل نقرأ بيانات التشغيل من صفحة الفيديو نفسها.
+    """
+    attempts = []
+    html = None
+    final = link
+    page_headers = {
+        "user-agent": BROWSER_UA,
+        "accept": "text/html,application/xhtml+xml",
+        "accept-language": "en-US,en;q=0.9",
+    }
+
     try:
-        return int(_clean(response.headers.get("content-length"), "0"))
-    except Exception:
+        response = await fetch(link, headers=page_headers, redirect="follow")
+        final = _clean(_field(response, "url"), link) or link
+        if int(response.status) == 200:
+            html = await response.text()
+        else:
+            attempts.append(f"page -> HTTP {response.status}")
+    except Exception as exc:  # noqa: BLE001
+        attempts.append(f"page -> {str(exc)[:80]}")
+
+    for candidate in dict.fromkeys((final, link)):
+        try:
+            response = await fetch(
+                TIKTOK_RESOLVER + quote(candidate, safe=""),
+                headers={"accept": "application/json", "user-agent": BROWSER_UA},
+                redirect="follow",
+            )
+        except Exception as exc:  # noqa: BLE001
+            attempts.append(f"resolver -> {str(exc)[:80]}")
+            continue
+        if int(response.status) != 200:
+            attempts.append(f"resolver -> HTTP {response.status}")
+            continue
+        try:
+            payload = json.loads(await response.text())
+        except Exception:  # noqa: BLE001
+            attempts.append("resolver -> invalid json")
+            continue
+
+        data = payload.get("data") or {}
+        for key in ("hdplay", "play", "wmplay"):
+            media_url = _clean(data.get(key))
+            if not media_url:
+                continue
+            if media_url.startswith("/"):
+                media_url = TIKTOK_RESOLVER_ORIGIN + media_url
+            if not media_url.startswith("http"):
+                continue
+            try:
+                duration_s = int(data.get("duration") or 0)
+            except Exception:  # noqa: BLE001
+                duration_s = 0
+            info = {
+                "durationMs": duration_s * 1000,
+                "thumbnail": _clean(data.get("cover")) or None,
+                "title": _clean(data.get("title"))[:200] or None,
+            }
+            return media_url, info, attempts
+
+        attempts.append(
+            "resolver -> code %s %s"
+            % (payload.get("code"), str(payload.get("msg"))[:60])
+        )
+
+    if html:
+        found = _tiktok_media_urls(html)
+        if found:
+            return found[0], {}, attempts
+        attempts.append(f"page -> {len(html)} bytes, no media url")
+
+    return None, {}, attempts
+
+
+def _size_of(headers_obj):
+    """يقرأ الحجم من `content-length` أو من `content-range` (bytes 0-0/TOTAL)."""
+    try:
+        size = int(_clean(headers_obj.get("content-length"), "0"))
+    except Exception:  # noqa: BLE001
+        size = 0
+    if size > 1:
+        return size
+    try:
+        total = _clean(headers_obj.get("content-range")).rsplit("/", 1)[-1]
+        return int(total)
+    except Exception:  # noqa: BLE001
         return 0
 
 
-async def _download_bytes(media_url, on_progress):
+async def _media_size(media_url, headers):
+    """حجم الفيديو: HEAD أولاً، ثم طلب بايت واحد (بعض السيرفرات ترفض HEAD)."""
+    try:
+        response = await fetch(
+            media_url,
+            method="HEAD",
+            headers=headers,
+            redirect="follow",
+        )
+        if int(response.status) == 200:
+            size = _size_of(response.headers)
+            if size > 0:
+                return size
+    except Exception:  # noqa: BLE001 - نجرّب طلب النطاق
+        pass
+
+    try:
+        response = await fetch(
+            media_url,
+            headers={**headers, "range": "bytes=0-0"},
+            redirect="follow",
+        )
+        if int(response.status) in (200, 206):
+            return _size_of(response.headers)
+    except Exception:  # noqa: BLE001
+        return 0
+
+    return 0
+
+
+async def _download_bytes(media_url, on_progress, headers):
     """ينزّل الفيديو على دفعات ليعطي تقدّماً حقيقياً بين 0 و100."""
-    size = await _media_size(media_url)
+    size = await _media_size(media_url, headers)
     if size > MAX_BYTES:
         raise RuntimeError(f"reel too large ({size} bytes)")
-
-    headers = {
-        "user-agent": CRAWLER_UA,
-        "referer": "https://www.instagram.com/",
-    }
 
     if size <= 0:
         response = await fetch(media_url, headers=headers, redirect="follow")
@@ -358,8 +505,9 @@ class Default(WorkerEntrypoint):
                 {
                     "ok": True,
                     "service": "pigeon-reels",
-                    "version": 1,
+                    "version": 2,
                     "routes": ["POST /reels", "GET /reels/<id>", "GET /download/<id>"],
+                    "sources": ["instagram", "tiktok"],
                 }
             )
 
@@ -404,8 +552,10 @@ class Default(WorkerEntrypoint):
             return _error("missing id")
 
         code = _instagram_code(link)
-        if not code:
-            return _error("only instagram reel links are supported")
+        tiktok = None if code else _tiktok_link(link)
+        if not code and not tiktok:
+            return _error("only instagram reel and tiktok video links are supported")
+        source = "instagram" if code else "tiktok"
 
         origin = _origin_of(str(request.url))
         db = self._db()
@@ -418,7 +568,12 @@ class Default(WorkerEntrypoint):
         )
 
         job = self._archive(
-            reel_id=reel_id, code=code, origin=origin, thumbnail=thumbnail
+            reel_id=reel_id,
+            code=code,
+            tiktok=tiktok,
+            source=source,
+            origin=origin,
+            thumbnail=thumbnail,
         )
         try:
             self.ctx.waitUntil(job)
@@ -472,7 +627,7 @@ class Default(WorkerEntrypoint):
     def _key(self, reel_id):
         return f"reels/{reel_id}.mp4"
 
-    async def _archive(self, reel_id, code, origin, thumbnail):
+    async def _archive(self, reel_id, code, tiktok, source, origin, thumbnail):
         db = self._db()
         state_path = f"reels/{reel_id}/archive.json"
         started = int(time.time() * 1000)
@@ -492,18 +647,33 @@ class Default(WorkerEntrypoint):
         try:
             await report("downloading", 3)
 
-            media_url, attempts = await _resolve_media_url(code)
+            info = {}
+            if source == "tiktok":
+                media_url, info, attempts = await _resolve_tiktok(tiktok)
+            else:
+                media_url, attempts = await _resolve_media_url(code)
             if not media_url:
                 raise RuntimeError(
-                    "could not resolve the reel video url: " + " | ".join(attempts)
+                    f"could not resolve the {source} video url: " + " | ".join(attempts)
                 )
 
             await report("downloading", 6)
 
+            if source == "tiktok":
+                media_headers = {
+                    "user-agent": BROWSER_UA,
+                    "referer": "https://www.tiktok.com/",
+                }
+            else:
+                media_headers = {
+                    "user-agent": CRAWLER_UA,
+                    "referer": "https://www.instagram.com/",
+                }
+
             async def on_progress(percent):
                 await report("downloading", percent)
 
-            data = await _download_bytes(media_url, on_progress)
+            data = await _download_bytes(media_url, on_progress, media_headers)
 
             await report("storing", 95)
             await self.env.FILES.put(self._key(reel_id), data)
@@ -514,8 +684,10 @@ class Default(WorkerEntrypoint):
                 100,
                 url=download_url,
                 bytes=len(data),
-                source="instagram",
-                thumbnail=thumbnail or None,
+                source=source,
+                title=info.get("title") or None,
+                thumbnail=thumbnail or info.get("thumbnail") or None,
+                videoDurationMs=info.get("durationMs") or None,
                 durationMs=int(time.time() * 1000) - started,
             )
         except Exception as exc:  # noqa: BLE001
