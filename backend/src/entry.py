@@ -19,7 +19,7 @@ import asyncio
 import json
 import re
 import time
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from workers import Response, WorkerEntrypoint, fetch
 
@@ -577,6 +577,9 @@ class Default(WorkerEntrypoint):
         if parts[0] == "health":
             return _json({"ok": True, "time": int(time.time() * 1000)})
 
+        if parts[0] == "probe":
+            return await self._probe(request)
+
 
         if not self._authorized(request):
             return _error("unauthorized", 401)
@@ -602,6 +605,59 @@ class Default(WorkerEntrypoint):
             )
 
         return _error("not found", 404)
+
+    async def _probe(self, request):
+        """تشخيص مؤقت: يجرّب مستخرجات تيك توك من داخل الشبكة ويصف ردودها."""
+        query = urlparse(str(request.url)).query
+        params = dict(part.split("=", 1) for part in query.split("&") if "=" in part)
+        link = unquote(params.get("url", ""))
+        video_id = _clean(params.get("id")) or _tiktok_video_id(link) or ""
+        encoded = quote(link, safe="")
+
+        targets = [
+            ("tikwm-www", TIKTOK_RESOLVER + encoded),
+            ("tikwm-bare", "https://tikwm.com/api/?url=" + encoded),
+            ("tiklydown", "https://api.tiklydown.eu.org/api/download?url=" + encoded),
+            ("tikmate", "https://api.tikmate.app/api/lookup?url=" + encoded),
+            (
+                "douyinwtf",
+                "https://api.douyin.wtf/api/hybrid/video_data?url="
+                + encoded
+                + "&minimal=true",
+            ),
+            ("oembed", "https://www.tiktok.com/oembed?url=" + encoded),
+            (
+                "media-play",
+                f"{TIKTOK_RESOLVER_ORIGIN}/video/media/play/{video_id}.mp4",
+            ),
+            ("page", link),
+        ]
+
+        results = []
+        for label, target in targets:
+            if not target:
+                continue
+            try:
+                response = await _fetch(
+                    target,
+                    headers={"user-agent": BROWSER_UA, "accept": "*/*"},
+                    redirect="follow",
+                )
+                status = int(response.status)
+                head = ""
+                try:
+                    head = (await response.text())[:300]
+                except Exception:  # noqa: BLE001 - جسم ثنائي
+                    head = "<binary>"
+                results.append(
+                    {"label": label, "status": status, "head": head.replace("\n", " ")}
+                )
+            except Exception as exc:  # noqa: BLE001
+                results.append(
+                    {"label": label, "error": f"{exc.__class__.__name__}: {str(exc)[:80]}"}
+                )
+
+        return _json({"id": video_id, "results": results})
 
     async def _start(self, request):
         try:
