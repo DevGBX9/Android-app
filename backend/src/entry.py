@@ -939,6 +939,14 @@ class Default(WorkerEntrypoint):
         status = int(response.status)
         content_type = _clean(response.headers.get("content-type"))[:60]
         size = _size_of(response.headers)
+        chars = 700
+        try:
+            chars = min(int(_clean((query.get("chars") or ["0"])[0], "0") or 0), 200000)
+        except Exception:  # noqa: BLE001
+            chars = 700
+        if chars <= 0:
+            chars = 700
+
         text = ""
         if "json" in content_type or "text" in content_type or size < 4000:
             try:
@@ -980,7 +988,7 @@ class Default(WorkerEntrypoint):
                 "size": size,
                 "cookies": sorted(_tiktok_cookies(response.headers).keys()),
                 "urls": urls,
-                "body": text[:700],
+                "body": text[:chars],
             }
         )
 
