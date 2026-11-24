@@ -231,8 +231,17 @@ class SavedRepository(
             .getOrDefault(emptyList())
     }
 
-    /** الأرشفة تعمل لروابط إنستغرام وتيك توك (نفس معرّفات الـWorker). */
-    private fun isArchivable(link: String?): Boolean =
-        link != null &&
-            (link.contains("instagram.com") || link.contains("tiktok.com"))
+    /**
+     * الأرشفة تعمل لريلز إنستغرام وفيديوهات تيك توك فقط (لا بروفايلات تيك توك)،
+     * بنفس معرّفات الـWorker.
+     */
+    private fun isArchivable(link: String?): Boolean {
+        if (link == null) return false
+        if (link.contains("instagram.com")) return true
+        if (!link.contains("tiktok.com")) return false
+        return link.contains("/video/") ||
+            link.contains("vm.tiktok.com") ||
+            link.contains("vt.tiktok.com") ||
+            link.contains("/t/")
+    }
 }

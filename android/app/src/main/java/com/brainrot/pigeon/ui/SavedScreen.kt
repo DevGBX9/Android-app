@@ -528,10 +528,19 @@ private fun reelLabel(item: SavedItem): String {
     return code ?: item.title?.takeIf { it.isNotBlank() } ?: item.platform
 }
 
-private fun isArchivable(item: SavedItem): Boolean =
-    item.url?.let { it.contains("instagram.com") || it.contains("tiktok.com") } == true ||
-        item.platform == "instagram" ||
-        item.platform == "tiktok"
+private fun isArchivable(item: SavedItem): Boolean {
+    val link = item.url
+    if (link != null) {
+        if (link.contains("instagram.com")) return true
+        if (link.contains("tiktok.com")) {
+            return link.contains("/video/") ||
+                link.contains("vm.tiktok.com") ||
+                link.contains("vt.tiktok.com") ||
+                link.contains("/t/")
+        }
+    }
+    return item.platform == "instagram" || item.platform == "tiktok"
+}
 
 private fun openReel(context: Context, item: SavedItem) {
     val url = item.url ?: item.remoteUrl
