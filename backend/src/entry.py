@@ -886,6 +886,7 @@ class Default(WorkerEntrypoint):
             entry = {
                 "label": candidate.get("label"),
                 "host": (urlparse(candidate["url"]).hostname or "?")[:60],
+                "url": candidate["url"][:300],
                 "status": 0,
                 "bytes": 0,
                 "type": "",
@@ -954,6 +955,21 @@ class Default(WorkerEntrypoint):
                 ]
             except Exception:  # noqa: BLE001
                 urls = []
+        elif text:
+            for match in re.finditer(
+                r"https?://[^\s\"'\\]{20,600}?(?:/video/tos/[^\s\"'\\]*|\.mp4[^\s\"'\\]*)",
+                text,
+            ):
+                link = _unescape_media(match.group(0))
+                urls.append(
+                    {
+                        "path": "html",
+                        "host": (urlparse(link).hostname or "?")[:60],
+                        "url": link[:200],
+                    }
+                )
+                if len(urls) >= 6:
+                    break
 
         return _json(
             {
