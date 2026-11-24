@@ -308,8 +308,10 @@ async def _resolve_media_url(code):
 async def _resolve_tiktok(link):
     """يجيب رابط فيديو تيك توك قابل للتنزيل مع غلافه ومدّته.
 
-    يرجّع `(url, info, attempts)`. الترتيب: تتبّع الرابط المختصر ثم المستخرج
-    العام (بدون كوكيز)، وإن فشل نقرأ بيانات التشغيل من صفحة الفيديو نفسها.
+    يرجّع `(candidates, info, attempts)` حيث `candidates` قائمة روابط مرشّحة
+    بالترتيب (`play` ثم `hdplay` ثم `wmplay`): بعض نسخ الـCDN ترفض الطلب
+    من عناوين مراكز البيانات، فنجرّب التالي. الترتيب: تتبّع الرابط المختصر ثم
+    المستخرج العام (بدون كوكيز)، وإن فشل نقرأ بيانات صفحة الفيديو نفسها.
     """
     attempts = []
     html = None
@@ -350,7 +352,8 @@ async def _resolve_tiktok(link):
             continue
 
         data = payload.get("data") or {}
-        for key in ("hdplay", "play", "wmplay"):
+        candidates = []
+        for key, size_key in (("play", "size"), ("hdplay", "hd_size"), ("wmplay", "")):
             media_url = _clean(data.get(key))
             if not media_url:
                 continue
@@ -359,20 +362,22 @@ async def _resolve_tiktok(link):
             if not media_url.startswith("http"):
                 continue
             try:
+                known_size = int(data.get(size_key) or 0) if size_key else 0
+            except Exception:  # noqa: BLE001
+                known_size = 0
+            candidates.append({"url": media_url, "bytes": known_size})
+
+        if candidates:
+            try:
                 duration_s = int(data.get("duration") or 0)
             except Exception:  # noqa: BLE001
                 duration_s = 0
-            try:
-                known_size = int(data.get("size") or 0)
-            except Exception:  # noqa: BLE001
-                known_size = 0
             info = {
                 "durationMs": duration_s * 1000,
-                "bytes": known_size,
                 "thumbnail": _clean(data.get("cover")) or None,
                 "title": _clean(data.get("title"))[:200] or None,
             }
-            return media_url, info, attempts
+            return candidates, info, attempts
 
         attempts.append(
             "resolver -> code %s %s"
@@ -382,10 +387,10 @@ async def _resolve_tiktok(link):
     if html:
         found = _tiktok_media_urls(html)
         if found:
-            return found[0], {}, attempts
+            return [{"url": url, "bytes": 0} for url in found], {}, attempts
         attempts.append(f"page -> {len(html)} bytes, no media url")
 
-    return None, {}, attempts
+    return [], {}, attempts
 
 
 def _size_of(headers_obj):
@@ -675,10 +680,11 @@ class Default(WorkerEntrypoint):
 
             info = {}
             if source == "tiktok":
-                media_url, info, attempts = await _resolve_tiktok(tiktok)
+                candidates, info, attempts = await _resolve_tiktok(tiktok)
             else:
                 media_url, attempts = await _resolve_media_url(code)
-            if not media_url:
+                candidates = [{"url": media_url, "bytes": 0}] if media_url else []
+            if not candidates:
                 raise RuntimeError(
                     f"could not resolve the {source} video url: " + " | ".join(attempts)
                 )
@@ -697,18 +703,31 @@ class Default(WorkerEntrypoint):
             async def on_progress(percent):
                 await report("downloading", percent)
 
-            try:
-                data = await _download_bytes(
-                    media_url,
-                    on_progress,
-                    media_headers,
-                    info.get("bytes") or 0,
-                )
-            except RuntimeError as exc:
-                if "media HTTP" not in str(exc):
-                    raise
-                # احتياطي: طلب كامل واحد بدل النطاقات.
-                data = await _fetch_whole(media_url, on_progress, media_headers)
+            data = None
+            last_error = "no media url"
+            for candidate in candidates:
+                try:
+                    try:
+                        data = await _download_bytes(
+                            candidate["url"],
+                            on_progress,
+                            media_headers,
+                            candidate["bytes"],
+                        )
+                    except RuntimeError as exc:
+                        if "media HTTP" not in str(exc):
+                            raise
+                        # احتياطي: طلب كامل واحد بدل النطاقات.
+                        data = await _fetch_whole(
+                            candidate["url"], on_progress, media_headers
+                        )
+                    break
+                except Exception as exc:  # noqa: BLE001 - نجرّب الرابط التالي
+                    last_error = str(exc)[:120]
+                    data = None
+
+            if not data:
+                raise RuntimeError("media download failed: " + last_error)
 
             await report("storing", 95)
             await self.env.FILES.put(self._key(reel_id), data)
