@@ -19,7 +19,7 @@ import asyncio
 import json
 import re
 import time
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from workers import Response, WorkerEntrypoint, fetch
 
@@ -75,14 +75,24 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
-TIKTOK_VIDEO_RE = re.compile(r"/(?:video|v)/(\d{6,30})")
-TIKTOK_MEDIA_RE = re.compile(r'"(?:playAddr|downloadAddr)":"(https:[^"]+)"')
+TIKTOK_VIDEO_RE = re.compile(r"/(?:video|v|photo)/(\d{6,30})")
 
-# مسار عام بدون تسجيل دخول يعطي رابط CDN لا يحتاج كوكيز (روابط playAddr
-# الموقّعة ترفض بـ403 من غير `tt_chain_token`).
+# كوكيز الجلسة التي تُشترط لروابط `playAddr` من الموقع (`*-prime.tiktok.com`)
+# ترد 403 بدونها، فنأخذها من نفس استجابة الصفحة.
+TIKTOK_COOKIES = ("tt_chain_token", "tt_csrf_token", "ttwid", "msToken")
+
+# صفحة الموبايل تعطي نفس الفيديو من `*.tiktokcdn.com` بلا كوكيز ولا توقيع جلسة.
+TIKTOK_MOBILE_PAGE = "https://m.tiktok.com/v/{id}.html"
+
+# احتياط أخير: tikwm يحجب Cloudflare بحصة يومية مشتركة (`Free Api Limit`).
 TIKTOK_RESOLVER = "https://www.tikwm.com/api/?url="
 TIKTOK_RESOLVER_ORIGIN = "https://www.tikwm.com"
 TIKTOK_OEMBED = "https://www.tiktok.com/oembed?url="
+
+TIKTOK_PAGE_HEADERS = {
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9",
+}
 
 OG_VIDEO_RE = re.compile(
     r'<meta[^>]+(?:property|name)="og:video(?::\w+)?"[^>]+content="([^"]+)"'
@@ -203,13 +213,33 @@ def _tiktok_video_id(link):
     return match.group(1) if match else None
 
 
-def _tiktok_media_urls(html):
-    """يستخرج روابط الفيديو من بيانات تشغيل صفحة تيك توك."""
+def _tiktok_media_urls(html, key):
+    """روابط الفيديو من بيانات تشغيل الصفحة: `playAddr` نظيف و`downloadAddr` بعلامة."""
     found = []
-    for match in TIKTOK_MEDIA_RE.finditer(html or ""):
+    pattern = re.compile(r'"%s":\s*"([^"]{20,2500})"' % key)
+    for match in pattern.finditer(html or ""):
         link = _unescape_media(match.group(1))
-        if link.startswith("http"):
+        if link.startswith("http") and link not in found:
             found.append(link)
+    return found
+
+
+def _tiktok_cookies(headers_obj):
+    """كوكيز تيك توك من `set-cookie` (الـ`Headers` تجمعها في قيمة واحدة)."""
+    found = {}
+    try:
+        raw = _clean(headers_obj.get("set-cookie"))
+    except Exception:  # noqa: BLE001 - بعض الاستجابات بلا ترويسات
+        return found
+    if not raw:
+        return found
+    for part in re.split(r",\s*(?=[A-Za-z0-9_\-]+=)", raw):
+        name, _, rest = part.partition("=")
+        name = name.strip()
+        if name in TIKTOK_COOKIES and rest:
+            value = rest.split(";", 1)[0].strip()
+            if value:
+                found[name] = value
     return found
 
 
@@ -324,84 +354,139 @@ async def _resolve_media_url(code):
     return None, attempts
 
 
-async def _resolve_tiktok(link):
-    """يجيب فيديو تيك توك بدون علامة مائية مع غلافه وعنوانه.
+async def _resolve_tiktok(link, deadline=None):
+    """يجمع روابط فيديو تيك توك النظيفة (بلا علامة مائية) بترتيب الأفضلية.
 
-    يرجّع `(candidates, info, attempts)`. الأساس نسخة tikwm النظيفة
-    (`/video/media/play/<id>.mp4`): بلا علامة مائية ولا حصة API، لكنها ترفض
-    HEAD وطلبات النطاقات فتُنزَّل بطلب كامل واحد. رقم الفيديو يجي من تحويل
-    الرابط المختصر أو من oEmbed، و API الخاص بـ tikwm يبقى احتياطاً.
+    الأساس صفحة تيك توك نفسها: نتبع تحويل الرابط المختصر، ونأخذ معرّف الفيديو
+    و`playAddr` (النسخة التي يشغّلها الموقع، وهي بلا علامة)، ونرسل معها كوكيز
+    الصفحة و`referer` لأن روابط `*-prime.tiktok.com` ترد 403 بدونهما. ثم صفحة
+    الموبايل لأنها تعطي رابط `*.tiktokcdn.com` بلا كوكيز. أما tikwm (الذي كان
+    الأساس) فيحجب Cloudflare بحصة يومية مشتركة، فبقي احتياطاً أخيراً فقط.
     """
     attempts = []
-    html = None
-    final = link
-    page_headers = {
-        "user-agent": BROWSER_UA,
-        "accept": "text/html,application/xhtml+xml",
-        "accept-language": "en-US,en;q=0.9",
-    }
+    candidates = []
+    info = {}
+    cookies = {}
 
+    def left():
+        return 99.0 if deadline is None else deadline - time.monotonic()
+
+    def add(media_url, label, headers=None, size=0, whole=False):
+        media_url = _clean(media_url)
+        if not media_url.startswith("http"):
+            return
+        if any(entry["url"] == media_url for entry in candidates):
+            return
+        request_headers = {"user-agent": BROWSER_UA, "accept": "*/*"}
+        if headers:
+            for name, value in headers.items():
+                if value:
+                    request_headers[name] = value
+        candidates.append(
+            {
+                "url": media_url,
+                "bytes": size,
+                "headers": request_headers,
+                "label": label,
+                "whole": whole,
+            }
+        )
+
+    page_headers = dict(TIKTOK_PAGE_HEADERS)
+    page_headers["user-agent"] = BROWSER_UA
+
+    # 1) صفحة الرابط: تتبع التحويل القصير وتعطي المعرّف والكوكيز وplayAddr.
+    final = link
+    html = ""
     try:
         response = await _fetch(link, headers=page_headers, redirect="follow")
         final = _clean(_field(response, "url"), link) or link
+        cookies = _tiktok_cookies(response.headers)
         if int(response.status) == 200:
             html = await response.text()
         else:
             attempts.append(f"page -> HTTP {response.status}")
     except Exception as exc:  # noqa: BLE001
-        attempts.append(f"page -> {str(exc)[:80]}")
+        attempts.append(f"page -> {str(exc)[:70]}")
 
-    info = {}
     video_id = _tiktok_video_id(final) or _tiktok_video_id(link)
-    oembed = await _tiktok_oembed(final, attempts)
+
+    site_headers = {
+        "referer": "https://www.tiktok.com/",
+        "origin": "https://www.tiktok.com",
+    }
+    if cookies:
+        site_headers["cookie"] = "; ".join(
+            f"{name}={value}" for name, value in cookies.items()
+        )
+
+    for media_url in _tiktok_media_urls(html, "playAddr"):
+        add(media_url, "page/playAddr", site_headers)
+
     if not video_id:
+        oembed = await _tiktok_oembed(final, attempts)
         video_id = _clean(oembed.get("embed_product_id")) or None
-    if oembed:
-        info = {
-            "title": _clean(oembed.get("title"))[:200] or None,
-            "thumbnail": _clean(oembed.get("thumbnail_url")) or None,
-            "durationMs": 0,
-        }
+        if oembed:
+            info = {
+                "title": _clean(oembed.get("title"))[:200] or None,
+                "thumbnail": _clean(oembed.get("thumbnail_url")) or None,
+                "durationMs": 0,
+            }
 
-    # نسخة tikwm النظيفة (بلا علامة مائية): طلب كامل واحد، لأن السيرفر يرفض
-    # HEAD وطلبات النطاقات. لا تحتاج حصة API ولا تسجيل دخول.
-    candidates = []
-    if video_id:
-        for kind in ("play", "wmplay"):
-            candidates.append(
-                {
-                    "url": f"{TIKTOK_RESOLVER_ORIGIN}/video/media/{kind}/{video_id}.mp4",
-                    "bytes": 0,
-                    "whole": True,
-                }
-            )
-
-    payload = None
-    for candidate in dict.fromkeys((final, link)):
+    # 2) صفحة الموبايل: نفس الفيديو من CDN لا يحتاج كوكيز ولا جلسة.
+    if video_id and left() > 7:
         try:
             response = await _fetch(
-                TIKTOK_RESOLVER + quote(candidate, safe=""),
-                headers={"accept": "application/json", "user-agent": BROWSER_UA},
+                TIKTOK_MOBILE_PAGE.format(id=video_id),
+                headers={**page_headers, "referer": "https://www.tiktok.com/"},
                 redirect="follow",
             )
+            if int(response.status) == 200:
+                mobile_html = await response.text()
+                found = _tiktok_media_urls(mobile_html, "playAddr")
+                for media_url in found:
+                    add(media_url, "mobile/playAddr")
+                if not found:
+                    attempts.append(
+                        "mobile -> %d bytes, no media url" % len(mobile_html)
+                    )
+            else:
+                attempts.append(f"mobile -> HTTP {response.status}")
         except Exception as exc:  # noqa: BLE001
-            attempts.append(f"resolver -> {str(exc)[:80]}")
-            continue
-        if int(response.status) != 200:
-            attempts.append(f"resolver -> HTTP {response.status}")
-            continue
-        try:
-            parsed = json.loads(await response.text())
-        except Exception:  # noqa: BLE001
-            attempts.append("resolver -> invalid json")
-            continue
-        if parsed.get("data"):
-            payload = parsed
-            break
-        attempts.append(
-            "resolver -> code %s %s"
-            % (parsed.get("code"), str(parsed.get("msg"))[:60])
-        )
+            attempts.append(f"mobile -> {str(exc)[:70]}")
+
+    # 3) النسخة المعلَّمة: أفضل من لا شيء لو غيّرت تيك توك الروابط النظيفة.
+    for media_url in _tiktok_media_urls(html, "downloadAddr"):
+        add(media_url, "page/downloadAddr", site_headers)
+
+    # 4) tikwm: احتياط أخير فقط لأنه يحجب Cloudflare بحصة يومية مشتركة.
+    payload = None
+    if not candidates and left() > 5:
+        for candidate_link in dict.fromkeys((final, link)):
+            try:
+                response = await _fetch(
+                    TIKTOK_RESOLVER + quote(candidate_link, safe=""),
+                    headers={"accept": "application/json", "user-agent": BROWSER_UA},
+                    redirect="follow",
+                )
+            except Exception as exc:  # noqa: BLE001
+                attempts.append(f"resolver -> {str(exc)[:70]}")
+                continue
+            if int(response.status) != 200:
+                attempts.append(f"resolver -> HTTP {response.status}")
+                continue
+            try:
+                parsed = json.loads(await response.text())
+            except Exception:  # noqa: BLE001
+                attempts.append("resolver -> invalid json")
+                continue
+            if parsed.get("data"):
+                payload = parsed
+                break
+            attempts.append(
+                "resolver -> code %s %s"
+                % (parsed.get("code"), str(parsed.get("msg"))[:60])
+            )
 
     data = (payload or {}).get("data") or {}
     for key, size_key in (("play", "size"), ("hdplay", "hd_size"), ("wmplay", "")):
@@ -410,13 +495,11 @@ async def _resolve_tiktok(link):
             continue
         if media_url.startswith("/"):
             media_url = TIKTOK_RESOLVER_ORIGIN + media_url
-        if not media_url.startswith("http"):
-            continue
         try:
             known_size = int(data.get(size_key) or 0) if size_key else 0
         except Exception:  # noqa: BLE001
             known_size = 0
-        candidates.append({"url": media_url, "bytes": known_size})
+        add(media_url, f"tikwm/{key}", size=known_size)
 
     if data:
         try:
@@ -429,14 +512,15 @@ async def _resolve_tiktok(link):
             "title": info.get("title") or _clean(data.get("title"))[:200] or None,
         }
 
-    if html:
-        found = _tiktok_media_urls(html)
-        candidates.extend({"url": url, "bytes": 0} for url in found)
-        if not found:
-            attempts.append(f"page -> {len(html)} bytes, no media url")
+    # لو كل ما سبق فشل: مسار tikwm المباشر (بلا علامة) بطلب كامل واحد.
+    if video_id and not candidates:
+        add(
+            f"{TIKTOK_RESOLVER_ORIGIN}/video/media/play/{video_id}.mp4",
+            "tikwm/media/play",
+            whole=True,
+        )
 
     return candidates, info, attempts
-
 
 async def _tiktok_oembed(link, attempts):
     """بيانات الفيديو العامة (عنوان، غلاف، رقم الفيديو) بلا حصة ولا تسجيل."""
@@ -502,20 +586,24 @@ async def _media_size(media_url, headers):
 
 
 async def _fetch_media(media_url, headers, range_header=None):
-    """طلب وسائط مع إعادة محاولة قصيرة: شبكة تيك توك ترد 403/429 عند التكرار السريع."""
+    """طلب وسائط مع إعادة محاولة قصيرة لطلبات الازدحام فقط.
+
+    403 يعني أن الرابط نفسه مرفوض (توقيع/كوكي) فلا فائدة من إعادة الطلب
+    وضياع ميزانية المهمة؛ ننتقل إلى المرشّح التالي فوراً.
+    """
     request_headers = dict(headers)
     if range_header:
         request_headers["range"] = range_header
 
     status = 0
-    for attempt in range(3):
+    for attempt in range(2):
         response = await _fetch(media_url, headers=request_headers, redirect="follow")
         status = int(response.status)
         if status in (200, 206):
             return response
-        if status not in (403, 429, 503):
+        if status not in (429, 500, 502, 503, 504):
             break
-        await asyncio.sleep(0.5 * (attempt + 1))
+        await asyncio.sleep(0.4 * (attempt + 1))
 
     raise RuntimeError(f"media HTTP {status}")
 
@@ -623,6 +711,9 @@ class Default(WorkerEntrypoint):
 
         if parts[0] == "download" and len(parts) == 2 and method == "GET":
             return await self._download(parts[1])
+
+        if parts[0] == "probe" and method == "GET":
+            return await self._probe(str(request.url))
 
         if method == "OPTIONS":
             return Response(
@@ -751,6 +842,57 @@ class Default(WorkerEntrypoint):
     def _key(self, reel_id):
         return f"reels/{reel_id}.mp4"
 
+    async def _probe(self, raw_url):
+        """تشخيص مؤقت: يشغّل محلّل تيك توك ويجرّب أول 2KB من كل مرشّح."""
+        query = parse_qs(urlparse(raw_url).query)
+        link = _clean((query.get("url") or [""])[0])
+        if not link:
+            return _error("missing ?url=")
+
+        started = time.monotonic()
+        try:
+            candidates, info, attempts = await asyncio.wait_for(
+                _resolve_tiktok(link, deadline=time.monotonic() + 18), 20
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _json({"ok": False, "error": str(exc)[:200]})
+
+        results = []
+        for candidate in candidates[:6]:
+            entry = {
+                "label": candidate.get("label"),
+                "host": (urlparse(candidate["url"]).hostname or "?")[:60],
+                "status": 0,
+                "bytes": 0,
+                "type": "",
+            }
+            headers = dict(candidate.get("headers") or {})
+            headers["range"] = "bytes=0-2047"
+            try:
+                response = await _fetch(
+                    candidate["url"], headers=headers, redirect="follow"
+                )
+                entry["status"] = int(response.status)
+                entry["type"] = _clean(response.headers.get("content-type"))[:40]
+                size = _size_of(response.headers)
+                if size <= 3 * 1024 * 1024:
+                    size = len(await _read_bytes(response))
+                entry["bytes"] = size
+            except Exception as exc:  # noqa: BLE001
+                entry["error"] = str(exc)[:120]
+            results.append(entry)
+
+        return _json(
+            {
+                "ok": True,
+                "seconds": round(time.monotonic() - started, 1),
+                "candidates": len(candidates),
+                "attempts": attempts,
+                "info": info,
+                "results": results,
+            }
+        )
+
     async def _archive(self, reel_id, code, tiktok, source, origin, thumbnail):
         db = self._db()
         state_path = f"reels/{reel_id}/archive.json"
@@ -781,7 +923,10 @@ class Default(WorkerEntrypoint):
             try:
                 if source == "tiktok":
                     candidates, info, attempts = await asyncio.wait_for(
-                        _resolve_tiktok(tiktok), resolve_budget
+                        _resolve_tiktok(
+                            tiktok, deadline=time.monotonic() + resolve_budget
+                        ),
+                        resolve_budget,
                     )
                 else:
                     media_url, attempts = await asyncio.wait_for(
@@ -799,11 +944,12 @@ class Default(WorkerEntrypoint):
 
             await report("downloading", 6)
 
-            # تيك توك يرفض طلب النطاق إذا جاء مع referer، لذلك نرسل المتصفح فقط.
+            # تيك توك: كل مرشّح يحمل ترويساته (كوكي الجلسة و`referer`) لأن
+            # روابط `*-prime.tiktok.com` ترد 403 بدونهما.
             if source == "tiktok":
-                media_headers = {"user-agent": BROWSER_UA, "accept": "*/*"}
+                base_headers = {"user-agent": BROWSER_UA, "accept": "*/*"}
             else:
-                media_headers = {
+                base_headers = {
                     "user-agent": CRAWLER_UA,
                     "referer": "https://www.instagram.com/",
                 }
@@ -819,6 +965,8 @@ class Default(WorkerEntrypoint):
                     last_error = last_error or "the download budget ran out"
                     break
                 hosts.append((urlparse(candidate["url"]).hostname or "?")[:60])
+                media_headers = dict(base_headers)
+                media_headers.update(candidate.get("headers") or {})
                 try:
                     if candidate.get("whole"):
                         # سيرفر يرفض HEAD والنطاقات: طلب كامل واحد فقط.

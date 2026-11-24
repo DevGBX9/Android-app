@@ -3,6 +3,11 @@ name: Deploy Pigeon Reels API
 # يُشغَّل يدوياً من تبويب Actions بعد إضافة أسرار Cloudflare.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/api.yml"
 
 permissions:
   contents: read
