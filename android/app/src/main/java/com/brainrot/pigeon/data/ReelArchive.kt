@@ -40,6 +40,8 @@ private data class ArchiveRequest(
     val id: String,
     val url: String,
     val thumbnail: String? = null,
+    // رابط CDN النظيف لتيك توك (يُحل من الهاتف لأن Cloudflare محجوب عن الحل).
+    val media: String? = null,
 )
 
 /**
@@ -74,12 +76,20 @@ class ReelArchive(
      * يطلب من الخادم تنزيل الريل وتخزينه. يعيد `null` إذا قُبل الطلب،
      * أو رسالة الخطأ القادمة من الشبكة/الخادم حتى تظهر للمستخدم.
      */
-    suspend fun request(item: SavedItem): String? = withContext(Dispatchers.IO) {
+    suspend fun request(item: SavedItem, media: String? = null): String? =
+        withContext(Dispatchers.IO) {
         val link = item.url?.takeIf { it.isNotBlank() } ?: return@withContext "the reel has no link"
         if (!configured) return@withContext "the archive service is not configured"
 
         val body = json
-            .encodeToString(ArchiveRequest(id = item.id, url = link, thumbnail = item.thumbnail))
+            .encodeToString(
+                ArchiveRequest(
+                    id = item.id,
+                    url = link,
+                    thumbnail = item.thumbnail,
+                    media = media?.takeIf { it.startsWith("https://") },
+                ),
+            )
             .toRequestBody(ARCHIVE_MEDIA)
         val request = Request.Builder()
             .url("$base/reels")

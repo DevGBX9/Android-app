@@ -19,6 +19,7 @@ private const val MAX_SAVED_ITEMS = 300
 private const val MAX_THUMBNAIL_LOOKUPS = 30
 private const val ARCHIVE_TIMEOUT_MS = 210_000L
 private const val REQUEST_RETRY_MS = 12_000L
+private const val STALL_MS = 25_000L
 private const val MAX_ARCHIVE_FAILURES = 3
 
 /**
@@ -34,6 +35,7 @@ class SavedRepository(
     private val remote: FirebaseReels,
     private val thumbnails: ReelThumbnails,
     private val archive: ReelArchive,
+    private val tiktok: TikTokMedia,
     private val scope: CoroutineScope,
 ) {
 
@@ -77,7 +79,7 @@ class SavedRepository(
 
         context.savedStore.edit { prefs ->
             val local = decode(prefs[SAVED_ITEMS_KEY])
-            pending = local.filter { it.url != null && !it.registered && it.id !in remoteIds }
+            pending = local.filter { it.url != null && it.id !in remoteIds }
 
             // LinkedHashMap: سجلات Firebase أولاً ثم ما هو محلي فقط.
             val merged = LinkedHashMap<String, SavedItem>()
@@ -100,7 +102,9 @@ class SavedRepository(
         }
 
         pending.forEach { register(it) }
-        toArchive.forEach { item -> scope.launch { archive.request(item) } }
+        toArchive.forEach { item ->
+            scope.launch { archive.request(item, tiktok.resolve(item.url)) }
+        }
         return Result.success(Unit)
     }
 
@@ -129,23 +133,44 @@ class SavedRepository(
             return Result.failure(IOException("the archive service is not configured"))
         }
 
+        // رابط CDN النظيف لتيك توك يُحل مرة واحدة من شبكة الهاتف.
+        val media = tiktok.resolve(current.url)
+
         val deadline = System.currentTimeMillis() + ARCHIVE_TIMEOUT_MS
         var lastRequestAt = 0L
         var lastError: String? = null
         var failures = 0
+        var best = 0
+        var lastChangeAt = System.currentTimeMillis()
+        var lastState = ""
+
+        // الطلب الأول ثم الطلب عند الحاجة فقط: إعادة الطلب بينما المهمة تعمل
+        // تُصفّر تقدّم الخادم، وهذا سبب نسبة 8 ثم 2.
+        suspend fun requestNow() {
+            lastRequestAt = System.currentTimeMillis()
+            archive.request(current, media)?.let { lastError = it }
+        }
+
+        requestNow()
 
         while (System.currentTimeMillis() < deadline) {
-            // نطلب الأرشفة أول مرة ثم نعيد الطلب دورياً: طلب واحد قد يضيع
-            // (التطبيق يُغلق بعد المشاركة) أو تُلغى مهمته على الخادم.
-            val now = System.currentTimeMillis()
-            if (now - lastRequestAt >= REQUEST_RETRY_MS) {
-                lastRequestAt = now
-                archive.request(current)?.let { lastError = it }
+            delay(1200)
+            val status = remote.fetchArchive(current.id)
+
+            // غابت عقدة الأرشيف (طلب ضاع قبل أن يكتبه الخادم): نعيد الطلب.
+            if (status == null) {
+                if (System.currentTimeMillis() - lastRequestAt >= REQUEST_RETRY_MS) requestNow()
+                continue
             }
 
-            delay(1200)
-            val status = remote.fetchArchive(current.id) ?: continue
-            onProgress(status.progress.coerceIn(0, 100) * 85 / 100)
+            if (status.state != lastState || status.progress > best) {
+                lastState = status.state
+                lastChangeAt = System.currentTimeMillis()
+            }
+
+            // النسبة لا ترجع للخلف أبداً أثناء المحاولة نفسها.
+            best = maxOf(best, status.progress.coerceIn(0, 100))
+            onProgress(best * 85 / 100)
 
             when (status.state) {
                 "ready" -> {
@@ -165,8 +190,17 @@ class SavedRepository(
                     if (failures >= MAX_ARCHIVE_FAILURES) {
                         return Result.failure(IOException(lastError))
                     }
-                    // نعيد الطلب فوراً في الدورة التالية.
-                    lastRequestAt = 0L
+                    requestNow()
+                }
+
+                else -> {
+                    // مهمة الخلفية على Cloudflare تُلغى بصمت بعد ~30 ثانية؛
+                    // إذا توقّف التقدّم نعيد الطلب بدل الانتظار بلا نهاية.
+                    val stalled = System.currentTimeMillis() - lastChangeAt >= STALL_MS
+                    if (stalled && System.currentTimeMillis() - lastRequestAt >= REQUEST_RETRY_MS) {
+                        lastChangeAt = System.currentTimeMillis()
+                        requestNow()
+                    }
                 }
             }
         }
@@ -204,7 +238,9 @@ class SavedRepository(
         markRegistered(item.id)
 
         // الأرشفة في Cloudflare: ريلز إنستغرام وفيديوهات تيك توك.
-        if (isArchivable(link)) archive.request(item.copy(thumbnail = thumb))
+        if (isArchivable(link)) {
+            archive.request(item.copy(thumbnail = thumb), tiktok.resolve(link))
+        }
     }
 
     private suspend fun markRegistered(id: String) {
