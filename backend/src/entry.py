@@ -18,7 +18,7 @@ R2، ويحدّث حالة المعالجة والتقدّم في Firebase Realt
 import json
 import re
 import time
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from workers import Response, WorkerEntrypoint, fetch
 
@@ -514,6 +514,9 @@ class Default(WorkerEntrypoint):
         if parts[0] == "health":
             return _json({"ok": True, "time": int(time.time() * 1000)})
 
+        if parts[0] == "probe" and method == "GET":
+            return await self._probe(str(request.url))
+
         if not self._authorized(request):
             return _error("unauthorized", 401)
 
@@ -581,6 +584,47 @@ class Default(WorkerEntrypoint):
             await job
 
         return _json({"ok": True, "id": reel_id, "state": "queued"}, status=202)
+
+    async def _probe(self, raw_url):
+        """تشخيص مؤقت: يجيب ماذا يرى الـWorker من عنوان الوسائط."""
+        query = urlparse(raw_url).query
+        target = ""
+        for pair in query.split("&"):
+            key, _, value = pair.partition("=")
+            if key == "url":
+                target = unquote(value)
+        if not target.startswith("http"):
+            return _error("missing url")
+
+        variants = {
+            "plain": {},
+            "browser": {
+                "user-agent": BROWSER_UA,
+                "referer": "https://www.tiktok.com/",
+            },
+            "range": {"user-agent": BROWSER_UA, "range": "bytes=0-1023"},
+            "video-accept": {
+                "user-agent": BROWSER_UA,
+                "accept": "video/webm,video/ogg,video/*;q=0.9,*/*;q=0.8",
+                "accept-language": "en-US,en;q=0.9",
+            },
+        }
+
+        results = {}
+        for name, headers in variants.items():
+            try:
+                response = await fetch(target, headers=headers, redirect="follow")
+                body = await _read_bytes(response)
+                results[name] = {
+                    "status": int(response.status),
+                    "type": _clean(response.headers.get("content-type")),
+                    "bytes": len(body),
+                    "head": body[:32].decode("latin-1", "replace"),
+                }
+            except Exception as exc:  # noqa: BLE001
+                results[name] = {"error": str(exc)[:120]}
+
+        return _json({"ok": True, "target": target[:120], "results": results})
 
     async def _status(self, reel_id):
         reel_id = _safe_id(reel_id)
