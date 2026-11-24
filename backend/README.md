@@ -38,15 +38,21 @@ Instagram Graph API، من cron داخلي، وليس من جدولة إنستغ
   | `verifying` | `GET /<media_id>` من Graph API | `cleaning` أو `unverified` |
   | `cleaning` | تأكيد ثانٍ ← حذف R2 ← حذف Firebase | تُحذف السجلات (نهاية ناجحة) |
 
-- منع التداخل: كل انتقال يُكتب بـ`PATCH` مشروط بـ`if-match` (ETag من Firebase)،
+- منع التداخل: كل انتقال يُكتب بـ`PUT` مشروط بـ`if-match` (ETag من Firebase)،
   وكل خطوة تحجز نفسها قبل النداء الخارجي. تشغيلان في نفس اللحظة: الثاني يفشل
   بـ412 ولا ينشر ولا يحذف شيئاً (مُختبر).
+  سبب `PUT` لا `PATCH`: Firebase RTDB يرفض ترويسة `if-match` على PATCH (يرد
+  400)، فيُقرأ السجل ثم تُدمج الحقول الجديدة فوقه وتُكتب بـ`PUT`؛ التطابق
+  بـ`if-match` يضمن أن السجل لم يتغيّر بين القراءة والكتابة. ولا تكتب أي خطوة
+  بلا ETag.
 - لو انقطع الـWorker بعد `media_publish` لا يعيد النشر أبداً: يسأل الحساب عن
   آخر منشور أولاً. ولو بقي النشر غير مؤكد (`unverified`) يبقى الملف في R2
   وسجلات Firebase كما هي — لا حذف بلا تأكيد من إنستغرام.
 - التنظيف: بعد نجاح النشر بتأكيد Graph API ينتظر 5 ثوانٍ، يتأكد مرة أخرى،
   يحذف `reels/<id>.mp4` من R2، يتأكد أنه غاب (`head`)، ثم يحذف `reels/<id>`
   و`schedules/<id>` من Firebase. كل ذلك في نفس تشغيل cron.
+- سجل `reels/<id>/archive` يُحدَّث بـ`PATCH` (دمج)، وحالة `ready` نهائية: أي
+  محاولة أرشفة فاشلة بعدها لا ترجعه إلى `failed` ولا تمسح رابطه وحجمه.
 - الوقت ثابت 19:00 بتوقيت الجزائر (`Africa/Algiers` = UTC+1) أي 18:00 UTC.
 - `IG_ACCESS_TOKEN` سرّ في GitHub Actions وليس في `wrangler.jsonc`؛ يحتاج
   صلاحية `instagram_content_publish`. `IG_USER_ID` و`PUBLIC_BASE_URL` في

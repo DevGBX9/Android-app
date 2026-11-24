@@ -464,16 +464,26 @@ async def _firebase_read(base, path):
         return None, etag
 
 
-async def _firebase_compare_patch(base, path, etag, payload):
-    """PATCH مشروط: ينجح فقط إن لم يتغيّر السجل منذ قراءته (412 يعني سبقنا أحد)."""
-    headers = {"content-type": "application/json; charset=utf-8"}
-    if etag:
-        headers["if-match"] = etag
+async def _firebase_compare_write(base, path, etag, current, payload):
+    """كتابة مشروطة: تنجح فقط إن لم يتغيّر السجل منذ قراءته (412 يعني سبقنا أحد).
+
+    Firebase RTDB يرفض ترويسة `if-match` على PATCH (يرد 400: "The 'if-match'
+    header is not supported with GET, PATCH or POST requests")، ويقبلها على PUT
+    فقط. لذلك ندمج الحقول الجديدة فوق السجل الذي قرأناه ثم نكتبه بـPUT، وبما
+    أن `if-match` يضمن أن السجل لم يتغيّر بين القراءة والكتابة فالدمج آمن.
+    """
+    if not etag:
+        return 0
+    body = dict(current) if isinstance(current, dict) else {}
+    body.update(payload)
     response = await _fetch(
         f"{base.rstrip('/')}/{path.lstrip('/')}",
-        method="PATCH",
-        headers=headers,
-        body=json.dumps(payload, ensure_ascii=False),
+        method="PUT",
+        headers={
+            "content-type": "application/json; charset=utf-8",
+            "if-match": etag,
+        },
+        body=json.dumps(body, ensure_ascii=False),
     )
     return int(response.status)
 
@@ -1034,7 +1044,7 @@ class Default(WorkerEntrypoint):
                 {
                     "ok": True,
                     "service": "pigeon-reels",
-                    "version": 6,
+                    "version": 7,
                     "routes": [
                         "POST /reels",
                         "GET /reels/<id>",
@@ -1459,10 +1469,8 @@ class Default(WorkerEntrypoint):
 
         return state, None
 
-    async def _claim(self, db, path, etag, to_state, extra=None):
+    async def _claim(self, db, path, etag, current, to_state, extra=None):
         """يحجز خطوة: لا تنجح إلا إن كان السجل ما زال كما قرأناه (if-match)."""
-        if not etag:
-            return False
         moment = int(time.time() * 1000)
         payload = {
             "state": to_state,
@@ -1471,7 +1479,7 @@ class Default(WorkerEntrypoint):
         }
         if extra:
             payload.update(extra)
-        status = await _firebase_compare_patch(db, path, etag, payload)
+        status = await _firebase_compare_write(db, path, etag, current, payload)
         return status == 200
 
     async def _stage_prepare(self, db, schedule_id):
@@ -1499,7 +1507,9 @@ class Default(WorkerEntrypoint):
         if await _object_exists(self.env, self._key(schedule_id)) is not True:
             return STAGE_SCHEDULED, ARCHIVE_WAIT
 
-        if not await self._claim(db, path, etag, STAGE_PREPARING, {"error": None}):
+        if not await self._claim(
+            db, path, etag, current, STAGE_PREPARING, {"error": None}
+        ):
             return state, None  # تشغيل آخر حجز خطوة التجهيز
 
         container_id, error = await self._prepare_container(schedule_id)
@@ -1663,7 +1673,7 @@ class Default(WorkerEntrypoint):
 
         # 2ب) نحجز خطوة النشر قبل النداء الخارجي نفسه.
         if not await self._claim(
-            db, path, etag, STAGE_PUBLISHING, {"error": None, "attempts": 0}
+            db, path, etag, current, STAGE_PUBLISHING, {"error": None, "attempts": 0}
         ):
             return state, None
 
@@ -1746,7 +1756,7 @@ class Default(WorkerEntrypoint):
         )
         if confirmed is True:
             if not await self._claim(
-                db, path, etag, STAGE_CLEANING, {"error": None, "attempts": 0}
+                db, path, etag, current, STAGE_CLEANING, {"error": None, "attempts": 0}
             ):
                 return state, None
             published_at = _int_of(current, "publishedAt") or moment
@@ -1975,7 +1985,16 @@ class Default(WorkerEntrypoint):
             }
             payload.update(extra)
             try:
-                await _firebase_put(db, state_path, payload)
+                # سجل "ready" نهائي: محاولة أرشفة فاشلة بعده لا ترجعه إلى failed
+                # ولا تمسح رابطه وحجمه (وإلا ظهر الريل بلا بيانات في التطبيق).
+                if state != "ready":
+                    existing = await _firebase_get(db, state_path)
+                    if (
+                        isinstance(existing, dict)
+                        and _clean(existing.get("state")) == "ready"
+                    ):
+                        return
+                await _firebase_patch(db, state_path, payload)
             except Exception:
                 pass
 

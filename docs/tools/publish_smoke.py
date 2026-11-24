@@ -90,6 +90,20 @@ def _firebase(url, method, headers, body):
             json.dumps(node) if node is not None else "null",
             headers={"etag": '"%d"' % etag},
         )
+    # Firebase RTDB الحقيقي يرفض if-match على GET/PATCH/POST ويقبلها على PUT فقط.
+    if headers.get("if-match") and method not in ("PUT", "DELETE"):
+        STATE["log"].append(("if-match-unsupported", key, method))
+        return Response(
+            json.dumps(
+                {
+                    "error": (
+                        "The 'if-match' header is not supported with GET, "
+                        "PATCH or POST requests"
+                    )
+                }
+            ),
+            status=400,
+        )
     if headers.get("if-match"):
         expected = headers["if-match"].strip('"')
         if expected != str(STATE["etags"].get(key, 0)):
