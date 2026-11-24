@@ -275,6 +275,26 @@ def _media_urls(html):
     return found
 
 
+def _json_media_urls(payload):
+    """روابط الفيديو داخل رد JSON مع مسار المفتاح (player API)."""
+    found = []
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                walk(value, f"{path}.{key}" if path else str(key))
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{path}[{index}]")
+        elif isinstance(node, str) and node.startswith("http"):
+            lowered = node.lower()
+            if ("/video/tos/" in lowered or ".mp4" in lowered) and ".jpeg" not in lowered:
+                found.append((path, node))
+
+    walk(payload, "")
+    return found
+
+
 def _safe_id(value):
     return re.sub(r"[^A-Za-z0-9_-]", "", _clean(value))[:64]
 
@@ -918,12 +938,22 @@ class Default(WorkerEntrypoint):
         status = int(response.status)
         content_type = _clean(response.headers.get("content-type"))[:60]
         size = _size_of(response.headers)
-        body = ""
+        text = ""
         if "json" in content_type or "text" in content_type or size < 4000:
             try:
-                body = (await response.text())[:900]
+                text = await response.text()
             except Exception:  # noqa: BLE001
-                body = ""
+                text = ""
+
+        urls = []
+        if text.strip().startswith("{") or text.strip().startswith("["):
+            try:
+                urls = [
+                    {"path": path[:90], "host": (urlparse(url).hostname or "?")}
+                    for path, url in _json_media_urls(json.loads(text))[:8]
+                ]
+            except Exception:  # noqa: BLE001
+                urls = []
 
         return _json(
             {
@@ -933,7 +963,8 @@ class Default(WorkerEntrypoint):
                 "type": content_type,
                 "size": size,
                 "cookies": sorted(_tiktok_cookies(response.headers).keys()),
-                "body": body,
+                "urls": urls,
+                "body": text[:700],
             }
         )
 
