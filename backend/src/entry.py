@@ -845,6 +845,10 @@ class Default(WorkerEntrypoint):
     async def _probe(self, raw_url):
         """تشخيص مؤقت: يشغّل محلّل تيك توك ويجرّب أول 2KB من كل مرشّح."""
         query = parse_qs(urlparse(raw_url).query)
+        target = _clean((query.get("raw") or [""])[0])
+        if target:
+            return await self._probe_raw(target, query)
+
         link = _clean((query.get("url") or [""])[0])
         if not link:
             return _error("missing ?url=")
@@ -890,6 +894,46 @@ class Default(WorkerEntrypoint):
                 "attempts": attempts,
                 "info": info,
                 "results": results,
+            }
+        )
+
+    async def _probe_raw(self, target, query):
+        """جلب أي رابط من شبكة Cloudflare للتشخيص فقط."""
+        headers = {
+            "user-agent": _clean((query.get("ua") or [""])[0], BROWSER_UA),
+            "accept": "*/*",
+        }
+        referer = _clean((query.get("referer") or [""])[0])
+        if referer:
+            headers["referer"] = referer
+        cookie = _clean((query.get("cookie") or [""])[0])
+        if cookie:
+            headers["cookie"] = cookie
+
+        try:
+            response = await _fetch(target, headers=headers, redirect="follow")
+        except Exception as exc:  # noqa: BLE001
+            return _json({"ok": False, "error": str(exc)[:160]})
+
+        status = int(response.status)
+        content_type = _clean(response.headers.get("content-type"))[:60]
+        size = _size_of(response.headers)
+        body = ""
+        if "json" in content_type or "text" in content_type or size < 4000:
+            try:
+                body = (await response.text())[:900]
+            except Exception:  # noqa: BLE001
+                body = ""
+
+        return _json(
+            {
+                "ok": True,
+                "status": status,
+                "final": _clean(_field(response, "url"))[:200],
+                "type": content_type,
+                "size": size,
+                "cookies": sorted(_tiktok_cookies(response.headers).keys()),
+                "body": body,
             }
         )
 
