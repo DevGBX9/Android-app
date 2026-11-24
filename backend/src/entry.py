@@ -452,6 +452,18 @@ async def _fetch_media(media_url, headers, range_header=None):
     raise RuntimeError(f"media HTTP {status}")
 
 
+async def _fetch_whole(media_url, on_progress, headers):
+    """تنزيل الملف بطلب واحد عندما يرفض السيرفر طلبات النطاق."""
+    response = await _fetch_media(media_url, headers)
+    data = await _read_bytes(response)
+    if not data:
+        raise RuntimeError("empty media")
+    if len(data) > MAX_BYTES:
+        raise RuntimeError("reel too large")
+    await on_progress(92)
+    return data
+
+
 async def _download_bytes(media_url, on_progress, headers, known_size=0):
     """ينزّل الفيديو على دفعات ليعطي تقدّماً حقيقياً بين 0 و100."""
     size = int(known_size or 0)
@@ -461,14 +473,7 @@ async def _download_bytes(media_url, on_progress, headers, known_size=0):
         raise RuntimeError(f"reel too large ({size} bytes)")
 
     if size <= 0:
-        response = await _fetch_media(media_url, headers)
-        data = await _read_bytes(response)
-        if not data:
-            raise RuntimeError("empty media")
-        if len(data) > MAX_BYTES:
-            raise RuntimeError("reel too large")
-        await on_progress(92)
-        return data
+        return await _fetch_whole(media_url, on_progress, headers)
 
     buffer = bytearray()
     offset = 0
@@ -680,11 +685,9 @@ class Default(WorkerEntrypoint):
 
             await report("downloading", 6)
 
+            # تيك توك يرفض طلب النطاق إذا جاء مع referer، لذلك نرسل المتصفح فقط.
             if source == "tiktok":
-                media_headers = {
-                    "user-agent": BROWSER_UA,
-                    "referer": "https://www.tiktok.com/",
-                }
+                media_headers = {"user-agent": BROWSER_UA}
             else:
                 media_headers = {
                     "user-agent": CRAWLER_UA,
@@ -694,12 +697,18 @@ class Default(WorkerEntrypoint):
             async def on_progress(percent):
                 await report("downloading", percent)
 
-            data = await _download_bytes(
-                media_url,
-                on_progress,
-                media_headers,
-                info.get("bytes") or 0,
-            )
+            try:
+                data = await _download_bytes(
+                    media_url,
+                    on_progress,
+                    media_headers,
+                    info.get("bytes") or 0,
+                )
+            except RuntimeError as exc:
+                if "media HTTP" not in str(exc):
+                    raise
+                # احتياطي: طلب كامل واحد بدل النطاقات.
+                data = await _fetch_whole(media_url, on_progress, media_headers)
 
             await report("storing", 95)
             await self.env.FILES.put(self._key(reel_id), data)
