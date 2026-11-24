@@ -59,11 +59,15 @@ IG_GRAPH = "https://graph.facebook.com/v23.0"
 IG_DEFAULT_USER_ID = "17841438848736931"
 IG_DEFAULT_PUBLIC_BASE = "https://brainrot-pigeon-reels.brainrotpigeon.workers.dev"
 
-# عدد محاولات cron قبل اعتبار الريل فاشلاً (cron كل 5 دقائق).
-SCHEDULE_RETRY_LIMIT = 12
+# عدد محاولات cron قبل اعتبار الريل فاشلاً (cron كل دقيقة ≈ ساعة انتظار).
+SCHEDULE_RETRY_LIMIT = 60
 
 # أقصى عدد مواعيد تُعالج في تشغيل واحد حتى تبقى مدة cron قصيرة.
 MAX_PUBLISH_PER_RUN = 3
+
+# نُجهّز حاوية إنستغرام قبل الموعد: إنشاء الحاوية من الفيديو يستغرق دقائق عند
+# Meta، ولو انتظرنا لحظة الموعد لظهر الريل متأخراً عن الوقت المعروض في التطبيق.
+PREPARE_LEAD_MS = 45 * 60 * 1000
 
 # media_publish ينشر الريل فعلًا في ثوانٍ لكن استجابته قد تتأخر؛ المهلة القصيرة
 # كانت تجعل الـWorker يظن أن النشر فشل والريل منشور أصلًا.
@@ -1154,6 +1158,7 @@ class Default(WorkerEntrypoint):
 
         report["total"] = len(schedules)
         due = []
+        prepare = []
         for schedule_id, schedule in schedules.items():
             if not isinstance(schedule, dict):
                 continue
@@ -1161,12 +1166,33 @@ class Default(WorkerEntrypoint):
                 at = int(schedule.get("at") or 0)
             except (TypeError, ValueError):
                 continue
+            if at <= 0:
+                continue
             state = _clean(schedule.get("state"), "scheduled")
-            if at <= 0 or at > now:
+            if at <= now:
+                if state in ("scheduled", "creating", "publishing"):
+                    due.append((schedule_id, schedule, at))
                 continue
-            if state not in ("scheduled", "creating", "publishing"):
+            # لم يحن الموعد بعد: نُجهّز الحاوية مسبقاً حتى يُنشر الريل في دقيقته
+            # بدل أن يبدأ تنزيل الفيديو عند Meta بعد مرور الوقت المعروض.
+            if state != "scheduled" or _clean(schedule.get("containerId")):
                 continue
-            due.append((schedule_id, schedule, at))
+            if at - now > PREPARE_LEAD_MS:
+                continue
+            prepare.append((schedule_id, schedule, at))
+
+        # تجهيز الحاويات القريبة أولاً (الأقرب موعداً أولاً).
+        prepare.sort(key=lambda entry: entry[2])
+        report["prepared"] = 0
+        for schedule_id, _schedule, _at in prepare[:MAX_PUBLISH_PER_RUN]:
+            clean_id = _safe_id(schedule_id)
+            if not clean_id:
+                continue
+            try:
+                if await self._prepare_container(db, clean_id) is None:
+                    report["prepared"] += 1
+            except Exception as exc:  # noqa: BLE001 - التجهيز ليس حرجاً
+                print(f"pigeon prepare {clean_id} failed: {exc}")
 
         # الأقدم أولاً، وبحد 3 في التشغيل الواحد حتى تبقى مدة cron قصيرة.
         due.sort(key=lambda entry: entry[2])
@@ -1202,6 +1228,42 @@ class Default(WorkerEntrypoint):
             report["results"].append(entry)
 
         return report
+
+    async def _prepare_container(self, db, schedule_id):
+        """ينشئ حاوية إنستغرام (media container) قبل الموعد.
+
+        الحاوية تنزّل الفيديو من رابط `GET /media/<id>` وتصير FINISHED بعد
+        دقائق. بإنشائها مسبقاً يصبح النشر في دقيقة الموعد مجرد `media_publish`
+        يأخذ ثوانٍ، فلا يظهر الريل بعد الوقت المعروض في التطبيق.
+        يرجّع None عند النجاح أو رسالة الخطأ.
+        """
+        token = _ig_token(self.env)
+        if not token:
+            return "IG_ACCESS_TOKEN is not configured"
+
+        if await _object_exists(self.env, self._key(schedule_id)) is not True:
+            return "the reel is not archived yet"
+
+        media_url = f"{_ig_public_base(self.env)}/media/{schedule_id}"
+        try:
+            container_id = await _ig_create_container(
+                _ig_user(self.env), token, media_url, ""
+            )
+        except Exception as exc:  # noqa: BLE001 - نعيد المحاولة في cron القادم
+            return _describe(exc)[:300]
+
+        moment = int(time.time() * 1000)
+        await _firebase_patch(
+            db,
+            f"schedules/{schedule_id}.json",
+            {
+                "containerId": container_id,
+                "preparedAt": moment,
+                "attempts": 0,
+                "updatedAt": moment,
+            },
+        )
+        return None
 
     async def _publish_one(self, db, schedule_id, schedule, now):
         path = f"schedules/{schedule_id}.json"
@@ -1261,7 +1323,11 @@ class Default(WorkerEntrypoint):
             )
             return "failed", error
 
-        if state == "scheduled":
+        # الحاوية قد تكون مُجهّزة مسبقاً (أُنشئت قبل الموعد): حينها لا ننشئها من
+        # جديد، بل نفحص حالتها وننشر فوراً في دقيقة الموعد.
+        container_id = _clean(schedule.get("containerId"))
+
+        if state == "scheduled" and not container_id:
             # لازم يكون الملف في R2 قبل ما تعطيه Meta رابطاً عاماً.
             # لو تعذّر الفحص (None) نكمل: Meta هي التي تنزّل الرابط، وفشلها
             # يظهر كخطأ حاوية واضح بدل أن يبقى الموعد معلقاً للأبد.
@@ -1324,8 +1390,19 @@ class Default(WorkerEntrypoint):
             )
             return "creating", None
 
-        if state == "creating":
-            container_id = _clean(schedule.get("containerId"))
+        if state in ("scheduled", "creating"):
+            if state == "scheduled":
+                # حان الموعد والحاوية مُجهّزة: نبدأ الفحص والنشر في هذا التشغيل.
+                await _firebase_patch(
+                    db,
+                    path,
+                    {
+                        "state": "creating",
+                        "attempts": 0,
+                        "error": None,
+                        "updatedAt": now,
+                    },
+                )
             if not container_id:
                 error = "the Instagram container id is missing"
                 await _firebase_patch(

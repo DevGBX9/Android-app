@@ -78,12 +78,10 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
         viewModelScope.launch {
             while (isActive) {
                 val processing = items.value.any { it.isProcessing }
-                if (processing) {
-                    repository.syncFromRemote()
-                    delay(1_500)
-                } else {
-                    delay(8_000)
-                }
+                // نزامن دائماً: الريل المنشور يختفي من القائمة والقاعدة بلا حاجة
+                // لإغلاق التطبيق وفتحه من جديد.
+                repository.syncFromRemote()
+                delay(if (processing) 1_500 else 15_000)
             }
         }
     }

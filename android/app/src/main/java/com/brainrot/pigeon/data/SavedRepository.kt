@@ -60,7 +60,8 @@ class SavedRepository(
         if (item.url != null) {
             scope.launch {
                 register(item)
-                item.schedule?.let { remote.uploadSchedule(item.id, it) }
+                //موعد مضى لا يُرفع أبداً: لو رُفع لعاد الـWorker ونشره مرة ثانية.
+                item.schedule?.future()?.let { remote.uploadSchedule(item.id, it) }
             }
         }
     }
@@ -162,7 +163,8 @@ class SavedRepository(
 
         pending.forEach { item ->
             register(item)
-            item.schedule?.let { remote.uploadSchedule(item.id, it) }
+            // لا نرفع موعداً مضى: إعادة رفعه بعد الحذف تجعل الـWorker ينشر الريل ثانية.
+            item.schedule?.future()?.let { remote.uploadSchedule(item.id, it) }
         }
         toArchive.forEach { item ->
             scope.launch { archive.request(item, tiktok.resolve(item.url)) }
@@ -175,6 +177,10 @@ class SavedRepository(
         }
         return Result.success(Unit)
     }
+
+    /** الموعد نفسه إن كان ما زال مستقبلاً، وإلا null. */
+    private fun PublishSchedule.future(): PublishSchedule? =
+        takeIf { at > System.currentTimeMillis() + 60_000L }
 
     /**
      * يضمن أن الريل مؤرشف في R2 ثم ينزّله إلى Downloads على الجهاز.

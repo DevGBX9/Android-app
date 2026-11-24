@@ -25,9 +25,6 @@ class MainActivity : ComponentActivity() {
         requestedTab = tabFromIntent(intent) ?: AppTab.PROFILE
         val container = (application as PigeonApp).container
 
-        // مع كل فتح للتطبيق: نسحب قائمة الريلز من Firebase ونعرضها.
-        lifecycleScope.launch { container.saved.syncFromRemote() }
-
         setContent {
             PigeonTheme {
                 PigeonRoot(
@@ -35,6 +32,15 @@ class MainActivity : ComponentActivity() {
                     requestedTab = requestedTab,
                 )
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // مع كل عودة للتطبيق (لا مع أول إنشاء فقط): نسحب القائمة من Firebase،
+        // فيختفي الريل الذي نُشر على إنستغرام من الواجهة ومن القاعدة معاً.
+        lifecycleScope.launch {
+            (application as PigeonApp).container.saved.syncFromRemote()
         }
     }
 
