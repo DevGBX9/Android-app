@@ -197,7 +197,10 @@ async def _firebase_get(base, path):
 
 
 async def _resolve_media_url(code):
-    """يجيب رابط الفيديو الأصلي من صفحة embed العامة (بدون تسجيل دخول)."""
+    """يجيب رابط الفيديو الأصلي من صفحة embed العامة (بدون تسجيل دخول).
+
+    يرجّع `(url, attempts)`: الرابط إن وُجد، ووصف قصير لما أعادته إنستغرام.
+    """
     pages = (
         f"https://www.instagram.com/reel/{code}/embed/captioned/",
         f"https://www.instagram.com/p/{code}/embed/captioned/",
@@ -208,11 +211,20 @@ async def _resolve_media_url(code):
         "accept-language": "en-US,en;q=0.9",
     }
 
+    attempts = []
+
     for page in pages:
-        response = await fetch(page, headers=headers, redirect="follow")
-        if int(response.status) != 200:
+        try:
+            response = await fetch(page, headers=headers, redirect="follow")
+        except Exception as exc:  # noqa: BLE001
+            attempts.append(f"embed -> {str(exc)[:80]}")
+            continue
+        status = int(response.status)
+        if status != 200:
+            attempts.append(f"embed -> HTTP {status}")
             continue
         html = await response.text()
+        found = False
         for pattern in VIDEO_URL_PATTERNS:
             match = pattern.search(html)
             if not match:
@@ -220,9 +232,15 @@ async def _resolve_media_url(code):
             candidate = _unescape_media(match.group(1))
             host = (urlparse(candidate).hostname or "").lower()
             if _is_media_host(host):
-                return candidate
+                return candidate, attempts
+            found = True
+        attempts.append(
+            f"embed -> HTTP 200, no media url (len {len(html)}, video tag: {'<video' in html})"
+            if not found
+            else "embed -> HTTP 200, media url on a foreign host"
+        )
 
-    return None
+    return None, attempts
 
 
 async def _media_size(media_url):
@@ -455,9 +473,11 @@ class Default(WorkerEntrypoint):
         try:
             await report("downloading", 3)
 
-            media_url = await _resolve_media_url(code)
+            media_url, attempts = await _resolve_media_url(code)
             if not media_url:
-                raise RuntimeError("could not resolve the reel video url")
+                raise RuntimeError(
+                    "could not resolve the reel video url: " + " | ".join(attempts)
+                )
 
             await report("downloading", 6)
 
