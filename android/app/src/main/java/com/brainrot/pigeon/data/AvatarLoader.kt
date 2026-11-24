@@ -24,10 +24,15 @@ class AvatarLoader(private val client: OkHttpClient, cacheSize: Int = 12) {
     fun cacheKey(url: String): String =
         runCatching { Uri.parse(url).path }.getOrNull() ?: url
 
-    suspend fun load(url: String): ImageBitmap? = withContext(Dispatchers.IO) {
+    /**
+     * [targetSize] هو أكبر بعد مطلوب بالبكسل؛ تُفكّ الصورة بحجم مصغّر يناسبه
+     * (مثل خانات الشبكة) حتى ما نحمّل صورة كبيرة ونصغّرها كل مرة — أخف على
+     * الذاكرة وأسلس عند السحب. القيمة 0 تعني الحجم الكامل.
+     */
+    suspend fun load(url: String, targetSize: Int = 0): ImageBitmap? = withContext(Dispatchers.IO) {
         if (url.isBlank()) return@withContext null
 
-        val key = cacheKey(url)
+        val key = if (targetSize > 0) "${cacheKey(url)}@$targetSize" else cacheKey(url)
         cache.get(key)?.let { return@withContext it }
 
         runCatching {
@@ -39,10 +44,29 @@ class AvatarLoader(private val client: OkHttpClient, cacheSize: Int = 12) {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
                 val bytes = response.body?.bytes() ?: throw IOException("empty body")
-                val bitmap: Bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                val sample = sampleSize(bytes, targetSize)
+                val options = BitmapFactory.Options().apply {
+                    inSampleSize = sample
+                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                }
+                val bitmap: Bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
                     ?: throw IOException("decode failed")
                 bitmap.asImageBitmap().also { cache.put(key, it) }
             }
         }.getOrNull()
+    }
+
+    /** أكبر inSampleSize يجعل أكبر بعد في الصورة <= [targetSize]. */
+    private fun sampleSize(bytes: ByteArray, targetSize: Int): Int {
+        if (targetSize <= 0) return 1
+
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        val longest = maxOf(bounds.outWidth, bounds.outHeight)
+        if (longest <= 0) return 1
+
+        var sample = 1
+        while (longest / (sample * 2) >= targetSize) sample *= 2
+        return sample
     }
 }

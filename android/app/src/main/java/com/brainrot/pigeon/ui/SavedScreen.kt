@@ -110,7 +110,7 @@ fun ReelsRoute(container: AppContainer) {
                 horizontalArrangement = Arrangement.spacedBy(2.dp),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
-                items(items, key = { it.id }) { item ->
+                items(items, key = { it.id }, contentType = { "reel" }) { item ->
                     ReelCell(
                         item = item,
                         images = images,
@@ -152,13 +152,14 @@ private fun ReelCell(
     val thumbnail by produceState<ImageBitmap?>(initialValue = null, item.thumbnail) {
         value = item.thumbnail
             ?.takeIf { it.isNotBlank() }
-            ?.let { url -> images.load(url) }
+            ?.let { url -> images.load(url, targetSize = 360) }
     }
 
     val bitmap = thumbnail
 
     Box(
         modifier = Modifier
+            .fillMaxWidth()
             .aspectRatio(REEL_ASPECT)
             .clip(RoundedCornerShape(4.dp))
             .background(Brush.linearGradient(listOf(CellTop, CellBottom)))

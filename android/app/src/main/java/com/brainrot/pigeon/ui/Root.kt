@@ -1,9 +1,13 @@
 package com.brainrot.pigeon.ui
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.PagerSnapDistance
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.pager.PagerDefaults
 import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.runtime.Composable
@@ -24,9 +28,15 @@ private const val GRID_PAGE = 1
 private const val PAGE_COUNT = 2
 
 /**
- * Two vertical pages: the profile above and the scheduled reels grid below.
- * Swiping up lifts the profile out with an animation and leaves the grid;
- * swiping the grid down (or back) brings the profile back.
+ * صفحتان عموديتان: الحساب فوق وشبكة الريلز تحت. السحب للأعلى يرفع الحساب
+ * وينزل الشبكة، والسحب للأسفل (أو زر الرجوع) يرجّع الحساب.
+ *
+ * نعتمد على ثلاثة أشياء ليبقى السحب ناعماً:
+ *  - الصفحتان تُجهَّزان مسبقاً (`beyondViewportPageCount = 1`) فما يصير بناء
+ *    الشبكة وسط الإصبع (وهذا كان سبب التقطيع).
+ *  - سلوك سحب/إفلات واحد بحركة tween ثابتة بدل النابض، وعتبة تبديل منخفضة،
+ *    فما يرجّع الصفحة للوراء بشكل غريب.
+ *  - تحديث الحساب الدوري يتوقف والشبكة ظاهرة، ما في إعادة رسم فوق السحب.
  */
 @Composable
 fun PigeonRoot(
@@ -41,7 +51,7 @@ fun PigeonRoot(
 
     LaunchedEffect(requestedTab) {
         val target = if (requestedTab == AppTab.SAVED) GRID_PAGE else PROFILE_PAGE
-        if (pagerState.currentPage != target) pagerState.animateScrollToPage(target)
+        if (pagerState.settledPage != target) pagerState.animateScrollToPage(target)
     }
 
     BackHandler(enabled = pagerState.currentPage != PROFILE_PAGE) {
@@ -56,10 +66,23 @@ fun PigeonRoot(
         VerticalPager(
             state = pagerState,
             modifier = Modifier.fillMaxSize(),
+            beyondViewportPageCount = 1,
+            flingBehavior = PagerDefaults.flingBehavior(
+                state = pagerState,
+                pagerSnapDistance = PagerSnapDistance.atMost(1),
+                snapPositionalThreshold = 0.16f,
+                snapAnimationSpec = tween(
+                    durationMillis = 280,
+                    easing = FastOutSlowInEasing,
+                ),
+            ),
         ) { page ->
             when (page) {
                 GRID_PAGE -> ReelsRoute(container)
-                else -> ProfileRoute(container)
+                else -> ProfileRoute(
+                    container = container,
+                    active = pagerState.settledPage == PROFILE_PAGE,
+                )
             }
         }
     }

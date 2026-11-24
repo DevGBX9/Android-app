@@ -92,6 +92,20 @@ class ProfileViewModel(
         }
     }
 
+    /**
+     * يوقف/يشغّل التحديث الدوري: يتوقف أثناء عرض شبكة الريلز حتى تبقى الصفحات
+     * ناعمة، ويحدّث فوراً عند الرجوع لصفحة الحساب.
+     */
+    fun setPollingEnabled(enabled: Boolean) {
+        if (enabled) {
+            startPolling()
+            viewModelScope.launch { repository.refresh(minGapMs = FOREGROUND_MIN_GAP_MS) }
+        } else {
+            pollJob?.cancel()
+            pollJob = null
+        }
+    }
+
     /** تحديث فوري عند رجوع التطبيق للواجهة (فاصل ثانية واحدة فقط لمنع التكرار). */
     fun onForeground() {
         // نعيد تفعيل الطلبات عند كل عودة للتطبيق حتى لو رفض Graph التوكن سابقاً.

@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -30,8 +31,15 @@ import com.brainrot.pigeon.ui.components.ProfileCard
 import com.brainrot.pigeon.ui.theme.TextMuted
 import com.brainrot.pigeon.ui.util.openExternal
 
+/**
+ * [active] يكون false والشبكة ظاهرة: نتوقف عن التحديث الدوري حتى ما تصير
+ * إعادة رسم وأنيميشن العدادات فوق سحب الصفحات.
+ */
 @Composable
-fun ProfileRoute(container: AppContainer) {
+fun ProfileRoute(
+    container: AppContainer,
+    active: Boolean = true,
+) {
     val viewModel: ProfileViewModel = viewModel(
         factory = viewModelFactory {
             initializer {
@@ -49,6 +57,8 @@ fun ProfileRoute(container: AppContainer) {
     val loading = profile.fetchedAt == 0L && error == null
 
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { viewModel.onForeground() }
+
+    LaunchedEffect(active) { viewModel.setPollingEnabled(active) }
 
     Box(
         modifier = Modifier
