@@ -274,9 +274,9 @@ class ReelArchive(
                             ?: "server HTTP ${response.code}",
                     )
                 }
-                reply?.error?.takeIf { it.isNotBlank() && reply.ok.not() }?.let { reason ->
-                    throw IOException(reason)
-                }
+                // ردّ غير ناجح مع سبب واضح (مثلاً ريل آخر يُنشر الآن).
+                val problem = reply?.takeIf { !it.ok }?.error?.takeIf { it.isNotBlank() }
+                if (problem != null) throw IOException(problem)
             }
         }
     }
