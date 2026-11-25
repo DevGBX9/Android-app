@@ -1076,7 +1076,7 @@ class Default(WorkerEntrypoint):
                 {
                     "ok": True,
                     "service": "pigeon-reels",
-                    "version": 11,
+                    "version": 12,
                     "routes": [
                         "POST /reels",
                         "GET /reels/<id>",
@@ -2166,7 +2166,7 @@ class Default(WorkerEntrypoint):
             )
             if published_id:
                 await self._enter_verifying(
-                    db, path, published_id, moment, stage_at
+                    db, path, published_id, moment, stage_at, "scan"
                 )
                 # نُكمل السلسلة في نفس التشغيل: تأكيد ثم تنظيف بعد 5 ثوانٍ.
                 return await self._stage_verify(db, schedule_id)
@@ -2249,14 +2249,19 @@ class Default(WorkerEntrypoint):
         except Exception as exc:  # noqa: BLE001 - قد يكون النشر نجح والرد ضاع
             error = _describe(exc)[:300]
 
+        # رد media_publish الناجح نفسه دليل النشر؛ البحث في الحساب احتياط فقط.
+        source = "api"
         if not media_id:
+            source = "scan"
             media_id = await _ig_published_media(
                 user_id, token, started - 180_000
             )
 
         moment = int(time.time() * 1000)
         if media_id:
-            await self._enter_verifying(db, path, media_id, moment, started)
+            await self._enter_verifying(
+                db, path, media_id, moment, started, source
+            )
             # التأكيد والتنظيف في نفس التشغيل حتى تُحذف المخلفات بعد 5 ثوانٍ
             # من نجاح النشر، لا مع cron لاحق.
             return await self._stage_verify(db, schedule_id)
@@ -2271,8 +2276,15 @@ class Default(WorkerEntrypoint):
         await _firebase_patch(db, path, payload)
         return _clean(payload.get("state"), state), error
 
-    async def _enter_verifying(self, db, path, media_id, moment, published_at):
-        """ينقل السجل من publishing إلى verifying مع موعد التنظيف (بعد 5 ثوانٍ)."""
+    async def _enter_verifying(
+        self, db, path, media_id, moment, published_at, source="api"
+    ):
+        """ينقل السجل من publishing إلى verifying مع موعد التنظيف (بعد 5 ثوانٍ).
+
+        [source] مصدر معرّف المنشور: `api` من رد media_publish نفسه، أو `scan`
+        من البحث في منشورات الحساب. الأول دليل نشر قاطع، فلا يتوقف التنظيف لو
+        تعذّرت قراءة المنشور بعد ذلك.
+        """
         if published_at <= 0 or published_at > moment:
             published_at = moment
         await _firebase_patch(
@@ -2283,6 +2295,7 @@ class Default(WorkerEntrypoint):
                 "mediaId": media_id,
                 "publishedAt": published_at,
                 "cleanupAt": published_at + CLEANUP_DELAY_MS,
+                "publishSource": source,
                 "attempts": 0,
                 "error": None,
                 "stageAt": moment,
@@ -2315,9 +2328,8 @@ class Default(WorkerEntrypoint):
             )
             return STAGE_UNVERIFIED, error
 
-        confirmed = await _ig_media_exists(
-            _ig_user(self.env), token, media_id
-        )
+        confirmed = await self._published_confirmed(current, media_id, token)
+
         if confirmed is True:
             if not await self._claim(
                 db, path, etag, current, STAGE_CLEANING, {"error": None, "attempts": 0}
@@ -2358,6 +2370,31 @@ class Default(WorkerEntrypoint):
         )
         return state, error
 
+    async def _published_confirmed(self, schedule, media_id, token):
+        """هل النشر مؤكد بما يكفي لحذف ملف R2؟
+
+        الفحص المباشر لمنشور واحد أولاً. لو قال Graph إن المنشور غير موجود فلا
+        نحذف شيئاً. أما إذا كان معرّف المنشور نفسه من رد `media_publish` الناجح
+        (`publishSource=api`) أو كان النشر يدوياً من المالك، فذلك دليل نشر قاطع
+        حتى لو تعذّرت قراءة المنشور بعد النشر — وإلا بقي السجل عالقاً في
+        `cleaning` وبقي الفيديو في R2 وسجلاته في Firebase إلى الأبد.
+        """
+        if not media_id:
+            return False
+
+        if token:
+            confirmed = await _ig_media_exists(_ig_user(self.env), token, media_id)
+            if confirmed is True:
+                return True
+            proof = (
+                _clean(schedule.get("publishSource")) == "api"
+                or _truthy(schedule.get("manualPublish"))
+            )
+            if confirmed is False and not proof:
+                return False
+
+        return _int_of(schedule, "publishedAt") > 0
+
     async def _stage_clean(self, db, schedule_id):
         """الخطوة 4: حذف الملف من R2 ثم كل معلومات الريل من Firebase.
 
@@ -2397,7 +2434,7 @@ class Default(WorkerEntrypoint):
             )
             return STAGE_UNVERIFIED, error
 
-        confirmed = await _ig_media_exists(_ig_user(self.env), token, media_id)
+        confirmed = await self._published_confirmed(current, media_id, token)
         moment = int(time.time() * 1000)
         if confirmed is not True:
             attempts = _int_of(current, "attempts") + 1

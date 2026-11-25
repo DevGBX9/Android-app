@@ -267,9 +267,13 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
         _publishingIds.update { it + item.id }
 
         viewModelScope.launch {
-            repository.publishNow(item).onFailure { error ->
-                _scheduleError.value = error.message ?: "could not publish now"
-            }
+            repository.publishNow(item)
+                // الخادم أكّد النشر: الريل يخرج من الشبكة الآن مع علامة صح،
+                // بدل بقائه "publishing" إلى أن ينتهي الخادم من التنظيف.
+                .onSuccess { repository.markPublished(item) }
+                .onFailure { error ->
+                    _scheduleError.value = error.message ?: "could not publish now"
+                }
             _publishingIds.update { it - item.id }
             // الحالة بعد الطلب تأتي من الخادم، لا من التطبيق.
             refreshSchedules()

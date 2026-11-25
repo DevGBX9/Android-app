@@ -55,6 +55,15 @@ class SavedRepository(
     // مزامنة واحدة في المرة: البث الحيّ ودورة التحديث قد يتقاطعان بلا داعٍ.
     private val syncLock = Mutex()
 
+    /**
+     * ريلز نُشرت فعلاً وتجب ألا تعود للشبكة، حتى لو تأخر الخادم في مسح سجلها.
+     * مصدرها ردّ `publish-now` أو سجل الخادم بعد النشر.
+     */
+    private val finishedIds = mutableSetOf<String>()
+
+    /** معرّفات ظهرت لها علامة النشر مرة واحدة: لا نعيد الأنيميشن كل مزامنة. */
+    private val exitedIds = mutableSetOf<String>()
+
     private val _publishedExits = MutableSharedFlow<SavedItem>(extraBufferCapacity = 16)
 
     /**
@@ -145,6 +154,23 @@ class SavedRepository(
     suspend fun publishNow(item: SavedItem): Result<Unit> = archive.publishNow(item.id)
 
     /**
+     * بعد رد الخادم بأن النشر نجح: الريل يخرج فوراً من الشبكة ومن التخزين
+     * المحلي، مع علامة صح واحدة، ولا يعود إليها بعد إعادة المزامنة.
+     */
+    suspend fun markPublished(item: SavedItem) = syncLock.withLock {
+        finishedIds += item.id
+        val moment = System.currentTimeMillis()
+        val schedule = (item.schedule ?: PublishSchedule()).copy(
+            state = ScheduleSlots.STATE_PUBLISHED,
+            publishedAt = item.schedule?.publishedAt?.takeIf { it > 0L } ?: moment,
+        )
+        if (exitedIds.add(item.id)) {
+            _publishedExits.tryEmit(item.copy(schedule = schedule))
+        }
+        delete(item.id)
+    }
+
+    /**
      * ترتيب الشبكة: الخادم يعيد توزيع المواعيد نفسها على الريلز حسب ترتيب
      * [ids]، ثم نحفظ المواعيد التي أكدها محلياً حتى لا تختلف بعد إغلاق التطبيق.
      */
@@ -231,19 +257,23 @@ class SavedRepository(
                 if (item.schedule?.isPublished == true) add(item.id)
             }
         }
-        // الإبلاغ قبل الكتابة: الشبكة تعلّم الخانة أولاً ثم يصلها الحذف.
+        // المنشور يخرج نهائياً: ما رآه الخادم منشوراً، وما أكّده رد النشر هنا.
+        val doneIds = publishedIds + finishedIds
+
+        // الإبلاغ مرة واحدة لكل ريل قبل الكتابة: الشبكة تعلّم الخانة ثم يصلها
+        // الحذف، ولا يتكرر الأنيميشن مع كل لقطة من الخادم.
         localBefore.forEach { item ->
-            if (item.id in publishedIds) {
+            if (item.id in doneIds && exitedIds.add(item.id)) {
                 _publishedExits.tryEmit(
                     item.copy(schedule = remoteSchedules[item.id] ?: item.schedule),
                 )
             }
         }
 
-        val liveRemote = remoteItems.filterNot { it.id in publishedIds }
+        val liveRemote = remoteItems.filterNot { it.id in doneIds }
 
         context.savedStore.edit { prefs ->
-            val local = decode(prefs[SAVED_ITEMS_KEY]).filterNot { it.id in publishedIds }
+            val local = decode(prefs[SAVED_ITEMS_KEY]).filterNot { it.id in doneIds }
             val localById = local.associateBy { it.id }
             // فقط ما فشل رفعه يُعاد رفعه: السجل الذي رُفع ثم اختفى من الخادم
             // حُذف هناك (بعد النشر أو يدوياً) ولا يجوز أن يعود للحياة.
@@ -256,6 +286,7 @@ class SavedRepository(
                 merged[item.id] = item.copy(registered = true, schedule = schedule)
             }
             local.forEach { item ->
+                if (item.id in doneIds) return@forEach
                 // مسجّل في الخادم ثم غاب منه = حُذف بعد النشر: يُمحى من الجهاز.
                 if (item.registered && item.id !in remoteIds) return@forEach
                 val existing = merged[item.id]

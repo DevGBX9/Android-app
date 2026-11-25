@@ -31,11 +31,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
@@ -82,10 +84,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
@@ -107,6 +109,7 @@ import com.brainrot.pigeon.ui.util.openExternal
 import com.brainrot.pigeon.ui.util.toast
 import kotlinx.coroutines.delay
 import kotlin.math.floor
+import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
@@ -211,9 +214,14 @@ fun ReelsRoute(container: AppContainer) {
         HorizontalDivider(color = Outline, thickness = 1.dp)
 
         // الانتقال بين "شارك أول ريل" والشبكة يصير بتلاشي ناعم بدل قفزة.
+        Box(
+            Modifier
+                .weight(1f)
+                .navigationBarsPadding(),
+        ) {
         Crossfade(
             targetState = items.isEmpty(),
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.fillMaxSize(),
             animationSpec = tween(durationMillis = 260, easing = FastOutSlowInEasing),
             label = "reels-content",
         ) { empty ->
@@ -223,9 +231,7 @@ fun ReelsRoute(container: AppContainer) {
                 LazyVerticalGrid(
                     state = gridState,
                     columns = GridCells.Fixed(GRID_COLUMNS),
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .navigationBarsPadding(),
+                    modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(2.dp),
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
@@ -236,11 +242,9 @@ fun ReelsRoute(container: AppContainer) {
                         contentType = { _, _ -> "reel" },
                     ) { _, item ->
                         ReelCell(
-                            // ظهور الخانة الجديدة وانزلاق الباقي عند الحذف، والريل
-                            // المسحوب يطلع فوق البقية أثناء تحريكه.
-                            modifier = Modifier
-                                .animateItem()
-                                .zIndex(if (drag?.id == item.id) 1f else 0f),
+                            // ظهور الخانة الجديدة وانزلاق الباقي عند الحذف. الريل
+                            // المسحوب يبقى شفافاً هنا وتُعرض نسخته فوق الشبكة.
+                            modifier = Modifier.animateItem(),
                             item = item,
                             clock = clock,
                             // بقية الشبكة تبهت والخانة المفتوحة إعداداتها تبرز.
@@ -251,6 +255,7 @@ fun ReelsRoute(container: AppContainer) {
                             exit = exits[item.id],
                             dragging = drag?.id == item.id,
                             dragOffset = drag?.takeIf { it.id == item.id }?.offset ?: Offset.Zero,
+                            hidden = drag?.id == item.id,
                             onDragStart = { cell ->
                                 drag = ReelDrag(item.id, shown, Offset.Zero, cell)
                             },
@@ -278,6 +283,18 @@ fun ReelsRoute(container: AppContainer) {
                     }
                 }
             }
+        }
+
+            // الريل المسحوب فوق كل الخانات: طبقة خارج الشبكة، لأن zIndex داخل
+            // LazyVerticalGrid لا يتجاوز صفّه.
+            DragPreview(
+                drag = drag,
+                grid = gridState,
+                shown = shown,
+                clock = clock,
+                images = images,
+                downloads = downloads,
+            )
         }
     }
 
@@ -535,6 +552,10 @@ private fun ReelCell(
     exit: ReelExitKind?,
     dragging: Boolean,
     dragOffset: Offset,
+    // الخانة الأصلية للريل المسحوب: تبقى في مكانها وتستقبل الإصبع لكن بلا رسم.
+    hidden: Boolean = false,
+    // نسخة العرض في الطبقة العليا لا تتفاعل مع اللمس.
+    interactive: Boolean = true,
     onDragStart: (IntSize) -> Unit,
     onDrag: (Offset) -> Unit,
     onDragEnd: () -> Unit,
@@ -581,7 +602,7 @@ private fun ReelCell(
             .clip(RoundedCornerShape(6.dp))
             .background(Brush.linearGradient(listOf(CellTop, CellBottom)))
             .graphicsLayer(
-                alpha = dimAlpha,
+                alpha = if (hidden) 0f else dimAlpha,
                 translationX = dragOffset.x,
                 translationY = dragOffset.y,
                 scaleX = if (dragging) 1.06f else 1f,
@@ -595,8 +616,8 @@ private fun ReelCell(
                 },
             )
             // الضغط المطوّل بداية السحب: الحركة بعده تنقل الريل بين الخانات.
-            .pointerInput(item.id, item.schedule?.at, item.schedule?.state, exit) {
-                if (exit != null || !item.canDrag()) return@pointerInput
+            .pointerInput(item.id, item.schedule?.at, item.schedule?.state, exit, interactive) {
+                if (exit != null || !interactive || !item.canDrag()) return@pointerInput
                 detectDragGesturesAfterLongPress(
                     onDragStart = {
                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
@@ -610,7 +631,7 @@ private fun ReelCell(
                     onDragCancel = { onDragCancel() },
                 )
             }
-            .clickable(enabled = exit == null, onClick = onClick),
+            .clickable(enabled = exit == null && interactive, onClick = onClick),
     ) {
         if (bitmap != null) {
             // الغلاف خلفية باهتة: نخفض شفافيته ثم نعتّمه حتى يبرز التاريخ في وسطه.
@@ -826,11 +847,12 @@ private fun ScheduleStateLine(
 
     Text(
         text = when {
-            // النص يتبع حالة الخادم: لا "publishing" من تقدير التطبيق.
-            schedule.isPublishing -> stringResource(R.string.reel_countdown_now)
-
-            schedule.state == ScheduleSlots.STATE_PUBLISHED ->
+            // النص يتبع حالة الخادم: لا "publishing" من تقدير التطبيق. النشر
+            // المؤكد يظهر منشوراً حتى لو تأخر الخادم في تنظيف سجله.
+            schedule.state == ScheduleSlots.STATE_PUBLISHED || schedule.publishedAt > 0L ->
                 stringResource(R.string.schedule_published)
+
+            schedule.isPublishing -> stringResource(R.string.reel_countdown_now)
 
             schedule.state == ScheduleSlots.STATE_FAILED ||
                 schedule.state == ScheduleSlots.STATE_UNVERIFIED ->
@@ -1222,6 +1244,59 @@ fun DownloadGlyph(color: Color, modifier: Modifier = Modifier) {
             end = Offset(w * 0.86f, h * 0.92f),
             strokeWidth = stroke,
             cap = StrokeCap.Round,
+        )
+    }
+}
+
+/**
+ * الرسم العلوي للريل المسحوب: LazyVerticalGrid يلفّ كل صف داخل Row، وzIndex
+ * لا يعمل إلا بين أشقّاء النقطة نفسها، فتبقى الخانة تحت الصفوف التالية مهما
+ * رفعنا قيمته. هنا نعرض نسخة مطابقة فوق الشبكة كلها، والخانة الأصلية تبقى
+ * شفافة وتستقبل الإصبع فوراً بلا قطع للسحب.
+ */
+@Composable
+private fun DragPreview(
+    drag: ReelDrag?,
+    grid: LazyGridState,
+    shown: List<SavedItem>,
+    clock: StateFlow<Long>,
+    images: AvatarLoader,
+    downloads: Map<String, DownloadUi>,
+) {
+    val current = drag ?: return
+    val target = shown.firstOrNull { it.id == current.id } ?: return
+    // موقع الخانة في الشبكة يتبع تغيّر الترتيب، والإزاحة تحفظها تحت الإصبع.
+    val info = grid.layoutInfo.visibleItemsInfo
+        .firstOrNull { item -> item.key == current.id } ?: return
+    val width = with(LocalDensity.current) { info.size.width.toDp() }
+
+    Box(
+        modifier = Modifier
+            .offset {
+                IntOffset(
+                    info.offset.x + current.offset.x.roundToInt(),
+                    info.offset.y + current.offset.y.roundToInt(),
+                )
+            }
+            .width(width),
+    ) {
+        ReelCell(
+            item = target,
+            clock = clock,
+            dimmed = false,
+            focused = false,
+            images = images,
+            download = downloads[target.id],
+            exit = null,
+            dragging = true,
+            dragOffset = Offset.Zero,
+            interactive = false,
+            onDragStart = {},
+            onDrag = {},
+            onDragEnd = {},
+            onDragCancel = {},
+            onClick = {},
+            onOpenSettings = {},
         )
     }
 }
