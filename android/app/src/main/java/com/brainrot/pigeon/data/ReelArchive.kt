@@ -18,7 +18,6 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonArray
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -301,9 +300,9 @@ class ReelArchive(
                 if (!configured) throw IOException("the archive service is not configured")
                 if (ids.size < 2) return@runCatching emptyMap()
 
-                val payload = buildJsonObject {
-                    putJsonArray("ids") { ids.forEach { add(it) } }
-                }.toString().toRequestBody(ARCHIVE_MEDIA)
+                // قائمة المعرّفات تُرمَّز بمحرّك JSON نفسه، فلا حاجة لبناء عناصر يدوياً.
+                val payload = ("{\"ids\":" + json.encodeToString(ids) + "}")
+                    .toRequestBody(ARCHIVE_MEDIA)
 
                 val request = Request.Builder()
                     .url("$base/schedules/order")
