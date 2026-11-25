@@ -4,16 +4,24 @@ import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
-import androidx.compose.foundation.BorderStroke
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -21,21 +29,33 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DatePicker
+import androidx.compose.material3.DatePickerDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.SelectableDates
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TimePicker
+import androidx.compose.material3.rememberDatePickerState
+import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -52,7 +72,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.lifecycle.lifecycleScope
 import com.brainrot.pigeon.MainActivity
 import com.brainrot.pigeon.PigeonApp
@@ -65,15 +84,10 @@ import com.brainrot.pigeon.data.SchedulePolicy
 import com.brainrot.pigeon.data.ScheduleSlots
 import com.brainrot.pigeon.ui.AppTab
 import com.brainrot.pigeon.ui.ReelGlyph
-import com.brainrot.pigeon.ui.theme.Accent
-import com.brainrot.pigeon.ui.theme.Background
-import com.brainrot.pigeon.ui.theme.CardSurface
-import com.brainrot.pigeon.ui.theme.Outline
 import com.brainrot.pigeon.ui.theme.PigeonTheme
-import com.brainrot.pigeon.ui.theme.TextMuted
-import com.brainrot.pigeon.ui.theme.TextPrimary
+import java.time.Instant
 import java.time.LocalDate
-import java.util.Locale
+import java.time.ZoneOffset
 import kotlinx.coroutines.launch
 
 private val InstagramGradient = listOf(Color(0xFFF58529), Color(0xFFE1306C), Color(0xFF8134AF))
@@ -88,16 +102,22 @@ private sealed interface SharePhase {
 
 private enum class ScheduleStep { Auto, Time, Date }
 
+/** مفتاح المحتوى داخل النافذة: أي تغيير فيه يشغّل انتقالاً متحركاً. */
+private data class ScreenKey(val phase: SharePhase, val step: ScheduleStep)
+
 /**
  * شاشة شفافة فوق التطبيق الذي شارك الريل (إنستغرام مثلاً): تحضّر الريل أولاً،
  * تعرض خطوة اختيار وقت النشر ثم التاريخ (أول ريل فقط)، وبعد التأكيد تحفظه
  * وترفع موعده إلى Firebase لينشره Cloudflare في وقته.
+ *
+ * واجهة الجدولة بستايل Material You: منتقي وقت دائري (TimePicker) وتقويم
+ * (DatePicker) من Material 3، مع انتقالات منزلقة بين الخطوات.
  */
 class ShareReceiverActivity : ComponentActivity() {
 
     private var phase by mutableStateOf<SharePhase>(SharePhase.Working)
     private var plan by mutableStateOf<SchedulePlan?>(null)
-    private var step by mutableStateOf(ScheduleStep.Time)
+    private var step by mutableStateOf(ScheduleStep.Auto)
     private var hour by mutableStateOf(ScheduleSlots.PUBLISH_HOUR)
     private var minute by mutableStateOf(ScheduleSlots.PUBLISH_MINUTE)
     private var date by mutableStateOf<LocalDate?>(null)
@@ -263,11 +283,12 @@ private fun ShareOverlay(
     LaunchedEffect(Unit) { entered = true }
 
     val busy = phase == SharePhase.Working || phase == SharePhase.Saving
+    val scheme = MaterialTheme.colorScheme
 
-    Box(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.45f))
+            .background(Color.Black.copy(alpha = 0.56f))
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -276,18 +297,23 @@ private fun ShareOverlay(
             ),
         contentAlignment = Alignment.Center,
     ) {
+        val cardMaxHeight = maxHeight - 44.dp
+
         AnimatedVisibility(
             visible = entered,
-            enter = fadeIn(tween(170)) + scaleIn(tween(230), initialScale = 0.9f),
+            enter = fadeIn(tween(170)) +
+                scaleIn(tween(240, easing = FastOutSlowInEasing), initialScale = 0.9f),
         ) {
             Surface(
-                shape = RoundedCornerShape(24.dp),
-                color = CardSurface,
-                shadowElevation = 24.dp,
+                shape = RoundedCornerShape(28.dp),
+                color = scheme.surfaceContainerHigh,
+                contentColor = scheme.onSurface,
+                shadowElevation = 26.dp,
                 modifier = Modifier
-                    .padding(horizontal = 24.dp)
+                    .padding(horizontal = 14.dp)
                     .fillMaxWidth()
-                    .widthIn(max = 360.dp)
+                    .widthIn(max = 400.dp)
+                    .heightIn(max = cardMaxHeight)
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
@@ -298,78 +324,128 @@ private fun ShareOverlay(
                     modifier = Modifier
                         .fillMaxWidth()
                         .verticalScroll(rememberScrollState())
-                        .padding(22.dp),
+                        .padding(horizontal = 14.dp, vertical = 18.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(Brush.linearGradient(InstagramGradient)),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        ReelGlyph(color = Color.White, modifier = Modifier.size(22.dp))
+                    MarkBadge()
+
+                    if (phase == SharePhase.Scheduling) {
+                        Spacer(Modifier.height(10.dp))
+                        StepDots(
+                            index = when (step) {
+                                ScheduleStep.Auto -> 0
+                                ScheduleStep.Time -> 0
+                                ScheduleStep.Date -> 1
+                            },
+                            count = 2,
+                        )
                     }
 
                     Spacer(Modifier.height(14.dp))
 
-                    when (phase) {
-                        SharePhase.Working -> BusyContent(stringResource(R.string.share_dialog_saving))
-                        SharePhase.Saving -> BusyContent(stringResource(R.string.schedule_saving))
-                        SharePhase.Empty -> EmptyContent(onClose)
-                        is SharePhase.Added -> AddedContent(phase.detail, onView, onClose)
-                        SharePhase.Scheduling -> {
-                            when (val current = plan) {
-                                null -> BusyContent(stringResource(R.string.share_dialog_saving))
-                                SchedulePlan.Manual -> when (step) {
-                                    ScheduleStep.Auto, ScheduleStep.Time -> TimeStep(
-                                        hour = hour,
-                                        minute = minute,
-                                        cancelLabel = stringResource(R.string.action_close),
-                                        onHour = onHour,
-                                        onMinute = onMinute,
-                                        onCancel = onCancel,
-                                        onNext = onNext,
-                                    )
+                    AnimatedContent(
+                        targetState = ScreenKey(phase, step),
+                        transitionSpec = {
+                            val bothScheduling = initialState.phase is SharePhase.Scheduling &&
+                                targetState.phase is SharePhase.Scheduling
+                            if (bothScheduling) {
+                                val forward = targetState.step.ordinal > initialState.step.ordinal
+                                (
+                                    slideInHorizontally(
+                                        animationSpec = tween(280, easing = FastOutSlowInEasing),
+                                        initialOffsetX = { width -> if (forward) width / 2 else -width / 2 },
+                                    ) + fadeIn(tween(200))
+                                    ).togetherWith(
+                                    slideOutHorizontally(
+                                        animationSpec = tween(220, easing = FastOutSlowInEasing),
+                                        targetOffsetX = { width -> if (forward) -width / 2 else width / 2 },
+                                    ) + fadeOut(tween(130)),
+                                )
+                            } else {
+                                fadeIn(tween(200, easing = FastOutSlowInEasing)) togetherWith
+                                    fadeOut(tween(120))
+                            }
+                        }.using(
+                            SizeTransform(
+                                clip = false,
+                                sizeAnimationSpec = { _, _ ->
+                                    tween(300, easing = FastOutSlowInEasing)
+                                },
+                            ),
+                        ),
+                        contentAlignment = Alignment.TopCenter,
+                        label = "share-content",
+                    ) { key ->
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            when (val current = key.phase) {
+                                SharePhase.Working ->
+                                    BusyContent(stringResource(R.string.share_dialog_saving))
 
-                                    ScheduleStep.Date -> DateStep(
-                                        hour = hour,
-                                        minute = minute,
-                                        date = date,
-                                        auto = null,
-                                        onDate = onDate,
-                                        onBack = onBack,
-                                        onConfirm = onConfirm,
-                                    )
-                                }
+                                SharePhase.Saving ->
+                                    BusyContent(stringResource(R.string.schedule_saving))
 
-                                is SchedulePlan.Auto -> when (step) {
-                                    ScheduleStep.Auto -> AutoStep(
-                                        at = current.at,
-                                        onCancel = onCancel,
-                                        onEdit = onEdit,
-                                        onConfirm = onConfirm,
-                                    )
+                                SharePhase.Empty -> EmptyContent(onClose)
 
-                                    ScheduleStep.Time -> TimeStep(
-                                        hour = hour,
-                                        minute = minute,
-                                        cancelLabel = stringResource(R.string.schedule_back),
-                                        onHour = onHour,
-                                        onMinute = onMinute,
-                                        onCancel = onReset,
-                                        onNext = onNext,
-                                    )
+                                is SharePhase.Added -> AddedContent(current.detail, onView, onClose)
 
-                                    ScheduleStep.Date -> DateStep(
-                                        hour = hour,
-                                        minute = minute,
-                                        date = date,
-                                        auto = current.at,
-                                        onDate = onDate,
-                                        onBack = onBack,
-                                        onConfirm = onConfirm,
-                                    )
+                                SharePhase.Scheduling -> {
+                                    when (val schedule = plan) {
+                                        null -> BusyContent(stringResource(R.string.share_dialog_saving))
+
+                                        SchedulePlan.Manual -> when (key.step) {
+                                            ScheduleStep.Auto, ScheduleStep.Time -> TimeStep(
+                                                hour = hour,
+                                                minute = minute,
+                                                cancelLabel = stringResource(R.string.action_close),
+                                                onHour = onHour,
+                                                onMinute = onMinute,
+                                                onCancel = onCancel,
+                                                onNext = onNext,
+                                            )
+
+                                            ScheduleStep.Date -> DateStep(
+                                                hour = hour,
+                                                minute = minute,
+                                                date = date,
+                                                auto = null,
+                                                onDate = onDate,
+                                                onBack = onBack,
+                                                onConfirm = onConfirm,
+                                            )
+                                        }
+
+                                        is SchedulePlan.Auto -> when (key.step) {
+                                            ScheduleStep.Auto -> AutoStep(
+                                                at = schedule.at,
+                                                onCancel = onCancel,
+                                                onEdit = onEdit,
+                                                onConfirm = onConfirm,
+                                            )
+
+                                            ScheduleStep.Time -> TimeStep(
+                                                hour = hour,
+                                                minute = minute,
+                                                cancelLabel = stringResource(R.string.schedule_back),
+                                                onHour = onHour,
+                                                onMinute = onMinute,
+                                                onCancel = onReset,
+                                                onNext = onNext,
+                                            )
+
+                                            ScheduleStep.Date -> DateStep(
+                                                hour = hour,
+                                                minute = minute,
+                                                date = date,
+                                                auto = schedule.at,
+                                                onDate = onDate,
+                                                onBack = onBack,
+                                                onConfirm = onConfirm,
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -380,48 +456,87 @@ private fun ShareOverlay(
     }
 }
 
+/** أيقونة التطبيق أعلى النافذة: دائرة بتدرّج إنستغرام. */
+@Composable
+private fun MarkBadge() {
+    Box(
+        modifier = Modifier
+            .size(46.dp)
+            .clip(CircleShape)
+            .background(Brush.linearGradient(InstagramGradient)),
+        contentAlignment = Alignment.Center,
+    ) {
+        ReelGlyph(color = Color.White, modifier = Modifier.size(21.dp))
+    }
+}
+
+/** مؤشر الخطوات: نقطتان تتوسّع النشِطة منهما بحركة نابضة. */
+@Composable
+private fun StepDots(index: Int, count: Int) {
+    val scheme = MaterialTheme.colorScheme
+    Row(
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        repeat(count) { position ->
+            val selected = position == index
+            val width by animateDpAsState(
+                targetValue = if (selected) 18.dp else 6.dp,
+                animationSpec = tween(240, easing = FastOutSlowInEasing),
+                label = "step-dot",
+            )
+            Box(
+                Modifier
+                    .width(width)
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(50))
+                    .background(if (selected) scheme.primary else scheme.outline),
+            )
+        }
+    }
+}
+
 @Composable
 private fun BusyContent(label: String) {
     CircularProgressIndicator(
-        modifier = Modifier.size(18.dp),
-        color = TextMuted,
+        modifier = Modifier.size(20.dp),
+        color = MaterialTheme.colorScheme.primary,
         strokeWidth = 2.dp,
     )
-    Spacer(Modifier.height(10.dp))
-    Text(text = label, color = TextMuted, fontSize = 13.sp)
+    Spacer(Modifier.height(12.dp))
+    Text(
+        text = label,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        style = MaterialTheme.typography.bodyMedium,
+    )
 }
 
 @Composable
 private fun EmptyContent(onClose: () -> Unit) {
     Text(
         text = stringResource(R.string.share_dialog_failed_title),
-        color = TextPrimary,
-        fontSize = 17.sp,
-        fontWeight = FontWeight.SemiBold,
+        color = MaterialTheme.colorScheme.onSurface,
+        style = MaterialTheme.typography.titleMedium,
     )
     Spacer(Modifier.height(7.dp))
     Text(
         text = stringResource(R.string.share_dialog_failed_body),
-        color = TextMuted,
-        fontSize = 13.sp,
-        lineHeight = 19.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        style = MaterialTheme.typography.bodySmall,
         textAlign = TextAlign.Center,
     )
     Spacer(Modifier.height(18.dp))
     OutlinedButton(
         onClick = onClose,
         shape = RoundedCornerShape(50),
-        border = BorderStroke(1.dp, Outline),
-        colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
         contentPadding = PaddingValues(0.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .height(42.dp),
+            .height(46.dp),
     ) {
         Text(
             text = stringResource(R.string.action_close),
-            fontSize = 13.sp,
-            fontWeight = FontWeight.SemiBold,
+            style = MaterialTheme.typography.labelLarge,
         )
     }
 }
@@ -430,16 +545,14 @@ private fun EmptyContent(onClose: () -> Unit) {
 private fun AddedContent(detail: String, onView: () -> Unit, onClose: () -> Unit) {
     Text(
         text = stringResource(R.string.share_dialog_title),
-        color = TextPrimary,
-        fontSize = 17.sp,
-        fontWeight = FontWeight.SemiBold,
+        color = MaterialTheme.colorScheme.onSurface,
+        style = MaterialTheme.typography.titleMedium,
     )
     Spacer(Modifier.height(6.dp))
     Text(
         text = detail,
-        color = TextMuted,
-        fontSize = 12.sp,
-        lineHeight = 17.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        style = MaterialTheme.typography.bodySmall,
         textAlign = TextAlign.Center,
         maxLines = 2,
         overflow = TextOverflow.Ellipsis,
@@ -452,41 +565,34 @@ private fun AddedContent(detail: String, onView: () -> Unit, onClose: () -> Unit
         Button(
             onClick = onView,
             shape = RoundedCornerShape(50),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = TextPrimary,
-                contentColor = Background,
-            ),
             contentPadding = PaddingValues(0.dp),
             modifier = Modifier
                 .weight(1f)
-                .height(42.dp),
+                .height(46.dp),
         ) {
             Text(
                 text = stringResource(R.string.action_view),
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold,
+                style = MaterialTheme.typography.labelLarge,
             )
         }
 
         OutlinedButton(
             onClick = onClose,
             shape = RoundedCornerShape(50),
-            border = BorderStroke(1.dp, Outline),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
             contentPadding = PaddingValues(0.dp),
             modifier = Modifier
                 .weight(1f)
-                .height(42.dp),
+                .height(46.dp),
         ) {
             Text(
                 text = stringResource(R.string.action_close),
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold,
+                style = MaterialTheme.typography.labelLarge,
             )
         }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TimeStep(
     hour: Int,
@@ -497,115 +603,29 @@ private fun TimeStep(
     onCancel: () -> Unit,
     onNext: () -> Unit,
 ) {
-    Text(
-        text = stringResource(R.string.schedule_title),
-        color = TextPrimary,
-        fontSize = 17.sp,
-        fontWeight = FontWeight.SemiBold,
+    val timeState = rememberTimePickerState(
+        initialHour = hour,
+        initialMinute = minute,
+        is24Hour = false,
     )
-    Spacer(Modifier.height(6.dp))
-    Text(
-        text = stringResource(R.string.schedule_time_step),
-        color = TextMuted,
-        fontSize = 12.sp,
-        lineHeight = 17.sp,
-        textAlign = TextAlign.Center,
-    )
-    Spacer(Modifier.height(10.dp))
-    Text(
-        // الوقت بنظام 12 ساعة: 7:00 PM مساءً أو 7:00 AM صباحاً.
-        text = ScheduleSlots.formatTime(hour, minute),
-        color = TextPrimary,
-        fontSize = 34.sp,
-        fontWeight = FontWeight.Bold,
-    )
-    Spacer(Modifier.height(3.dp))
-    Text(
-        text = stringResource(R.string.schedule_zone),
-        color = TextMuted,
-        fontSize = 11.sp,
-    )
-    Spacer(Modifier.height(10.dp))
 
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(
-                text = stringResource(R.string.schedule_hour),
-                color = TextMuted,
-                fontSize = 10.sp,
-            )
-            Spacer(Modifier.height(4.dp))
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(148.dp),
-                state = rememberLazyListState(
-                    initialFirstVisibleItemIndex = ScheduleSlots.hour12(hour) - 1,
-                ),
-            ) {
-                items(12) { index ->
-                    val value = index + 1
-                    ChoiceChip(
-                        text = String.format(Locale.US, "%02d", value),
-                        selected = value == ScheduleSlots.hour12(hour),
-                        onClick = {
-                            onHour(ScheduleSlots.hour24(value, ScheduleSlots.isPm(hour)))
-                        },
-                    )
-                }
-            }
-        }
-
-        Column(Modifier.weight(1f)) {
-            Text(
-                text = stringResource(R.string.schedule_minute),
-                color = TextMuted,
-                fontSize = 10.sp,
-            )
-            Spacer(Modifier.height(4.dp))
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(148.dp),
-                state = rememberLazyListState(
-                    initialFirstVisibleItemIndex = minute,
-                ),
-            ) {
-                items(60) { value ->
-                    ChoiceChip(
-                        text = String.format(Locale.US, "%02d", value),
-                        selected = value == minute,
-                        onClick = { onMinute(value) },
-                    )
-                }
-            }
-        }
-
-        // AM / PM: يبدّل بين صباح ومساء مع بقاء الساعة الظاهرة كما هي.
-        Column(Modifier.weight(0.85f)) {
-            Text(
-                text = stringResource(R.string.schedule_meridiem),
-                color = TextMuted,
-                fontSize = 10.sp,
-            )
-            Spacer(Modifier.height(4.dp))
-            val pm = ScheduleSlots.isPm(hour)
-            val hour12 = ScheduleSlots.hour12(hour)
-            ChoiceChip(
-                text = stringResource(R.string.schedule_am),
-                selected = !pm,
-                onClick = { onHour(ScheduleSlots.hour24(hour12, false)) },
-            )
-            ChoiceChip(
-                text = stringResource(R.string.schedule_pm),
-                selected = pm,
-                onClick = { onHour(ScheduleSlots.hour24(hour12, true)) },
-            )
-        }
+    // المنتقي يحفظ وقته داخلياً؛ نرفع الاختيار للشاشة كل مرة يتغير فيها.
+    LaunchedEffect(timeState.hour, timeState.minute) {
+        onHour(timeState.hour)
+        onMinute(timeState.minute)
     }
+
+    StepTitle(
+        title = stringResource(R.string.schedule_title),
+        subtitle = stringResource(R.string.schedule_time_step),
+    )
+
+    Spacer(Modifier.height(8.dp))
+
+    TimePicker(state = timeState)
+
+    Spacer(Modifier.height(6.dp))
+    ZoneLabel()
 
     Spacer(Modifier.height(14.dp))
     DialogButtons(
@@ -617,6 +637,7 @@ private fun TimeStep(
     )
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun DateStep(
     hour: Int,
@@ -627,73 +648,97 @@ private fun DateStep(
     onBack: () -> Unit,
     onConfirm: () -> Unit,
 ) {
-    val now = System.currentTimeMillis()
-    val today = ScheduleSlots.dateOf(now)
-    val days = remember(today) { (0 until 90).map { today.plusDays(it.toLong()) } }
-    val selectedAt = date?.let { ScheduleSlots.at(it, hour, minute) }
-    val valid = selectedAt != null && selectedAt > now
+    val scheme = MaterialTheme.colorScheme
+    val today = ScheduleSlots.dateOf(System.currentTimeMillis())
 
-    Text(
-        text = stringResource(R.string.schedule_title),
-        color = TextPrimary,
-        fontSize = 17.sp,
-        fontWeight = FontWeight.SemiBold,
-    )
-    Spacer(Modifier.height(6.dp))
-    Text(
-        text = stringResource(R.string.schedule_date_step),
-        color = TextMuted,
-        fontSize = 12.sp,
-        lineHeight = 17.sp,
-        textAlign = TextAlign.Center,
-    )
-    Spacer(Modifier.height(4.dp))
-    Text(
-        text = ScheduleSlots.formatTime(hour, minute) +
-            " · " + stringResource(R.string.schedule_zone),
-        color = TextMuted,
-        fontSize = 11.sp,
-    )
-    Spacer(Modifier.height(10.dp))
+    // التواريخ الماضية (أو اليوم بوقت مضى) غير قابلة للاختيار من التقويم نفسه.
+    val selectable = remember(hour, minute) {
+        object : SelectableDates {
+            override fun isSelectableDate(utcTimeMillis: Long): Boolean {
+                val day = utcMillisToDate(utcTimeMillis)
+                return ScheduleSlots.at(day, hour, minute) > System.currentTimeMillis()
+            }
 
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(186.dp),
-    ) {
-        items(days.size) { index ->
-            val day = days[index]
-            DateRow(
-                date = day,
-                selected = day == date,
-                enabled = ScheduleSlots.at(day, hour, minute) > now,
-                isToday = day == today,
-                onClick = { onDate(day) },
-            )
+            override fun isSelectableYear(year: Int): Boolean =
+                year >= ScheduleSlots.dateOf(System.currentTimeMillis()).year
         }
     }
 
-    Spacer(Modifier.height(10.dp))
-    Text(
-        text = if (valid && selectedAt != null) {
-            stringResource(R.string.schedule_publish_at, ScheduleSlots.formatFull(selectedAt))
-        } else {
-            stringResource(R.string.schedule_past)
-        },
-        color = if (valid) TextPrimary else TextMuted,
-        fontSize = 11.sp,
-        textAlign = TextAlign.Center,
+    val pickerState = rememberDatePickerState(
+        initialSelectedDateMillis = date?.toUtcMillis(),
+        initialDisplayedMonthMillis = (date ?: today).toUtcMillis(),
+        selectableDates = selectable,
     )
-    // في الوضع التلقائي: تنبيه أن الموعد الأصلي محفوظ ويمكن الرجوع إليه بالنقر.
-    if (auto != null) {
-        Spacer(Modifier.height(3.dp))
-        Text(
-            text = stringResource(R.string.schedule_auto_keep, ScheduleSlots.formatFull(auto)),
-            color = TextMuted,
-            fontSize = 10.sp,
-            textAlign = TextAlign.Center,
-        )
+
+    LaunchedEffect(pickerState.selectedDateMillis) {
+        val millis = pickerState.selectedDateMillis ?: return@LaunchedEffect
+        onDate(utcMillisToDate(millis))
     }
+
+    StepTitle(
+        title = stringResource(R.string.schedule_title),
+        subtitle = stringResource(R.string.schedule_date_step),
+    )
+    Text(
+        text = ScheduleSlots.formatTime(hour, minute) + " · " +
+            stringResource(R.string.schedule_zone),
+        color = scheme.primary,
+        style = MaterialTheme.typography.labelLarge,
+        modifier = Modifier.padding(top = 4.dp),
+    )
+
+    Spacer(Modifier.height(6.dp))
+
+    DatePicker(
+        state = pickerState,
+        showModeToggle = false,
+        title = null,
+        headline = null,
+        colors = DatePickerDefaults.colors(
+            containerColor = Color.Transparent,
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    )
+
+    val selectedAt = date?.let { ScheduleSlots.at(it, hour, minute) }
+    val valid = selectedAt != null && selectedAt > System.currentTimeMillis()
+
+    AnimatedContent(
+        targetState = valid,
+        transitionSpec = {
+            fadeIn(tween(180)) togetherWith fadeOut(tween(120))
+        },
+        label = "publish-summary",
+    ) { enabled ->
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                text = if (enabled && selectedAt != null) {
+                    stringResource(
+                        R.string.schedule_publish_at,
+                        ScheduleSlots.formatFull(selectedAt),
+                    )
+                } else {
+                    stringResource(R.string.schedule_past)
+                },
+                color = if (enabled) scheme.onSurface else scheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center,
+            )
+            if (auto != null) {
+                Text(
+                    text = stringResource(
+                        R.string.schedule_auto_keep,
+                        ScheduleSlots.formatFull(auto),
+                    ),
+                    color = scheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelSmall,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(top = 3.dp),
+                )
+            }
+        }
+    }
+
     Spacer(Modifier.height(12.dp))
     DialogButtons(
         cancelLabel = stringResource(R.string.schedule_back),
@@ -711,51 +756,70 @@ private fun AutoStep(
     onEdit: () -> Unit,
     onConfirm: () -> Unit,
 ) {
-    Text(
-        text = stringResource(R.string.schedule_auto_title),
-        color = TextPrimary,
-        fontSize = 17.sp,
-        fontWeight = FontWeight.SemiBold,
+    val scheme = MaterialTheme.colorScheme
+
+    StepTitle(
+        title = stringResource(R.string.schedule_auto_title),
+        subtitle = stringResource(R.string.schedule_auto_body),
     )
-    Spacer(Modifier.height(7.dp))
-    Text(
-        text = stringResource(R.string.schedule_auto_body),
-        color = TextMuted,
-        fontSize = 12.sp,
-        lineHeight = 18.sp,
-        textAlign = TextAlign.Center,
-    )
+
     Spacer(Modifier.height(14.dp))
+
+    // الحاوية اللونية تعرض الموعد التلقائي، وهو الافتراضي إن لم يغيّره المستخدم.
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = scheme.secondaryContainer,
+        contentColor = scheme.onSecondaryContainer,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(vertical = 16.dp, horizontal = 14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = ScheduleSlots.formatFull(at),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = stringResource(R.string.schedule_zone),
+                style = MaterialTheme.typography.labelMedium,
+                color = scheme.onSecondaryContainer.copy(alpha = 0.75f),
+            )
+        }
+    }
+
+    Spacer(Modifier.height(8.dp))
     Text(
-        text = ScheduleSlots.formatFull(at),
-        color = TextPrimary,
-        fontSize = 16.sp,
-        fontWeight = FontWeight.SemiBold,
+        text = stringResource(R.string.schedule_auto_hint),
+        color = scheme.onSurfaceVariant,
+        style = MaterialTheme.typography.labelMedium,
         textAlign = TextAlign.Center,
     )
-    Spacer(Modifier.height(4.dp))
-    Text(
-        text = stringResource(R.string.schedule_zone),
-        color = TextMuted,
-        fontSize = 11.sp,
-    )
-    Spacer(Modifier.height(16.dp))
-    OutlinedButton(
+
+    Spacer(Modifier.height(12.dp))
+    FilledTonalButton(
         onClick = onEdit,
         shape = RoundedCornerShape(50),
-        border = BorderStroke(1.dp, Outline),
-        colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
-        contentPadding = PaddingValues(0.dp),
+        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 0.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .height(42.dp),
+            .height(46.dp),
     ) {
+        Icon(
+            imageVector = Icons.Filled.Edit,
+            contentDescription = null,
+            modifier = Modifier.size(17.dp),
+        )
+        Spacer(Modifier.width(7.dp))
         Text(
             text = stringResource(R.string.schedule_change),
-            fontSize = 13.sp,
-            fontWeight = FontWeight.SemiBold,
+            style = MaterialTheme.typography.labelLarge,
         )
     }
+
     Spacer(Modifier.height(10.dp))
     DialogButtons(
         cancelLabel = stringResource(R.string.action_close),
@@ -763,6 +827,32 @@ private fun AutoStep(
         onCancel = onCancel,
         onConfirm = onConfirm,
         confirmEnabled = true,
+    )
+}
+
+@Composable
+private fun StepTitle(title: String, subtitle: String) {
+    Text(
+        text = title,
+        color = MaterialTheme.colorScheme.onSurface,
+        style = MaterialTheme.typography.titleMedium,
+        textAlign = TextAlign.Center,
+    )
+    Spacer(Modifier.height(6.dp))
+    Text(
+        text = subtitle,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        style = MaterialTheme.typography.bodySmall,
+        textAlign = TextAlign.Center,
+    )
+}
+
+@Composable
+private fun ZoneLabel() {
+    Text(
+        text = stringResource(R.string.schedule_zone),
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        style = MaterialTheme.typography.labelMedium,
     )
 }
 
@@ -778,92 +868,35 @@ private fun DialogButtons(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        OutlinedButton(
+        TextButton(
             onClick = onCancel,
             shape = RoundedCornerShape(50),
-            border = BorderStroke(1.dp, Outline),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
             contentPadding = PaddingValues(0.dp),
             modifier = Modifier
                 .weight(1f)
-                .height(42.dp),
+                .height(46.dp),
         ) {
-            Text(text = cancelLabel, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text(text = cancelLabel, style = MaterialTheme.typography.labelLarge)
         }
 
         Button(
             onClick = onConfirm,
             enabled = confirmEnabled,
             shape = RoundedCornerShape(50),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = TextPrimary,
-                contentColor = Background,
-            ),
             contentPadding = PaddingValues(0.dp),
             modifier = Modifier
                 .weight(1f)
-                .height(42.dp),
+                .height(46.dp),
         ) {
-            Text(text = confirmLabel, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text(text = confirmLabel, style = MaterialTheme.typography.labelLarge)
         }
     }
 }
 
-@Composable
-private fun ChoiceChip(text: String, selected: Boolean, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 2.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(if (selected) Accent else Color.White.copy(alpha = 0.05f))
-            .clickable(onClick = onClick)
-            .padding(vertical = 7.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = text,
-            color = if (selected) Background else TextPrimary,
-            fontSize = 13.sp,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-        )
-    }
-}
+/** تاريخ محلي → منتصف الليل بتوقيت UTC كما يتوقعه DatePicker. */
+private fun LocalDate.toUtcMillis(): Long =
+    atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
 
-@Composable
-private fun DateRow(
-    date: LocalDate,
-    selected: Boolean,
-    enabled: Boolean,
-    isToday: Boolean,
-    onClick: () -> Unit,
-) {
-    val label = if (isToday) {
-        stringResource(R.string.schedule_today, ScheduleSlots.formatDate(date))
-    } else {
-        ScheduleSlots.formatDate(date)
-    }
-
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 2.dp)
-            .clip(RoundedCornerShape(9.dp))
-            .background(if (selected) Accent else Color.White.copy(alpha = 0.05f))
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 12.dp, vertical = 9.dp),
-    ) {
-        Text(
-            text = label,
-            color = if (selected) {
-                Background
-            } else if (enabled) {
-                TextPrimary
-            } else {
-                TextMuted.copy(alpha = 0.4f)
-            },
-            fontSize = 12.sp,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-        )
-    }
-}
+/** ميللي UTC القادم من DatePicker → تاريخ محلي. */
+private fun utcMillisToDate(utcTimeMillis: Long): LocalDate =
+    Instant.ofEpochMilli(utcTimeMillis).atZone(ZoneOffset.UTC).toLocalDate()

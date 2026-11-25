@@ -1,5 +1,12 @@
 package com.brainrot.pigeon.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -12,8 +19,12 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -74,17 +85,42 @@ fun ProfileRoute(
                 .widthIn(max = 430.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            ProfileCard(
-                profile = profile,
-                avatar = avatar,
-                loading = loading,
-                onAvatarLanded = viewModel::onAvatarLanded,
-                onAvatarClick = { openExternal(context, PROFILE_PAGE_URL) },
+            // أول ظهور للكرت: يتلاشى ويدخل من الأسفل قليلاً بدل القفزة.
+            var appeared by remember { mutableStateOf(false) }
+            LaunchedEffect(Unit) { appeared = true }
+            val appear by animateFloatAsState(
+                targetValue = if (appeared) 1f else 0f,
+                animationSpec = tween(durationMillis = 420, easing = FastOutSlowInEasing),
+                label = "profile-appear",
             )
 
-            error?.let { reason ->
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .graphicsLayer(
+                        alpha = appear,
+                        scaleX = 0.97f + 0.03f * appear,
+                        scaleY = 0.97f + 0.03f * appear,
+                    ),
+            ) {
+                ProfileCard(
+                    profile = profile,
+                    avatar = avatar,
+                    loading = loading,
+                    onAvatarLanded = viewModel::onAvatarLanded,
+                    onAvatarClick = { openExternal(context, PROFILE_PAGE_URL) },
+                )
+            }
+
+            val errorText = error
+            AnimatedVisibility(
+                visible = errorText != null,
+                enter = fadeIn(tween(240)) +
+                    slideInVertically(tween(260, easing = FastOutSlowInEasing)) { it / 3 },
+                exit = fadeOut(tween(140)),
+            ) {
                 Text(
-                    text = stringResource(R.string.profile_update_failed, reason),
+                    text = stringResource(R.string.profile_update_failed, errorText.orEmpty()),
                     color = TextMuted,
                     fontSize = 12.sp,
                     lineHeight = 16.sp,

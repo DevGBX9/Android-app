@@ -1,6 +1,15 @@
 package com.brainrot.pigeon.ui
 
 import android.content.Context
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
@@ -54,6 +63,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
@@ -128,37 +138,46 @@ fun ReelsRoute(container: AppContainer) {
         ReelsHeader()
         HorizontalDivider(color = Outline, thickness = 1.dp)
 
-        if (items.isEmpty()) {
-            EmptyReels(Modifier.weight(1f))
-        } else {
-            LazyVerticalGrid(
-                columns = GridCells.Fixed(GRID_COLUMNS),
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .navigationBarsPadding(),
-                contentPadding = PaddingValues(2.dp),
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                items(items, key = { it.id }, contentType = { "reel" }) { item ->
-                    ReelCell(
-                        item = item,
-                        images = images,
-                        download = downloads[item.id],
-                        expanded = expandedId == item.id,
-                        onClick = { openReel(context, item) },
-                        onLongClick = { expandedId = item.id },
-                        onDismiss = { expandedId = null },
-                        onDownload = {
-                            expandedId = null
-                            viewModel.download(item)
-                        },
-                        onDelete = {
-                            expandedId = null
-                            viewModel.delete(item)
-                        },
-                    )
+        // الانتقال بين "شارك أول ريل" والشبكة يصير بتلاشي ناعم بدل قفزة.
+        Crossfade(
+            targetState = items.isEmpty(),
+            modifier = Modifier.weight(1f),
+            animationSpec = tween(durationMillis = 260, easing = FastOutSlowInEasing),
+            label = "reels-content",
+        ) { empty ->
+            if (empty) {
+                EmptyReels(Modifier.fillMaxSize())
+            } else {
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(GRID_COLUMNS),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .navigationBarsPadding(),
+                    contentPadding = PaddingValues(2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    items(items, key = { it.id }, contentType = { "reel" }) { item ->
+                        ReelCell(
+                            // ظهور الخانة الجديدة وانزلاق الباقي عند الحذف.
+                            modifier = Modifier.animateItem(),
+                            item = item,
+                            images = images,
+                            download = downloads[item.id],
+                            expanded = expandedId == item.id,
+                            onClick = { openReel(context, item) },
+                            onLongClick = { expandedId = item.id },
+                            onDismiss = { expandedId = null },
+                            onDownload = {
+                                expandedId = null
+                                viewModel.download(item)
+                            },
+                            onDelete = {
+                                expandedId = null
+                                viewModel.delete(item)
+                            },
+                        )
+                    }
                 }
             }
         }
@@ -167,13 +186,30 @@ fun ReelsRoute(container: AppContainer) {
 
 @Composable
 private fun ReelsHeader() {
+    var shown by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { shown = true }
+
+    val scale by animateFloatAsState(
+        targetValue = if (shown) 1f else 0.8f,
+        animationSpec = tween(durationMillis = 360, easing = FastOutSlowInEasing),
+        label = "header-scale",
+    )
+    val alpha by animateFloatAsState(
+        targetValue = if (shown) 1f else 0f,
+        animationSpec = tween(durationMillis = 300),
+        label = "header-alpha",
+    )
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 9.dp),
         contentAlignment = Alignment.Center,
     ) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.graphicsLayer(scaleX = scale, scaleY = scale, alpha = alpha),
+        ) {
             GridGlyph(color = TextPrimary, modifier = Modifier.size(22.dp))
             Spacer(Modifier.height(7.dp))
             Box(
@@ -189,6 +225,7 @@ private fun ReelsHeader() {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ReelCell(
+    modifier: Modifier = Modifier,
     item: SavedItem,
     images: AvatarLoader,
     download: DownloadUi?,
@@ -214,8 +251,20 @@ private fun ReelCell(
         item.archiveState == "storing"
     val busy = download?.running == true
 
+    // ظهور الغلاف بتلاشي بدل ما يقفز الصورة دفعة واحدة، وشريط التحميل يتقدّم بنعومة.
+    val thumbAlpha by animateFloatAsState(
+        targetValue = if (bitmap != null) 1f else 0f,
+        animationSpec = tween(durationMillis = 340, easing = FastOutSlowInEasing),
+        label = "thumb-alpha",
+    )
+    val downloadFraction by animateFloatAsState(
+        targetValue = ((download?.percent ?: 0).coerceIn(0, 100)) / 100f,
+        animationSpec = tween(durationMillis = 260, easing = FastOutSlowInEasing),
+        label = "download-fraction",
+    )
+
     Box(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .aspectRatio(REEL_ASPECT)
             .clip(RoundedCornerShape(4.dp))
@@ -227,7 +276,9 @@ private fun ReelCell(
                 bitmap = bitmap,
                 contentDescription = reelLabel(item),
                 contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer(alpha = thumbAlpha),
             )
 
             // تعتيم سفلي حتى يبقى كود الريل واضحاً فوق الصورة.
@@ -252,10 +303,14 @@ private fun ReelCell(
             )
         }
 
-        if (item.registered) {
+        AnimatedVisibility(
+            visible = item.registered,
+            enter = fadeIn(tween(200)) + scaleIn(tween(220), initialScale = 0.6f),
+            exit = fadeOut(tween(120)) + scaleOut(tween(160), targetScale = 0.6f),
+            modifier = Modifier.align(Alignment.TopEnd),
+        ) {
             Box(
                 modifier = Modifier
-                    .align(Alignment.TopEnd)
                     .padding(5.dp)
                     .size(19.dp)
                     .clip(CircleShape)
@@ -311,13 +366,19 @@ private fun ReelCell(
                 .padding(start = 6.dp, end = 30.dp, top = 5.dp, bottom = 5.dp),
         )
 
-        item.schedule?.let { schedule ->
-            ScheduleBadge(
-                schedule = schedule,
-                modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .padding(5.dp),
-            )
+        val schedule = item.schedule
+        AnimatedVisibility(
+            visible = schedule != null,
+            enter = fadeIn(tween(220)) +
+                scaleIn(tween(240, easing = FastOutSlowInEasing), initialScale = 0.7f),
+            exit = fadeOut(tween(120)) + scaleOut(tween(160), targetScale = 0.7f),
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(5.dp),
+        ) {
+            if (schedule != null) {
+                ScheduleBadge(schedule = schedule)
+            }
         }
 
         // نسبة معالجة الريل على Cloudflare (0..100) قبل أن يصير قابلاً للتحميل.
@@ -331,7 +392,11 @@ private fun ReelCell(
         }
 
         // نزيل التحميل من الخادم إلى الجهاز: النسبة فوق البطاقة.
-        if (busy) {
+        AnimatedVisibility(
+            visible = busy,
+            enter = fadeIn(tween(150)),
+            exit = fadeOut(tween(150)),
+        ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -358,7 +423,7 @@ private fun ReelCell(
                     ) {
                         Box(
                             Modifier
-                                .fillMaxWidth(((download?.percent ?: 0).coerceIn(0, 100)) / 100f)
+                                .fillMaxWidth(downloadFraction)
                                 .fillMaxHeight()
                                 .background(Accent),
                         )
@@ -368,7 +433,12 @@ private fun ReelCell(
         }
 
         // ضغطة مطوّلة: زر تحميل الريل المخزّن.
-        if (expanded && !busy) {
+        AnimatedVisibility(
+            visible = expanded && !busy,
+            enter = fadeIn(tween(150)) +
+                scaleIn(tween(210, easing = FastOutSlowInEasing), initialScale = 0.94f),
+            exit = fadeOut(tween(120)),
+        ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -492,6 +562,11 @@ private fun ScheduleBadge(schedule: PublishSchedule, modifier: Modifier = Modifi
 @Composable
 private fun ProcessingBar(progress: Int, modifier: Modifier = Modifier) {
     val clamped = progress.coerceIn(0, 100)
+    val fraction by animateFloatAsState(
+        targetValue = clamped / 100f,
+        animationSpec = tween(durationMillis = 320, easing = FastOutSlowInEasing),
+        label = "archive-fraction",
+    )
 
     Column(modifier.fillMaxWidth()) {
         Text(
@@ -509,7 +584,7 @@ private fun ProcessingBar(progress: Int, modifier: Modifier = Modifier) {
         ) {
             Box(
                 Modifier
-                    .fillMaxWidth(clamped / 100f)
+                    .fillMaxWidth(fraction)
                     .fillMaxHeight()
                     .background(Accent),
             )
