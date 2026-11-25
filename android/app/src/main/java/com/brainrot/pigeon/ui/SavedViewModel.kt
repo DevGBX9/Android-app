@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -85,12 +86,21 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
                     val fromServer = schedules[item.id]?.takeIf { it.at > 0L }
                     if (fromServer == null) item else item.copy(schedule = fromServer.toSchedule())
                 }
-                .sortedByDescending { it.createdAt }
-        }.stateIn(
-        scope = viewModelScope,
-        started = SharingStarted.WhileSubscribed(5_000),
-        initialValue = emptyList(),
-    )
+                // الأقرب موعداً أولاً: نفس ترتيب النشر على الخادم، وغير المجدول آخراً.
+                .sortedWith(
+                    compareBy<SavedItem>(
+                        { it.schedule?.at?.takeIf { at -> at > 0L } ?: Long.MAX_VALUE },
+                        { -it.createdAt },
+                    ),
+                )
+        }
+            // كل خمس ثوانٍ تصل لقطة جديدة؛ لا نعيد رسم الشبكة إن لم يتغيّر شيء.
+            .distinctUntilChanged()
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5_000),
+                initialValue = emptyList(),
+            )
 
     /** معرّف كل خانة خارجة ونوع علامتها. */
     val exits: StateFlow<Map<String, ReelExitKind>> = marks
@@ -111,6 +121,10 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
     /** رسالة فشل تغيير الموعد (تُعرض مرة واحدة ثم تُمسح). */
     private val _scheduleError = MutableStateFlow<String?>(null)
     val scheduleError: StateFlow<String?> = _scheduleError.asStateFlow()
+
+    /** ريلز طُلب نشرها الآن وطلباتها في الطريق: تُعطَّل أزرارها حتى يردّ الخادم. */
+    private val _publishingIds = MutableStateFlow<Set<String>>(emptySet())
+    val publishingIds: StateFlow<Set<String>> = _publishingIds.asStateFlow()
 
     /** آخر نقطة ساعة من الخادم؛ كل العرض يُحسب منها. */
     private val clock = MutableStateFlow(
@@ -194,6 +208,25 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
                 _scheduleError.value = error.message ?: "could not change the date"
             }
             // الموعد الجديد والوقت المتبقي يصلان من الخادم بعد الكتابة.
+            refreshSchedules()
+        }
+    }
+
+    /**
+     * ينشر الريل الآن: يطلب من الخادم إلغاء العدّاد ثم يمشي الخادم في خطوات
+     * النشر العادية نفسها (نشر، تأكيد، تنظيف). لا نشر ولا حساب وقت هنا.
+     */
+    fun publishNow(item: SavedItem) {
+        if (item.schedule == null) return
+        if (item.id in _publishingIds.value) return
+        _publishingIds.update { it + item.id }
+
+        viewModelScope.launch {
+            repository.publishNow(item).onFailure { error ->
+                _scheduleError.value = error.message ?: "could not publish now"
+            }
+            _publishingIds.update { it - item.id }
+            // الحالة بعد الطلب تأتي من الخادم، لا من التطبيق.
             refreshSchedules()
         }
     }

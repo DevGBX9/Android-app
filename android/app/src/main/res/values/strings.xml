@@ -46,6 +46,8 @@
     <string name="reel_delete">Delete</string>
     <string name="reel_delete_confirm">Tap again to delete</string>
     <string name="reel_schedule">Schedule date &amp; time</string>
+    <string name="reel_publish_now">Publish now</string>
+    <string name="reel_publish_now_running">Publishing now…</string>
     <string name="reel_downloading">Downloading %1$d%%</string>
     <string name="reel_deleted">Deleted</string>
     <string name="reel_number">Reel #%1$d</string>

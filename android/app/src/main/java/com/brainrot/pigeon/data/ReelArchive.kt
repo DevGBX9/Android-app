@@ -84,6 +84,13 @@ private data class ScheduleReply(
 )
 
 @Serializable
+private data class PublishReply(
+    val ok: Boolean = false,
+    val state: String = "",
+    val error: String? = null,
+)
+
+@Serializable
 private data class ArchiveRequest(
     val id: String,
     val url: String,
@@ -235,6 +242,44 @@ class ReelArchive(
                 }
             }
         }
+
+    /**
+     * ينشر الريل الآن: يطلب من الخادم إلغاء العدّاد وبدء سلسلة النشر نفسها
+     * (نشر، تأكيد، تنظيف) التي تعمل عند صفر العدّاد.
+     */
+    suspend fun publishNow(id: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!configured) throw IOException("the archive service is not configured")
+
+            val payload = buildJsonObject { put("id", id) }
+                .toString()
+                .toRequestBody(ARCHIVE_MEDIA)
+
+            val request = Request.Builder()
+                .url("$base/publish-now")
+                .header("Accept", "application/json")
+                .apply { if (token.isNotBlank()) header("X-Api-Key", token) }
+                .post(payload)
+                .build()
+
+            http.newCall(request).execute().use { response ->
+                val text = runCatching { response.body?.string().orEmpty() }.getOrDefault("")
+                val reply = runCatching {
+                    json.decodeFromString<PublishReply>(text)
+                }.getOrNull()
+
+                if (!response.isSuccessful) {
+                    throw IOException(
+                        reply?.error?.takeIf { it.isNotBlank() }
+                            ?: "server HTTP ${response.code}",
+                    )
+                }
+                reply?.error?.takeIf { it.isNotBlank() && reply.ok.not() }?.let { reason ->
+                    throw IOException(reason)
+                }
+            }
+        }
+    }
 
     /**
      * يحذف الريل من الخادم: ملفه من R2 وكل معلوماته من Firebase.

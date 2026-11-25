@@ -97,6 +97,7 @@ import com.brainrot.pigeon.ui.theme.TextPrimary
 import com.brainrot.pigeon.ui.util.openExternal
 import com.brainrot.pigeon.ui.util.toast
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 private val CellTop = Color(0xFF1C232B)
@@ -129,8 +130,10 @@ fun ReelsRoute(container: AppContainer) {
     val images = remember { container.reelImages }
     val context = LocalContext.current
 
-    // ساعة واحدة للشبكة كلها، وهي ساعة الخادم: التطبيق لا يحسب موعداً بنفسه.
-    val now by viewModel.serverNow.collectAsStateWithLifecycle()
+    // ساعة الخادم تُقرأ داخل سطر العدّاد وحده: إعادة الرسم كل ثانية تبقى محصورة
+    // في نص صغير بدل الشبكة كلها، فتبقى التمرير والقائمة سلسة.
+    val clock = viewModel.serverNow
+    val publishing by viewModel.publishingIds.collectAsStateWithLifecycle()
 
     // الخانة التي فُتحت لها القائمة السفلية، والريل الذي يُعدَّل موعده.
     var sheetFor by remember { mutableStateOf<SavedItem?>(null) }
@@ -140,9 +143,13 @@ fun ReelsRoute(container: AppContainer) {
     val sheetItem = sheetFor?.let { target -> items.firstOrNull { it.id == target.id } }
     val editItem = editingFor?.let { target -> items.firstOrNull { it.id == target.id } }
 
-    LaunchedEffect(sheetItem, editItem) {
-        if (sheetItem == null) sheetFor = null
-        if (editItem == null) editingFor = null
+    // نراقب المعرّف لا الكائن: كل لقطة من الخادم تصنع نسخة جديدة، فلا نُعيد
+    // تشغيل الأثر (وإغلاق النافذة) بلا سبب.
+    LaunchedEffect(sheetFor?.id, sheetItem?.id) {
+        if (sheetFor != null && sheetItem == null) sheetFor = null
+    }
+    LaunchedEffect(editingFor?.id, editItem?.id) {
+        if (editingFor != null && editItem == null) editingFor = null
     }
 
     // سبب فشل التحميل يظهر كرسالة بدل البقاء على 0% أو علامة تعجّب صامتة.
@@ -203,7 +210,7 @@ fun ReelsRoute(container: AppContainer) {
                             modifier = Modifier.animateItem(),
                             item = item,
                             number = index + 1,
-                            now = now,
+                            clock = clock,
                             // بقية الشبكة تبهت والخانة المفتوحة إعداداتها تبرز.
                             dimmed = sheetItem != null && sheetItem?.id != item.id,
                             focused = sheetItem?.id == item.id,
@@ -225,11 +232,13 @@ fun ReelsRoute(container: AppContainer) {
             item = target,
             number = items.indexOfFirst { it.id == target.id } + 1,
             download = downloads[target.id],
+            publishing = target.id in publishing,
             onDismiss = { sheetFor = null },
             onDownload = {
                 sheetFor = null
                 viewModel.download(target)
             },
+            onPublishNow = { viewModel.publishNow(target) },
             onReschedule = {
                 sheetFor = null
                 editingFor = target
@@ -271,8 +280,10 @@ private fun ReelSheet(
     item: SavedItem,
     number: Int,
     download: DownloadUi?,
+    publishing: Boolean,
     onDismiss: () -> Unit,
     onDownload: () -> Unit,
+    onPublishNow: () -> Unit,
     onReschedule: () -> Unit,
     onDelete: () -> Unit,
 ) {
@@ -344,6 +355,25 @@ private fun ReelSheet(
                     onClick = onDownload,
                 ) {
                     DownloadGlyph(color = scheme.onSurface, modifier = Modifier.size(22.dp))
+                }
+            }
+
+            // النشر الآن: يلغي العدّاد ويبدأ نفس سلسلة النشر على الخادم فوراً.
+            val scheduled = item.schedule
+            if (scheduled != null && !scheduled.isPublishing) {
+                SheetRow(
+                    label = if (publishing) {
+                        stringResource(R.string.reel_publish_now_running)
+                    } else {
+                        stringResource(R.string.reel_publish_now)
+                    },
+                    tint = if (publishing) scheme.onSurfaceVariant else Accent,
+                    onClick = { if (!publishing) onPublishNow() },
+                ) {
+                    PublishNowGlyph(
+                        color = if (publishing) scheme.onSurfaceVariant else Accent,
+                        modifier = Modifier.size(20.dp),
+                    )
                 }
             }
 
@@ -443,7 +473,7 @@ private fun ReelCell(
     modifier: Modifier = Modifier,
     item: SavedItem,
     number: Int,
-    now: Long,
+    clock: StateFlow<Long>,
     dimmed: Boolean,
     focused: Boolean,
     images: AvatarLoader,
@@ -610,30 +640,10 @@ private fun ReelCell(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                Text(
-                    // النص يتبع حالة الخادم: لا "publishing" من تقدير التطبيق.
-                    text = when {
-                        schedule.isPublishing ->
-                            stringResource(R.string.reel_countdown_now)
-
-                        schedule.state == ScheduleSlots.STATE_PUBLISHED ->
-                            stringResource(R.string.schedule_published)
-
-                        schedule.state == ScheduleSlots.STATE_FAILED ||
-                            schedule.state == ScheduleSlots.STATE_UNVERIFIED ->
-                            stringResource(R.string.schedule_failed)
-
-                        scheduledAt > now -> stringResource(
-                            R.string.reel_countdown,
-                            ScheduleSlots.formatCountdown(scheduledAt - now),
-                        )
-
-                        else -> stringResource(R.string.reel_state_waiting)
-                    },
-                    color = Accent,
-                    fontSize = 8.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+                ScheduleStateLine(
+                    schedule = schedule,
+                    scheduledAt = scheduledAt,
+                    clock = clock,
                 )
             }
 
@@ -715,6 +725,60 @@ private fun ReelCell(
         if (exit != null) {
             ReelExitOverlay(kind = exit)
         }
+    }
+}
+
+/**
+ * سطر الحالة والعدّاد داخل الخانة. هو المكان الوحيد الذي يقرأ ساعة الخادم،
+ * فتقتصر إعادة الرسم كل ثانية على هذا النص بدل الشبكة بأكملها.
+ */
+@Composable
+private fun ScheduleStateLine(
+    schedule: PublishSchedule,
+    scheduledAt: Long,
+    clock: StateFlow<Long>,
+) {
+    val now by clock.collectAsStateWithLifecycle()
+
+    Text(
+        text = when {
+            // النص يتبع حالة الخادم: لا "publishing" من تقدير التطبيق.
+            schedule.isPublishing -> stringResource(R.string.reel_countdown_now)
+
+            schedule.state == ScheduleSlots.STATE_PUBLISHED ->
+                stringResource(R.string.schedule_published)
+
+            schedule.state == ScheduleSlots.STATE_FAILED ||
+                schedule.state == ScheduleSlots.STATE_UNVERIFIED ->
+                stringResource(R.string.schedule_failed)
+
+            scheduledAt > now -> stringResource(
+                R.string.reel_countdown,
+                ScheduleSlots.formatCountdown(scheduledAt - now),
+            )
+
+            else -> stringResource(R.string.reel_state_waiting)
+        },
+        color = Accent,
+        fontSize = 8.sp,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
+
+/** مثلث تشغيل صغير: "انشر الآن". */
+@Composable
+private fun PublishNowGlyph(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        val triangle = Path().apply {
+            moveTo(w * 0.24f, h * 0.16f)
+            lineTo(w * 0.86f, h * 0.50f)
+            lineTo(w * 0.24f, h * 0.84f)
+            close()
+        }
+        drawPath(triangle, color)
     }
 }
 

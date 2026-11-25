@@ -13,6 +13,8 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -49,6 +51,9 @@ class SavedRepository(
         ignoreUnknownKeys = true
         encodeDefaults = true
     }
+
+    // مزامنة واحدة في المرة: البث الحيّ ودورة التحديث قد يتقاطعان بلا داعٍ.
+    private val syncLock = Mutex()
 
     private val _publishedExits = MutableSharedFlow<SavedItem>(extraBufferCapacity = 16)
 
@@ -136,6 +141,9 @@ class SavedRepository(
         return Result.success(Unit)
     }
 
+    /** ينشر الريل الآن: الخادم يلغي العدّاد ثم يكمل بخطوات النشر العادية. */
+    suspend fun publishNow(item: SavedItem): Result<Unit> = archive.publishNow(item.id)
+
     /**
      * العدّ التنازلي من الخادم: وقت الخادم والوقت المتبقي لكل ريل في طلب واحد.
      * لا حساب لموعد أو لعدّاد داخل التطبيق.
@@ -179,7 +187,9 @@ class SavedRepository(
      * يسحب القائمة من Firebase ويدمجها مع المحلي (سجلات Firebase تتقدّم)،
      * ثم يرفع أي عنصر محلي ما وصل للقاعدة بعد، ويطلب أرشفة ما لم يُؤرشف.
      */
-    suspend fun syncFromRemote(): Result<Unit> {
+    suspend fun syncFromRemote(): Result<Unit> = syncLock.withLock { syncRemoteOnce() }
+
+    private suspend fun syncRemoteOnce(): Result<Unit> {
         val remoteItems = remote.fetchAll().getOrElse { return Result.failure(it) }
         // المواعيد منفصلة عن سجل الريل حتى لا يمسحها PATCH من التطبيق.
         val remoteSchedules = remote.fetchSchedules().getOrDefault(emptyMap())

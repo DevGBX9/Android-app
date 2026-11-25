@@ -17,6 +17,7 @@ R2، ويحدّث حالة المعالجة والتقدّم في Firebase Realt
     GET  /media/<id>           نفس الملف للعرض العام (لـMeta، بلا مفتاح)
     GET  /schedules            وقت الخادم والوقت المتبقي وحالة كل موعد
     POST /schedules            {"id", "at"} -> يكتب الموعد ويزيحه لو تداخل
+    POST /publish-now          {"id"} -> يلغي العدّاد وينشر الريل الآن بنفس السلسلة
     GET|POST /publish          تشغيل المجدول فوراً (احتياط للـcron)
 
 كل الطلبات تُرفض إذا لم يكن `API_TOKEN` مضبوطاً في الأسرار، ولم يكن الترويسة
@@ -1060,7 +1061,7 @@ class Default(WorkerEntrypoint):
                 {
                     "ok": True,
                     "service": "pigeon-reels",
-                    "version": 8,
+                    "version": 9,
                     "routes": [
                         "POST /reels",
                         "GET /reels/<id>",
@@ -1070,6 +1071,7 @@ class Default(WorkerEntrypoint):
                         "GET|POST /publish",
                         "GET /schedules",
                         "POST /schedules",
+                        "POST /publish-now",
                     ],
                     "sources": ["instagram", "tiktok"],
                     "publishing": "instagram graph api (server countdown)",
@@ -1106,6 +1108,11 @@ class Default(WorkerEntrypoint):
         # الجدولة تُكتب من هنا لا من التطبيق، فيملك الخادم الموعد والعدّ التنازلي.
         if parts[0] == "schedules" and len(parts) == 1 and method == "POST":
             return await self._set_schedule(request)
+
+        # النشر الآن من التطبيق: العدّاد يُلغى فوراً ثم تتولى السلسلة العادية
+        # بقية الخطوات (نشر، تأكيد، تنظيف) كما لو أن الموعد حلّ هذه اللحظة.
+        if parts[0] == "publish-now" and len(parts) == 1 and method == "POST":
+            return await self._publish_now(request)
 
         # تشغيل المجدول فوراً بدل انتظار cron: يرجّع تقريراً كاملاً لكل موعد
         # (الحالة، سبب الخطأ، وهل التوكن مضبوط) حتى يمكن تشخيص النشر من المتصفح.
@@ -1614,6 +1621,113 @@ class Default(WorkerEntrypoint):
                 "shifted": settled != at,
             }
         )
+
+    async def _publish_now(self, request):
+        """ينشر الريل فوراً: يُلغي العدّاد ثم يمشي في سلسلة النشر العادية نفسها.
+
+        لا يوجد مسار نشر ثانٍ: نُقدّم موعد الموعد إلى اللحظة الحالية فقط، ثم
+        تتولى `_advance` الخطوات نفسها (تجهيز الحاوية، media_publish، التأكيد،
+        التنظيف) كما لو أن العدّاد وصل صفراً، فلا يختلف النشر اليدوي عن الطبيعي.
+        """
+        try:
+            body = await request.json()
+            schedule_id = _safe_id(_field(body, "id"))
+        except Exception:
+            return _error("invalid json body")
+
+        if not schedule_id:
+            return _error("missing id")
+
+        db = self._db()
+        now = int(time.time() * 1000)
+        path = f"schedules/{schedule_id}.json"
+        current, _etag = await _firebase_read(db, path)
+        if not isinstance(current, dict):
+            return _error("this reel has no schedule on the server", 404)
+
+        state = _stage_of(current)
+        if state in (STAGE_PUBLISHING, STAGE_VERIFYING, STAGE_CLEANING):
+            return _error("this reel is being published right now", 409)
+        if state == STAGE_PUBLISHED or _int_of(current, "publishedAt") > 0:
+            return _error("this reel was already published", 409)
+        if state == STAGE_UNVERIFIED:
+            return _error("the last publish is unconfirmed; check Instagram first", 409)
+
+        # ريل واحد ينشر في المرة: لا نُقحم هذا الريل وسط نشر ريل آخر.
+        if not await self._publish_slot_free(db, schedule_id, now):
+            return _error(PUBLISH_BUSY, 409)
+
+        container_id = _clean(current.get("containerId"))
+        status = await _firebase_patch(
+            db,
+            path,
+            {
+                # الموعد صار الآن: العدّاد ينتهي ويبدأ النشر في نفس اللحظة.
+                "at": now,
+                "state": STAGE_PREPARED if container_id else STAGE_SCHEDULED,
+                "attempts": 0,
+                "error": None,
+                "stageAt": 0,
+                "manualPublish": True,
+                "manualAt": now,
+                "updatedAt": now,
+            },
+        )
+        if status != 200:
+            return _error("could not start the publish (firebase %d)" % status, 502)
+
+        state, error = await self._advance_now(db, schedule_id)
+        if error == ARCHIVE_WAIT:
+            error = "the reel is still being archived on the server"
+
+        return _json(
+            {
+                "ok": error is None,
+                "id": schedule_id,
+                "state": state,
+                "error": error,
+                "serverTime": int(time.time() * 1000),
+                "remainingMs": 0,
+            }
+        )
+
+    async def _advance_now(self, db, schedule_id, budget_s=14):
+        """يمشي بالخطوات فوراً بعد إلغاء العدّاد بدل انتظار دورة cron.
+
+        حاوية إنستغرام تحتاج وقتاً قصيراً حتى تنتهي معالجة الفيديو، فننتظر داخل
+        نفس الطلب مدة محدودة؛ وإن لم تنتهِ يكمل cron من الحالة التي وقفنا عندها،
+        فلا يُنشر شيء مرتين ولا يبقى الريل معلقاً.
+        """
+        deadline = time.monotonic() + budget_s
+        state = STAGE_SCHEDULED
+        error = None
+        final = (
+            STAGE_PUBLISHING,
+            STAGE_VERIFYING,
+            STAGE_CLEANING,
+            STAGE_PUBLISHED,
+            STAGE_FAILED,
+            STAGE_UNVERIFIED,
+        )
+
+        for _ in range(8):
+            current, _etag = await _firebase_read(db, f"schedules/{schedule_id}.json")
+            if not isinstance(current, dict):
+                return state, "the schedule record disappeared"
+            state = _stage_of(current)
+            if state in final:
+                break
+
+            state, error = await self._advance(
+                db, schedule_id, current, int(time.time() * 1000)
+            )
+            if error in (ARCHIVE_WAIT, PUBLISH_BUSY) or state in final:
+                break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(2)
+
+        return state, error
 
     async def _publish_slot_free(self, db, schedule_id, now):
         """هل يحق لهذا الريل أن يبدأ النشر الآن دون أن يتداخل مع ريل آخر؟"""
