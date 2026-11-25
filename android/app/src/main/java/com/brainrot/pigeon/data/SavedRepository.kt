@@ -247,6 +247,12 @@ class SavedRepository(
         return Result.success(Unit)
     }
 
+    /**
+     * يطلب من الـWorker بدء النشر فور حلول الموعد بدل انتظار cron. الـWorker
+     * لا ينشر قبل الوقت المسجل في Firebase، فالطلب آمن لو وصل مبكراً.
+     */
+    suspend fun publishDue(): Result<Unit> = archive.publishDue()
+
     /** الموعد نفسه إن كان ما زال مستقبلاً، وإلا null. */
     private fun PublishSchedule.future(): PublishSchedule? =
         takeIf { at > System.currentTimeMillis() + 60_000L }

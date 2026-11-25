@@ -4,6 +4,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.brainrot.pigeon.data.SavedItem
 import com.brainrot.pigeon.data.SavedRepository
+import com.brainrot.pigeon.data.ScheduleSlots
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -31,6 +33,19 @@ private data class ExitMark(val item: SavedItem, val kind: ReelExitKind)
 
 /** مدة بقاء علامة النشر/الحذف على الخانة قبل أن تختفي. */
 private const val EXIT_HOLD_MS = 1_150L
+
+// النشر المجدول يعمل من cron كل دقيقة، فيتأخر بدء النشر حتى 60 ثانية بعد
+// الموعد. التطبيق يطلب من الـWorker البدء لحظة الموعد، ويكرر الطلب داخل هذه
+// النافذة حتى تصل الحالة من Firebase (الـWorker يرفض أي نشر قبل وقته).
+private const val PUBLISH_TRIGGER_WINDOW_MS = 90_000L
+private const val PUBLISH_TRIGGER_GAP_MS = 6_000L
+
+private val PENDING_PUBLISH_STATES = setOf(
+    ScheduleSlots.STATE_SCHEDULED,
+    ScheduleSlots.STATE_CREATING,
+    ScheduleSlots.STATE_PREPARING,
+    ScheduleSlots.STATE_PREPARED,
+)
 
 /**
  * يعرض قائمة الريلز المجدولة؛ المزامنة مع Firebase تحدث عند فتح التطبيق،
@@ -84,6 +99,9 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
     private val _scheduleError = MutableStateFlow<String?>(null)
     val scheduleError: StateFlow<String?> = _scheduleError.asStateFlow()
 
+    /** مؤقّت طلب النشر للموعد القادم؛ يُلغى ويُعاد ضبطه مع كل تغيير في القائمة. */
+    private var publishTrigger: Job? = null
+
     init {
         // قبل المزامنة: نلتقط حدث النشر ونعرض عليه علامة الصح.
         viewModelScope.launch {
@@ -102,6 +120,10 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
         }
         // متابعة حيّة: الريل يختفي من الشاشة لحظة حذف الـWorker له بعد النشر.
         viewModelScope.launch { repository.observeRemote() }
+        // توقيت طلب النشر عند الموعد بالضبط بدل انتظار cron.
+        viewModelScope.launch {
+            live.collect { schedulePublishTrigger(it) }
+        }
         pollArchives()
     }
 
@@ -144,6 +166,36 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
 
     fun dismissScheduleError() {
         _scheduleError.value = null
+    }
+
+    /**
+     * يوقّت طلب نشر واحد عند أقرب موعد قادم. الطلب لا ينشر شيئاً بحد ذاته:
+     * الـWorker يقرأ الموعد من Firebase ولا يبدأ قبل حلوله، لكنه يوفّر تأخير
+     * cron (حتى دقيقة). نعيد التوقيت كلما تغيّرت القائمة أو حالة موعد.
+     */
+    private fun schedulePublishTrigger(current: List<SavedItem>) {
+        publishTrigger?.cancel()
+        val next = current
+            .filter { item ->
+                item.schedule?.let { it.at > 0L && it.state in PENDING_PUBLISH_STATES } == true
+            }
+            .minByOrNull { it.schedule?.at ?: Long.MAX_VALUE }
+            ?: return
+        val at = next.schedule?.at ?: return
+
+        publishTrigger = viewModelScope.launch {
+            val wait = at - System.currentTimeMillis()
+            if (wait > 0L) delay(wait)
+
+            val deadline = System.currentTimeMillis() + PUBLISH_TRIGGER_WINDOW_MS
+            while (isActive && System.currentTimeMillis() < deadline) {
+                repository.publishDue()
+                // تغيّر الحالة يعني أن الـWorker بدأ: لا حاجة لمزيد من الطلبات.
+                val state = live.value.firstOrNull { it.id == next.id }?.schedule?.state
+                if (state == null || state !in PENDING_PUBLISH_STATES) return@launch
+                delay(PUBLISH_TRIGGER_GAP_MS)
+            }
+        }
     }
 
     /** ينزّل الريل من R2 إلى Downloads مع نسبة 0..100 على البطاقة. */

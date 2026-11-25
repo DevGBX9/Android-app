@@ -56,6 +56,8 @@ object ScheduleSlots {
 
     const val STATE_SCHEDULED = "scheduled"
     const val STATE_CREATING = "creating"
+    const val STATE_PREPARING = "preparing"
+    const val STATE_PREPARED = "prepared"
     const val STATE_PUBLISHING = "publishing"
     const val STATE_PUBLISHED = "published"
     const val STATE_FAILED = "failed"

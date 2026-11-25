@@ -122,6 +122,28 @@ class ReelArchive(
     }
 
     /**
+     * يطلب من الـWorker تشغيل المجدول الآن. الـWorker يتحقق من الوقت بنفسه،
+     * فلا ينشر شيئاً قبل موعده؛ الفائدة أن النشر يبدأ في الثانية نفسها بدل
+     * انتظار cron الذي قد يتأخر حتى دقيقة كاملة.
+     */
+    suspend fun publishDue(): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!configured) return@runCatching
+
+            val request = Request.Builder()
+                .url("$base/publish")
+                .header("Accept", "application/json")
+                .apply { if (token.isNotBlank()) header("X-Api-Key", token) }
+                .post("{}".toRequestBody(ARCHIVE_MEDIA))
+                .build()
+
+            http.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw IOException("server HTTP ${response.code}")
+            }
+        }
+    }
+
+    /**
      * يحذف الريل من الخادم: ملفه من R2 وكل معلوماته من Firebase.
      * لا يُقبل الحذف أثناء خطوة نشر جارية (يردّ الخادم 409).
      */
