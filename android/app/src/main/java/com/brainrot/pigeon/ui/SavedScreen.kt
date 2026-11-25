@@ -229,7 +229,11 @@ fun ReelsRoute(container: AppContainer) {
     editItem?.let { target ->
         ScheduleEditDialog(
             initialAt = target.schedule?.at?.takeIf { it > System.currentTimeMillis() }
-                ?: SchedulePlanner.defaultManualDate(
+                ?: ScheduleSlots.at(
+                    SchedulePlanner.defaultManualDate(
+                        ScheduleSlots.PUBLISH_HOUR,
+                        ScheduleSlots.PUBLISH_MINUTE,
+                    ),
                     ScheduleSlots.PUBLISH_HOUR,
                     ScheduleSlots.PUBLISH_MINUTE,
                 ),
