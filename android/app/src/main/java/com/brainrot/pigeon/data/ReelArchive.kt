@@ -113,10 +113,11 @@ class ReelArchive(
     private val appContext = context.applicationContext
     private val base = endpoint.trim().trimEnd('/')
 
-    // التحميل الحقيقي قد يأخذ دقائق: بلا مهلة إجمالية ومهلة قراءة سخية.
+    // التحميل الحقيقي قد يأخذ دقائق، و"انشر الآن" ينتظر معالجة الحاوية عند Meta
+    // داخل نفس الطلب: بلا مهلة إجمالية ومهلة قراءة سخية.
     private val http: OkHttpClient = baseClient.newBuilder()
         .callTimeout(0, TimeUnit.SECONDS)
-        .readTimeout(90, TimeUnit.SECONDS)
+        .readTimeout(150, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 

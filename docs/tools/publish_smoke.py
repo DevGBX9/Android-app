@@ -253,6 +253,9 @@ async def main():
     assert blocked.status == 409
 
     # تشغيلان متزامنان لا ينشران الريل مرتين (حجز ETag).
+    # قفل النشر من التشغيل السابق لسا داخل فاصل الدقيقتين، فلو تركنا هيمنع
+    # البدء ويقيس الاختبار فاصل النشر بدل التداخل. نصفّره هنا.
+    STATE["db"].pop("worker", None)
     STATE["db"]["reels"] = {"reel-4": {"url": "https://instagram.com/reel/xyz"}}
     STATE["db"]["schedules"] = {
         "reel-4": {
@@ -288,6 +291,37 @@ async def main():
     assert final.get("state") == "unverified"
     assert "reels/reel-5.mp4" in STATE["objects"], "the file was deleted without confirmation"
     assert "reel-5" in STATE["db"].get("reels", {})
+
+    # "انشر الآن": ينشر ويتنظّف في نفس الطلب، بلا انتظار الموعد وبلا ضغطة ثانية.
+    class FakeRequest:
+        def __init__(self, payload):
+            self._payload = payload
+
+        async def json(self):
+            return self._payload
+
+    STATE["db"]["reels"] = {"reel-6": {"url": "https://instagram.com/reel/now"}}
+    STATE["db"]["schedules"] = {
+        "reel-6": {
+            "at": now + 10 * 24 * 3600 * 1000,  # موعد بعيد: النشر اليدوي يتجاهله
+            "state": "scheduled",
+            "timezone": "Africa/Algiers",
+        }
+    }
+    STATE["objects"]["reels/reel-6.mp4"] = b"now-bytes"
+    STATE["publishes"] = 0
+    STATE["slow_publish"] = False
+    STATE["ig_media"] = {}
+    STATE["verify_ok"] = True
+    reply = await worker._publish_now(FakeRequest({"id": "reel-6"}))
+    body = json.loads(reply._body)
+    print("publish-now:", reply.status, body)
+    assert reply.status == 200 and body["ok"] is True, "publish-now did not publish"
+    assert STATE["publishes"] == 1, "publish-now must call media_publish once"
+    assert "reels/reel-6.mp4" not in STATE["objects"], (
+        "the archived file must be deleted after publishing"
+    )
+    assert not STATE["db"].get("reels") and not STATE["db"].get("schedules")
 
     print("SMOKE OK")
 

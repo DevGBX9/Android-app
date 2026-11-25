@@ -17,7 +17,7 @@ R2، ويحدّث حالة المعالجة والتقدّم في Firebase Realt
     GET  /media/<id>           نفس الملف للعرض العام (لـMeta، بلا مفتاح)
     GET  /schedules            وقت الخادم والوقت المتبقي وحالة كل موعد
     POST /schedules            {"id", "at"} -> يكتب الموعد ويزيحه لو تداخل
-    POST /publish-now          {"id"} -> يلغي العدّاد وينشر الريل الآن بنفس السلسلة
+    POST /publish-now          {"id"} -> ينشر الريل الآن (يتجاهل الموعد) ثم يحذف وينظّف
     GET|POST /publish          تشغيل المجدول فوراً (احتياط للـcron)
 
 كل الطلبات تُرفض إذا لم يكن `API_TOKEN` مضبوطاً في الأسرار، ولم يكن الترويسة
@@ -81,6 +81,13 @@ MIN_SLOT_GAP_MS = 5 * 60 * 1000
 PUBLISH_GAP_MS = 2 * 60 * 1000
 PUBLISH_BUSY = "waiting for the reel that is publishing now"
 PUBLISH_LOCK_PATH = "worker/publishLock.json"
+
+# "انشر الآن" ينفّذ السلسلة كلها داخل الطلب نفسه: أرشفة إن لزم، إنشاء الحاوية،
+# انتظار جاهزيتها عند Meta، media_publish، تأكيد، ثم حذف الملف والتنظيف.
+# الميزانية زمنية (نوم لا حساب) لأن معالجة الفيديو عند Meta تحتاج دقائق أحياناً،
+# والمهلة القصيرة كانت تخلّي أول ضغطة ترجع "prepared" بلا نشر.
+PUBLISH_NOW_BUDGET_S = 90
+PUBLISH_NOW_POLL_S = 2.5
 
 # نُجهّز حاوية إنستغرام قبل الموعد: إنشاء الحاوية من الفيديو يستغرق دقائق عند
 # Meta، ولو انتظرنا لحظة الموعد لظهر الريل متأخراً عن الوقت المعروض في التطبيق.
@@ -915,6 +922,13 @@ def _describe(exc):
     return text or exc.__class__.__name__
 
 
+def _truthy(value):
+    """حقل منطقي من Firebase: قد يوصل bool كما هو أو كنص."""
+    if isinstance(value, bool):
+        return value
+    return _clean(value).lower() in ("1", "true", "yes")
+
+
 async def _ig_published_media(user_id, token, since_ms):
     """هل نُشر ريل جديد على الحساب بعد `since_ms`؟ يرجّع معرّفه أو None.
 
@@ -1061,7 +1075,7 @@ class Default(WorkerEntrypoint):
                 {
                     "ok": True,
                     "service": "pigeon-reels",
-                    "version": 9,
+                    "version": 10,
                     "routes": [
                         "POST /reels",
                         "GET /reels/<id>",
@@ -1623,11 +1637,15 @@ class Default(WorkerEntrypoint):
         )
 
     async def _publish_now(self, request):
-        """ينشر الريل فوراً: يُلغي العدّاد ثم يمشي في سلسلة النشر العادية نفسها.
+        """ينشر الريل الآن ويتجاهل الموعد: سلسلة كاملة داخل هذا الطلب.
 
-        لا يوجد مسار نشر ثانٍ: نُقدّم موعد الموعد إلى اللحظة الحالية فقط، ثم
-        تتولى `_advance` الخطوات نفسها (تجهيز الحاوية، media_publish، التأكيد،
-        التنظيف) كما لو أن العدّاد وصل صفراً، فلا يختلف النشر اليدوي عن الطبيعي.
+        الخطوات بالترتيب: تأكيد أن الفيديو في R2 (وأرشفته فوراً لو ما وصل)،
+        إنشاء حاوية إنستغرام الآن بلا انتظار مهلة التجهيز المسبق، إلغاء العدّاد
+        (at = الآن)، ثم الانتظار حتى تصير الحاوية FINISHED عند Meta والنشر
+        والتأكيد وحذف الملف من R2 وسجلات Firebase.
+
+        السبب: الضغطة الأولى كانت تنتهي بعد ~16 ثانية والحاوية ما زالت تُعالج،
+        فترجع الحالة prepared بلا نشر، ولا ينشر إلا بعد ضغطة ثانية بعد دقائق.
         """
         try:
             body = await request.json()
@@ -1653,67 +1671,127 @@ class Default(WorkerEntrypoint):
         if state == STAGE_UNVERIFIED:
             return _error("the last publish is unconfirmed; check Instagram first", 409)
 
-        # ريل واحد ينشر في المرة: لا نُقحم هذا الريل وسط نشر ريل آخر.
-        if not await self._publish_slot_free(db, schedule_id, now):
+        # ريل واحد ينشر في المرة، لكن الضغط اليدوي لا ينتظر فاصل الدقيقتين.
+        if not await self._publish_slot_free(db, schedule_id, now, ignore_gap=True):
             return _error(PUBLISH_BUSY, 409)
 
+        # 1) الفيديو في التخزين: لو الأرشفة وقت المشاركة ما كملت، تؤرشف الآن.
+        if await _object_exists(self.env, self._key(schedule_id)) is not True:
+            if not await self._archive_now(db, schedule_id):
+                return _error(
+                    "the reel could not be archived yet, try again", 503
+                )
+
+        # 2) حاوية إنستغرام: تُنشأ الآن، لا تُترك لخطوة التجهيز المجدولة.
         container_id = _clean(current.get("containerId"))
+        if not container_id:
+            container_id, error = await self._prepare_container(schedule_id)
+            if not container_id:
+                await _firebase_patch(
+                    db,
+                    path,
+                    {"error": error, "updatedAt": int(time.time() * 1000)},
+                )
+                return _json(
+                    {
+                        "ok": False,
+                        "id": schedule_id,
+                        "state": state,
+                        "error": error or "instagram did not return a container id",
+                        "serverTime": int(time.time() * 1000),
+                        "remainingMs": 0,
+                    },
+                    status=503,
+                )
+
+        # 3) العدّاد يُلغى: الموعد صار الآن، و"انشر الآن" يعلَّم على السجل.
+        moment = int(time.time() * 1000)
         status = await _firebase_patch(
             db,
             path,
             {
-                # الموعد صار الآن: العدّاد ينتهي ويبدأ النشر في نفس اللحظة.
-                "at": now,
-                "state": STAGE_PREPARED if container_id else STAGE_SCHEDULED,
+                "at": moment,
+                "state": STAGE_PREPARED,
+                "containerId": container_id,
                 "attempts": 0,
                 "error": None,
                 "stageAt": 0,
                 "manualPublish": True,
-                "manualAt": now,
-                "updatedAt": now,
+                "manualAt": moment,
+                "updatedAt": moment,
             },
         )
         if status != 200:
             return _error("could not start the publish (firebase %d)" % status, 502)
 
+        # 4) النشر ثم التأكيد ثم الحذف والتنظيف، كلها قبل الردّ.
         state, error = await self._advance_now(db, schedule_id)
         if error == ARCHIVE_WAIT:
-            error = "the reel is still being archived on the server"
+            error = "the reel archive is not ready on the server"
+
+        published = state in (STAGE_PUBLISHED, STAGE_CLEANING)
+        if not published and error is None:
+            error = "instagram is still processing the video; press again in a minute"
 
         return _json(
             {
-                "ok": error is None,
+                "ok": published,
                 "id": schedule_id,
                 "state": state,
-                "error": error,
+                "error": None if published else error,
                 "serverTime": int(time.time() * 1000),
                 "remainingMs": 0,
-            }
+            },
+            status=200 if published else 202,
         )
 
-    async def _advance_now(self, db, schedule_id, budget_s=14):
-        """يمشي بالخطوات فوراً بعد إلغاء العدّاد بدل انتظار دورة cron.
+    async def _archive_now(self, db, schedule_id):
+        """يؤرشف ريلاً فوراً لو ملفه مو في R2 بعد (نفس منطق `_archive_missing`).
 
-        حاوية إنستغرام تحتاج وقتاً قصيراً حتى تنتهي معالجة الفيديو، فننتظر داخل
-        نفس الطلب مدة محدودة؛ وإن لم تنتهِ يكمل cron من الحالة التي وقفنا عندها،
-        فلا يُنشر شيء مرتين ولا يبقى الريل معلقاً.
+        يرجّع True فقط إذا صار الملف موجوداً فعلاً في R2 بعد المحاولة.
+        """
+        reel = await _firebase_get(db, f"reels/{schedule_id}.json") or {}
+        if not isinstance(reel, dict):
+            return False
+
+        link = _clean(reel.get("url"))
+        code = _instagram_code(link)
+        tiktok = None if code else _tiktok_link(link)
+        if not code and not tiktok:
+            return False
+
+        await self._archive(
+            reel_id=schedule_id,
+            code=code,
+            tiktok=tiktok,
+            source="instagram" if code else "tiktok",
+            origin=_ig_public_base(self.env),
+            thumbnail=_clean(reel.get("thumbnail")) or None,
+            app_media=_safe_media_url(reel.get("media")),
+        )
+        return await _object_exists(self.env, self._key(schedule_id)) is True
+
+    async def _advance_now(self, db, schedule_id, budget_s=PUBLISH_NOW_BUDGET_S):
+        """يمشي بالسلسلة فوراً بعد إلغاء العدّاد، حتى النشر والتنظيف.
+
+        معالجة الفيديو عند Meta تحتاج ثواني إلى دقائق قبل أن تصير الحاوية
+        `FINISHED`، فالمتابعة هنا زمنية (نوم بين المحاولات) لا بعدد دورات: المهلة
+        القديمة (ثماني دورات ≈ 16 ثانية) كانت ترجع وفيها الحاوية ما زالت تُعالج،
+        فيظهر للمالك أن "انشر الآن" ما عمل شي حتى يضغط مرة ثانية بعد دقائق.
         """
         deadline = time.monotonic() + budget_s
         state = STAGE_SCHEDULED
         error = None
-        final = (
-            STAGE_PUBLISHING,
-            STAGE_VERIFYING,
-            STAGE_CLEANING,
-            STAGE_PUBLISHED,
-            STAGE_FAILED,
-            STAGE_UNVERIFIED,
-        )
+        final = (STAGE_PUBLISHED, STAGE_FAILED, STAGE_UNVERIFIED)
 
-        for _ in range(8):
+        while time.monotonic() < deadline:
             current, _etag = await _firebase_read(db, f"schedules/{schedule_id}.json")
             if not isinstance(current, dict):
+                # خطوة التنظيف مسحت السجل: النشر تمّ فعلاً وانتهى.
+                if state in (STAGE_VERIFYING, STAGE_CLEANING, STAGE_PUBLISHED):
+                    return STAGE_PUBLISHED, None
                 return state, "the schedule record disappeared"
+
             state = _stage_of(current)
             if state in final:
                 break
@@ -1721,18 +1799,22 @@ class Default(WorkerEntrypoint):
             state, error = await self._advance(
                 db, schedule_id, current, int(time.time() * 1000)
             )
-            if error in (ARCHIVE_WAIT, PUBLISH_BUSY) or state in final:
+            if state in final:
                 break
-            if time.monotonic() >= deadline:
-                break
-            await asyncio.sleep(2)
+            if error in (ARCHIVE_WAIT, PUBLISH_BUSY):
+                break  # لا فائدة من الانتظار: يحتاج الملف أو خانة نشر حرّة
+            await asyncio.sleep(PUBLISH_NOW_POLL_S)
 
         return state, error
 
-    async def _publish_slot_free(self, db, schedule_id, now):
-        """هل يحق لهذا الريل أن يبدأ النشر الآن دون أن يتداخل مع ريل آخر؟"""
+    async def _publish_slot_free(self, db, schedule_id, now, ignore_gap=False):
+        """هل يحق لهذا الريل أن يبدأ النشر الآن دون أن يتداخل مع ريل آخر؟
+
+        [ignore_gap] لنشر يدوي من المالك: يتجاهل فاصل الدقيقتين بعد نشر الريل
+        السابق، لكنه لا يسمح أبداً بالتداخل مع ريل ما زال ينشر الآن.
+        """
         lock = await _firebase_get(db, PUBLISH_LOCK_PATH) or {}
-        if isinstance(lock, dict):
+        if isinstance(lock, dict) and not ignore_gap:
             busy_id = _safe_id(lock.get("id"))
             started = _int_of(lock, "at")
             if (
@@ -2012,8 +2094,12 @@ class Default(WorkerEntrypoint):
             return _clean(payload.get("state"), state), payload.get("error")
 
         # 2ب) ريل واحد ينشر في المرة: لا نبدأ media_publish وريل آخر ينشر أو
-        # يتحقق أو ينظف، ولا قبل مدة كافية من بدء نشر الريل السابق.
-        if not await self._publish_slot_free(db, schedule_id, moment):
+        # يتحقق أو ينظف، ولا قبل مدة كافية من بدء نشر الريل السابق. النشر اليدوي
+        # (manualPublish) يتجاوز الفاصل الزمني فقط، لا التداخل مع نشر جارٍ.
+        manual = _truthy(current.get("manualPublish"))
+        if not await self._publish_slot_free(
+            db, schedule_id, moment, ignore_gap=manual
+        ):
             return state, PUBLISH_BUSY
 
         # 2ج) نحجز خطوة النشر قبل النداء الخارجي نفسه.
