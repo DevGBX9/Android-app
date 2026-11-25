@@ -6,7 +6,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
@@ -350,29 +349,20 @@ private fun ShareOverlay(
                                 targetState.phase is SharePhase.Scheduling
                             if (bothScheduling) {
                                 val forward = targetState.step.ordinal > initialState.step.ordinal
-                                (
-                                    slideInHorizontally(
-                                        animationSpec = tween(280, easing = FastOutSlowInEasing),
-                                        initialOffsetX = { width -> if (forward) width / 2 else -width / 2 },
-                                    ) + fadeIn(tween(200))
-                                    ).togetherWith(
-                                    slideOutHorizontally(
-                                        animationSpec = tween(220, easing = FastOutSlowInEasing),
-                                        targetOffsetX = { width -> if (forward) -width / 2 else width / 2 },
-                                    ) + fadeOut(tween(130)),
-                                )
+                                val enter = slideInHorizontally(
+                                    animationSpec = tween(280, easing = FastOutSlowInEasing),
+                                    initialOffsetX = { width -> if (forward) width / 2 else -width / 2 },
+                                ) + fadeIn(tween(200))
+                                val exit = slideOutHorizontally(
+                                    animationSpec = tween(220, easing = FastOutSlowInEasing),
+                                    targetOffsetX = { width -> if (forward) -width / 2 else width / 2 },
+                                ) + fadeOut(tween(130))
+                                enter togetherWith exit
                             } else {
                                 fadeIn(tween(200, easing = FastOutSlowInEasing)) togetherWith
                                     fadeOut(tween(120))
                             }
-                        }.using(
-                            SizeTransform(
-                                clip = false,
-                                sizeAnimationSpec = { _, _ ->
-                                    tween(300, easing = FastOutSlowInEasing)
-                                },
-                            ),
-                        ),
+                        },
                         contentAlignment = Alignment.TopCenter,
                         label = "share-content",
                     ) { key ->
