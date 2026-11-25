@@ -51,6 +51,8 @@
     <string name="reel_downloading">Downloading %1$d%%</string>
     <string name="reel_deleted">Deleted</string>
     <string name="reel_number">Reel #%1$d</string>
+    <string name="reel_settings">Reel settings</string>
+    <string name="reel_no_date">Not scheduled</string>
     <string name="reel_countdown">in %1$s</string>
     <string name="reel_countdown_now">publishing…</string>
     <string name="reel_state_waiting">on the server…</string>

@@ -50,8 +50,8 @@ import com.brainrot.pigeon.ui.theme.Bubble
 import com.brainrot.pigeon.ui.theme.BubbleText
 import com.brainrot.pigeon.ui.theme.TextPrimary
 
-private val ShimmerBase = Color(0xFF232A31)
-private val ShimmerHighlight = Color(0xFF3B454F)
+private val ShimmerBase = Color(0xFF1E1E1E)
+private val ShimmerHighlight = Color(0xFF3A3A3A)
 
 // نفس نسب الصورة المرجعية: الأفاتار 76dp، فقاعة أعرض قليلاً من الأفاتار
 // ومُلتصقة فيه، البايو تحت العمود الأيسر، والاسم والإحصائيات على اليمين بمحاذاة

@@ -145,6 +145,29 @@ class SavedRepository(
     suspend fun publishNow(item: SavedItem): Result<Unit> = archive.publishNow(item.id)
 
     /**
+     * ترتيب الشبكة: الخادم يعيد توزيع المواعيد نفسها على الريلز حسب ترتيب
+     * [ids]، ثم نحفظ المواعيد التي أكدها محلياً حتى لا تختلف بعد إغلاق التطبيق.
+     */
+    suspend fun reorder(ids: List<String>): Result<Unit> {
+        val times = archive.reorder(ids).getOrElse { return Result.failure(it) }
+        if (times.isEmpty()) return Result.success(Unit)
+
+        context.savedStore.edit { prefs ->
+            val next = decode(prefs[SAVED_ITEMS_KEY]).map { item ->
+                val at = times[item.id] ?: return@map item
+                item.copy(
+                    schedule = (item.schedule ?: PublishSchedule()).copy(
+                        at = at,
+                        state = ScheduleSlots.STATE_SCHEDULED,
+                    ),
+                )
+            }
+            prefs[SAVED_ITEMS_KEY] = json.encodeToString(next)
+        }
+        return Result.success(Unit)
+    }
+
+    /**
      * العدّ التنازلي من الخادم: وقت الخادم والوقت المتبقي لكل ريل في طلب واحد.
      * لا حساب لموعد أو لعدّاد داخل التطبيق.
      */

@@ -89,7 +89,8 @@ import java.time.LocalDate
 import java.time.ZoneOffset
 import kotlinx.coroutines.launch
 
-private val InstagramGradient = listOf(Color(0xFFF58529), Color(0xFFE1306C), Color(0xFF8134AF))
+// شارة الريل في نافذة المشاركة: نفس الرمادي المستخدم في التطبيق بلا أي لون.
+private val CardGradient = listOf(Color(0xFF3C3C3C), Color(0xFF1E1E1E))
 
 private sealed interface SharePhase {
     data object Working : SharePhase
@@ -453,7 +454,7 @@ private fun MarkBadge() {
         modifier = Modifier
             .size(46.dp)
             .clip(CircleShape)
-            .background(Brush.linearGradient(InstagramGradient)),
+            .background(Brush.linearGradient(CardGradient)),
         contentAlignment = Alignment.Center,
     ) {
         ReelGlyph(color = Color.White, modifier = Modifier.size(21.dp))

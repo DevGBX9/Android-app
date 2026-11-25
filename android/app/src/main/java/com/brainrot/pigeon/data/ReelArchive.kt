@@ -18,6 +18,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonArray
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -87,6 +88,14 @@ private data class ScheduleReply(
 private data class PublishReply(
     val ok: Boolean = false,
     val state: String = "",
+    val error: String? = null,
+)
+
+/** ردّ الخادم بعد ترتيب الشبكة: المواعيد التي أقرّها لكل ريل. */
+@Serializable
+private data class ReorderReply(
+    val ok: Boolean = false,
+    val times: Map<String, Long> = emptyMap(),
     val error: String? = null,
 )
 
@@ -281,6 +290,44 @@ class ReelArchive(
             }
         }
     }
+
+    /**
+     * يرسل ترتيب الشبكة الجديد: الخادم يعيد توزيع المواعيد نفسها على الريلز
+     * حسب هذا الترتيب، ويرجّع الموعد الذي صار لكل ريل.
+     */
+    suspend fun reorder(ids: List<String>): Result<Map<String, Long>> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                if (!configured) throw IOException("the archive service is not configured")
+                if (ids.size < 2) return@runCatching emptyMap()
+
+                val payload = buildJsonObject {
+                    putJsonArray("ids") { ids.forEach { add(it) } }
+                }.toString().toRequestBody(ARCHIVE_MEDIA)
+
+                val request = Request.Builder()
+                    .url("$base/schedules/order")
+                    .header("Accept", "application/json")
+                    .apply { if (token.isNotBlank()) header("X-Api-Key", token) }
+                    .post(payload)
+                    .build()
+
+                http.newCall(request).execute().use { response ->
+                    val text = runCatching { response.body?.string().orEmpty() }.getOrDefault("")
+                    val reply = runCatching {
+                        json.decodeFromString<ReorderReply>(text)
+                    }.getOrNull()
+
+                    if (!response.isSuccessful) {
+                        throw IOException(
+                            reply?.error?.takeIf { it.isNotBlank() }
+                                ?: "server HTTP ${response.code}",
+                        )
+                    }
+                    reply?.times ?: emptyMap()
+                }
+            }
+        }
 
     /**
      * يحذف الريل من الخادم: ملفه من R2 وكل معلوماته من Firebase.

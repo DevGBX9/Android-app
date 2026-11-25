@@ -323,6 +323,48 @@ async def main():
     )
     assert not STATE["db"].get("reels") and not STATE["db"].get("schedules")
 
+    # ترتيب الشبكة: المواعيد نفسها تتبادل بين الريلز حسب مكان السحب.
+    day = 24 * 3600 * 1000
+    base = now + 40 * day
+    STATE["db"]["reels"] = {
+        "reel-a": {"url": "https://instagram.com/reel/a"},
+        "reel-b": {"url": "https://instagram.com/reel/b"},
+        "reel-c": {"url": "https://instagram.com/reel/c"},
+    }
+    STATE["db"]["schedules"] = {
+        "reel-a": {"at": base, "state": "scheduled", "timezone": "Africa/Algiers"},
+        "reel-b": {
+            "at": base + day,
+            "state": "prepared",
+            "timezone": "Africa/Algiers",
+            "containerId": "container-1",
+        },
+        "reel-c": {"at": base + 2 * day, "state": "scheduled", "timezone": "Africa/Algiers"},
+    }
+    moved = await worker._reorder_schedules(
+        FakeRequest({"ids": ["reel-c", "reel-a", "reel-b"]})
+    )
+    print("reorder:", moved.status, json.loads(moved._body))
+    reordered = STATE["db"]["schedules"]
+    assert moved.status == 200, "reorder was rejected"
+    assert reordered["reel-c"]["at"] == base
+    assert reordered["reel-a"]["at"] == base + day
+    assert reordered["reel-b"]["at"] == base + 2 * day
+    # الحاوية القديمة أُلغيت والحالة رجعت scheduled لتُحضّر عند الموعد الجديد.
+    assert reordered["reel-b"]["state"] == "scheduled"
+    assert not reordered["reel-b"].get("containerId")
+    assert reordered["reel-b"]["timezone"] == "Africa/Algiers"
+
+    # ريل يُنشر الآن: لا سحب حتى ينتهي، والمواعيد تبقى كما هي.
+    STATE["db"]["schedules"]["reel-a"]["state"] = "publishing"
+    before = STATE["db"]["schedules"]["reel-a"]["at"]
+    blocked_order = await worker._reorder_schedules(
+        FakeRequest({"ids": ["reel-a", "reel-c"]})
+    )
+    print("reorder while publishing:", blocked_order.status)
+    assert blocked_order.status == 409
+    assert STATE["db"]["schedules"]["reel-a"]["at"] == before
+
     print("SMOKE OK")
 
 

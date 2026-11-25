@@ -18,6 +18,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -37,6 +38,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -51,6 +53,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -69,14 +72,20 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
@@ -97,12 +106,15 @@ import com.brainrot.pigeon.ui.theme.TextPrimary
 import com.brainrot.pigeon.ui.util.openExternal
 import com.brainrot.pigeon.ui.util.toast
 import kotlinx.coroutines.delay
+import kotlin.math.floor
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
-private val CellTop = Color(0xFF1C232B)
-private val CellBottom = Color(0xFF0F141A)
-private val DeleteRed = Color(0xFFFF4D4D)
+// الشبكة بلا لون: رمادي فقط، والتعتيم والإطار الأبيض هما ما يميّز الحالة.
+private val CellTop = Color(0xFF1E1E1E)
+private val CellBottom = Color(0xFF101010)
+private val DeleteTint = Color(0xFFF0F0F0)
+private val ErrorTint = Color(0xFFDFDFDF)
 
 // نصف قطر الريل: 9:16 مثل تبويب الريلز في إنستغرام.
 private const val REEL_ASPECT = 9f / 16f
@@ -110,9 +122,14 @@ private const val GRID_COLUMNS = 3
 
 /**
  * صفحة الريلز: شريط أيقونة الشبكة مثل إنستغرام ثم خانات ريلز قائمة (9:16)
- * بصور غلاف حقيقية من إنستغرام. الضغط يفتح الريل، والضغط المطوّل يفتح قائمة
- * سفلية بأنماط إنستغرام (تحميل، تغيير الموعد، حذف). الخانة التي تُنشر أو
- * تُحذف تعرض علامة صح أو سلة حمراء بأنيميشن ثم تختفي.
+ * بصور غلاف حقيقية من إنستغرام.
+ *
+ * - الضغط القصير يفتح الريل، وزر الثلاث نقاط داخل الخانة يفتح الإعدادات.
+ * - الضغط المطوّل ثم السحب ينقل الريل بين الخانات، والمواعيد تتبادل معه:
+ *   الريل الذي ترفعه فوق ريل أبعد يأخذ موعده الأقرب، والعكس.
+ *
+ * وسط كل خانة تاريخ نشرها بالتفصيل فوق غلاف باهت، والخانة التي تُنشر أو
+ * تُحذف تعرض علامتها بأنيميشن ثم تختفي.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -138,6 +155,18 @@ fun ReelsRoute(container: AppContainer) {
     // الخانة التي فُتحت لها القائمة السفلية، والريل الذي يُعدَّل موعده.
     var sheetFor by remember { mutableStateOf<SavedItem?>(null) }
     var editingFor by remember { mutableStateOf<SavedItem?>(null) }
+
+    // سحب الريل: الترتيب المحلي تحت الإصبع، وإزاحته عن خانته الأولى.
+    val gridState = rememberLazyGridState()
+    var drag by remember { mutableStateOf<ReelDrag?>(null) }
+    // بعد الإفلات قد يصل نقرة عالقة من نفس الإصبع: نتجاهلها لبرهة.
+    var lastDragEnd by remember { mutableLongStateOf(0L) }
+    val reorderGap = with(LocalDensity.current) { 2.dp.toPx() }
+
+    // أثناء السحب نعرض ترتيب الإصبع نفسه، وبعد الإفلات يعود ترتيب الخادم.
+    val shown = drag?.order ?: items
+    // الخانات القابلة للسحب: المجدولة وليست في طريق النشر الآن.
+    val reorderableRange = remember(shown) { shown.reorderableRange() }
 
     // نقرأ العنصر من القائمة الحيّة: لو نُشر أو اختفى أثناء فتح القائمة تُغلق.
     val sheetItem = sheetFor?.let { target -> items.firstOrNull { it.id == target.id } }
@@ -192,6 +221,7 @@ fun ReelsRoute(container: AppContainer) {
                 EmptyReels(Modifier.fillMaxSize())
             } else {
                 LazyVerticalGrid(
+                    state = gridState,
                     columns = GridCells.Fixed(GRID_COLUMNS),
                     modifier = Modifier
                         .fillMaxSize()
@@ -201,15 +231,17 @@ fun ReelsRoute(container: AppContainer) {
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     itemsIndexed(
-                        items = items,
+                        items = shown,
                         key = { _, item -> item.id },
                         contentType = { _, _ -> "reel" },
-                    ) { index, item ->
+                    ) { _, item ->
                         ReelCell(
-                            // ظهور الخانة الجديدة وانزلاق الباقي عند الحذف.
-                            modifier = Modifier.animateItem(),
+                            // ظهور الخانة الجديدة وانزلاق الباقي عند الحذف، والريل
+                            // المسحوب يطلع فوق البقية أثناء تحريكه.
+                            modifier = Modifier
+                                .animateItem()
+                                .zIndex(if (drag?.id == item.id) 1f else 0f),
                             item = item,
-                            number = index + 1,
                             clock = clock,
                             // بقية الشبكة تبهت والخانة المفتوحة إعداداتها تبرز.
                             dimmed = sheetItem != null && sheetItem?.id != item.id,
@@ -217,8 +249,31 @@ fun ReelsRoute(container: AppContainer) {
                             images = images,
                             download = downloads[item.id],
                             exit = exits[item.id],
-                            onClick = { openReel(context, item) },
-                            onLongClick = { sheetFor = item },
+                            dragging = drag?.id == item.id,
+                            dragOffset = drag?.takeIf { it.id == item.id }?.offset ?: Offset.Zero,
+                            onDragStart = { cell ->
+                                drag = ReelDrag(item.id, shown, Offset.Zero, cell)
+                            },
+                            onDrag = { delta ->
+                                drag?.let { current ->
+                                    drag = current.moved(delta, reorderGap, reorderableRange)
+                                }
+                            },
+                            onDragEnd = {
+                                lastDragEnd = System.currentTimeMillis()
+                                val finished = drag
+                                drag = null
+                                if (finished != null) {
+                                    viewModel.reorder(finished.order.map { reel -> reel.id })
+                                }
+                            },
+                            onDragCancel = { drag = null },
+                            onClick = {
+                                if (System.currentTimeMillis() - lastDragEnd > 300L) {
+                                    openReel(context, item)
+                                }
+                            },
+                            onOpenSettings = { sheetFor = item },
                         )
                     }
                 }
@@ -271,8 +326,8 @@ fun ReelsRoute(container: AppContainer) {
 }
 
 /**
- * قائمة سفلية مثل إنستغرام: تُفتح من الضغطة المطوّلة، صفوفها أيقونة ونص،
- * وتُغلق بالضغط على الخلفية الفارغة أو بالسحب للأسفل.
+ * قائمة سفلية مثل إنستغرام: تُفتح من زر الثلاث نقاط داخل الخانة، صفوفها
+ * أيقونة ونص، وتُغلق بالضغط على الخلفية الفارغة أو بالسحب للأسفل.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -398,12 +453,12 @@ private fun ReelSheet(
                 } else {
                     stringResource(R.string.reel_delete)
                 },
-                tint = DeleteRed,
+                tint = DeleteTint,
                 onClick = {
                     if (confirmingDelete) onDelete() else confirmingDelete = true
                 },
             ) {
-                TrashGlyph(color = DeleteRed, modifier = Modifier.size(22.dp))
+                TrashGlyph(color = DeleteTint, modifier = Modifier.size(22.dp))
             }
         }
     }
@@ -472,15 +527,20 @@ private fun ReelsHeader() {
 private fun ReelCell(
     modifier: Modifier = Modifier,
     item: SavedItem,
-    number: Int,
     clock: StateFlow<Long>,
     dimmed: Boolean,
     focused: Boolean,
     images: AvatarLoader,
     download: DownloadUi?,
     exit: ReelExitKind?,
+    dragging: Boolean,
+    dragOffset: Offset,
+    onDragStart: (IntSize) -> Unit,
+    onDrag: (Offset) -> Unit,
+    onDragEnd: () -> Unit,
+    onDragCancel: () -> Unit,
     onClick: () -> Unit,
-    onLongClick: () -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     val thumbnail by produceState<ImageBitmap?>(initialValue = null, item.thumbnail) {
         value = item.thumbnail
@@ -512,48 +572,60 @@ private fun ReelCell(
         label = "cell-dim",
     )
 
+    val haptics = LocalHapticFeedback.current
+
     Box(
         modifier = modifier
             .fillMaxWidth()
             .aspectRatio(REEL_ASPECT)
-            .clip(RoundedCornerShape(4.dp))
+            .clip(RoundedCornerShape(6.dp))
             .background(Brush.linearGradient(listOf(CellTop, CellBottom)))
-            .graphicsLayer(alpha = dimAlpha)
+            .graphicsLayer(
+                alpha = dimAlpha,
+                translationX = dragOffset.x,
+                translationY = dragOffset.y,
+                scaleX = if (dragging) 1.06f else 1f,
+                scaleY = if (dragging) 1.06f else 1f,
+            )
             .then(
-                if (focused) {
-                    Modifier.border(1.dp, Accent, RoundedCornerShape(4.dp))
+                if (focused || dragging) {
+                    Modifier.border(1.dp, Accent, RoundedCornerShape(6.dp))
                 } else {
                     Modifier
                 },
             )
-            .combinedClickable(
-                enabled = exit == null,
-                onClick = onClick,
-                onLongClick = onLongClick,
-            ),
+            // الضغط المطوّل بداية السحب: الحركة بعده تنقل الريل بين الخانات.
+            .pointerInput(item.id, item.schedule?.at, item.schedule?.state, exit) {
+                if (exit != null || !item.canDrag()) return@pointerInput
+                detectDragGesturesAfterLongPress(
+                    onDragStart = {
+                        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onDragStart(size)
+                    },
+                    onDrag = { change, amount ->
+                        change.consume()
+                        onDrag(amount)
+                    },
+                    onDragEnd = { onDragEnd() },
+                    onDragCancel = { onDragCancel() },
+                )
+            }
+            .clickable(enabled = exit == null, onClick = onClick),
     ) {
         if (bitmap != null) {
+            // الغلاف خلفية باهتة: نخفض شفافيته ثم نعتّمه حتى يبرز التاريخ في وسطه.
             Image(
                 bitmap = bitmap,
                 contentDescription = reelLabel(item),
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
                     .fillMaxSize()
-                    .graphicsLayer(alpha = thumbAlpha),
+                    .graphicsLayer(alpha = 0.55f * thumbAlpha),
             )
-
-            // تعتيم سفلي حتى يبقى كود الريل واضحاً فوق الصورة.
             Box(
                 Modifier
                     .fillMaxSize()
-                    .background(
-                        Brush.verticalGradient(
-                            colorStops = arrayOf(
-                                0.55f to Color.Transparent,
-                                1f to Color.Black.copy(alpha = 0.62f),
-                            ),
-                        ),
-                    ),
+                    .background(Color.Black.copy(alpha = 0.42f)),
             )
         } else {
             ReelGlyph(
@@ -564,38 +636,53 @@ private fun ReelCell(
             )
         }
 
-        AnimatedVisibility(
-            visible = item.registered,
-            enter = fadeIn(tween(200)) + scaleIn(tween(220), initialScale = 0.6f),
-            exit = fadeOut(tween(120)) + scaleOut(tween(160), targetScale = 0.6f),
-            modifier = Modifier.align(Alignment.TopEnd),
-        ) {
+        // زر الإعدادات: ثلاث نقاط داخل الخانة، بدل الضغط المطوّل الذي صار للسحب.
+        if (exit == null) {
             Box(
                 modifier = Modifier
-                    .padding(5.dp)
-                    .size(19.dp)
+                    .align(Alignment.TopStart)
+                    .padding(4.dp)
+                    .size(30.dp)
                     .clip(CircleShape)
-                    .background(Color.Black.copy(alpha = 0.42f)),
+                    .background(Color.Black.copy(alpha = 0.45f))
+                    .clickable(
+                        onClickLabel = stringResource(R.string.reel_settings),
+                        onClick = onOpenSettings,
+                    ),
                 contentAlignment = Alignment.Center,
             ) {
-                Icon(
-                    imageVector = Icons.Filled.Check,
-                    contentDescription = stringResource(R.string.reels_registered),
-                    tint = Accent,
-                    modifier = Modifier.size(12.dp),
-                )
+                DotsGlyph(color = Color.White, modifier = Modifier.size(15.dp))
             }
         }
 
-        // رقم الريل في الشبكة، وأيقونات التحميل بجانبه حتى لا تتراكب.
-        Row(
+        // علامة التسجيل وحالة التحميل في الزاوية المقابلة، بلا رقم ولا كود.
+        Column(
             modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(5.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalAlignment = Alignment.CenterVertically,
+                .align(Alignment.TopEnd)
+                .padding(4.dp),
+            horizontalAlignment = Alignment.End,
+            verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            ReelNumberBadge(number = number)
+            AnimatedVisibility(
+                visible = item.registered,
+                enter = fadeIn(tween(200)) + scaleIn(tween(220), initialScale = 0.6f),
+                exit = fadeOut(tween(120)) + scaleOut(tween(160), targetScale = 0.6f),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(19.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.45f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Check,
+                        contentDescription = stringResource(R.string.reels_registered),
+                        tint = Accent,
+                        modifier = Modifier.size(12.dp),
+                    )
+                }
+            }
 
             if (download?.done == true) {
                 Box(
@@ -617,56 +704,53 @@ private fun ReelCell(
                         .background(Color.Black.copy(alpha = 0.55f)),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Text(text = "!", color = Color(0xFFFF6B6B), fontSize = 11.sp)
+                    Text(text = "!", color = ErrorTint, fontSize = 11.sp)
                 }
             }
         }
 
-        // معلومات الريل داخل إطاره: تاريخ الخادم، وحالته، والعدّاد من ساعته.
+        // تاريخ النشر في منتصف الخانة: الغلاف خلفية باهتة والنص هو البطل.
         val schedule = item.schedule
         val scheduledAt = schedule?.at?.takeIf { it > 0L }
         Column(
             modifier = Modifier
-                .align(Alignment.BottomStart)
-                .padding(start = 6.dp, end = 26.dp, top = 5.dp, bottom = 5.dp),
-            verticalArrangement = Arrangement.spacedBy(1.dp),
+                .align(Alignment.Center)
+                .padding(horizontal = 6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
-            if (scheduledAt != null && schedule != null) {
+            if (schedule != null && scheduledAt != null) {
                 Text(
-                    text = ScheduleSlots.formatShort(scheduledAt),
+                    text = ScheduleSlots.formatDate(ScheduleSlots.dateOf(scheduledAt)),
                     color = Color.White,
-                    fontSize = 8.sp,
+                    fontSize = 10.sp,
+                    lineHeight = 13.sp,
                     fontWeight = FontWeight.SemiBold,
+                    textAlign = TextAlign.Center,
+                    maxLines = 2,
+                )
+                Text(
+                    text = ScheduleSlots.formatTime(
+                        ScheduleSlots.timeOf(scheduledAt).hour,
+                        ScheduleSlots.timeOf(scheduledAt).minute,
+                    ),
+                    color = Color.White.copy(alpha = 0.85f),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Medium,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
                 )
                 ScheduleStateLine(
                     schedule = schedule,
                     scheduledAt = scheduledAt,
                     clock = clock,
                 )
-            }
-
-            Text(
-                text = reelLabel(item),
-                color = if (bitmap != null) Color.White.copy(alpha = 0.78f) else TextMuted,
-                fontSize = 7.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-
-        AnimatedVisibility(
-            visible = schedule != null,
-            enter = fadeIn(tween(220)) +
-                scaleIn(tween(240, easing = FastOutSlowInEasing), initialScale = 0.7f),
-            exit = fadeOut(tween(120)) + scaleOut(tween(160), targetScale = 0.7f),
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(5.dp),
-        ) {
-            if (schedule != null) {
-                ScheduleBadge(schedule = schedule)
+            } else {
+                Text(
+                    text = stringResource(R.string.reel_no_date),
+                    color = Color.White.copy(alpha = 0.7f),
+                    fontSize = 10.sp,
+                    textAlign = TextAlign.Center,
+                )
             }
         }
 
@@ -759,8 +843,10 @@ private fun ScheduleStateLine(
 
             else -> stringResource(R.string.reel_state_waiting)
         },
-        color = Accent,
-        fontSize = 8.sp,
+        color = Color.White.copy(alpha = 0.9f),
+        fontSize = 9.sp,
+        fontWeight = FontWeight.Medium,
+        textAlign = TextAlign.Center,
         maxLines = 1,
         overflow = TextOverflow.Ellipsis,
     )
@@ -786,7 +872,7 @@ private fun PublishNowGlyph(color: Color, modifier: Modifier = Modifier) {
 @Composable
 private fun ReelExitOverlay(kind: ReelExitKind, modifier: Modifier = Modifier) {
     val published = kind == ReelExitKind.Published
-    val tint = if (published) Accent else DeleteRed
+    val tint = if (published) Accent else DeleteTint
     val scrim = remember { Animatable(0f) }
     val scale = remember { Animatable(0.5f) }
     val stroke = remember { Animatable(0f) }
@@ -987,56 +1073,15 @@ internal fun CalendarGlyph(color: Color, modifier: Modifier = Modifier) {
     }
 }
 
-/** رقم الريل (#3) داخل شارة صغيرة أعلى الخانة، حتى تعرف أي ريل تعدّله. */
+/** ثلاث نقاط رأسية: زر إعدادات الريل داخل الخانة. */
 @Composable
-private fun ReelNumberBadge(number: Int) {
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(50))
-            .background(Color.Black.copy(alpha = 0.55f))
-            .padding(horizontal = 5.dp, vertical = 1.dp),
-    ) {
-        Text(
-            text = "#$number",
-            color = Color.White,
-            fontSize = 8.sp,
-            fontWeight = FontWeight.Bold,
-        )
-    }
-}
-
-/** شارة صغيرة أسفل الخانة: ساعة للمجدول، صح للناشر، تعجّب للفاشل. */
-@Composable
-private fun ScheduleBadge(schedule: PublishSchedule, modifier: Modifier = Modifier) {
-    val published = schedule.state == ScheduleSlots.STATE_PUBLISHED
-    val failed = schedule.state == ScheduleSlots.STATE_FAILED
-
-    Box(
-        modifier = modifier
-            .size(19.dp)
-            .clip(CircleShape)
-            .background(Color.Black.copy(alpha = 0.55f)),
-        contentAlignment = Alignment.Center,
-    ) {
-        when {
-            published -> Icon(
-                imageVector = Icons.Filled.Check,
-                contentDescription = stringResource(R.string.schedule_published),
-                tint = Accent,
-                modifier = Modifier.size(12.dp),
-            )
-
-            failed -> Text(
-                text = "!",
-                color = Color(0xFFFF6B6B),
-                fontSize = 11.sp,
-            )
-
-            else -> ClockGlyph(
-                color = Color.White,
-                modifier = Modifier.size(11.dp),
-            )
-        }
+private fun DotsGlyph(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val radius = size.minDimension * 0.11f
+        val centreX = size.width / 2f
+        drawCircle(color, radius = radius, center = Offset(centreX, size.height * 0.18f))
+        drawCircle(color, radius = radius, center = Offset(centreX, size.height * 0.50f))
+        drawCircle(color, radius = radius, center = Offset(centreX, size.height * 0.82f))
     }
 }
 
@@ -1181,33 +1226,55 @@ fun DownloadGlyph(color: Color, modifier: Modifier = Modifier) {
     }
 }
 
-/** ساعة بسيطة مرسومة: دائرة وعقربان، بلا مكتبة أيقونات إضافية. */
-@Composable
-private fun ClockGlyph(color: Color, modifier: Modifier = Modifier) {
-    Canvas(modifier) {
-        val side = size.minDimension
-        val stroke = side * 0.1f
+/** حالة السحب: ترتيب الشبكة تحت الإصبع وإزاحة الريل عن خانته الأصلية. */
+private data class ReelDrag(
+    val id: String,
+    val order: List<SavedItem>,
+    val offset: Offset,
+    val cell: IntSize,
+)
 
-        drawCircle(
-            color = color,
-            radius = side * 0.42f,
-            style = Stroke(stroke),
-        )
-        drawLine(
-            color = color,
-            start = Offset(side * 0.5f, side * 0.5f),
-            end = Offset(side * 0.5f, side * 0.27f),
-            strokeWidth = stroke,
-            cap = StrokeCap.Round,
-        )
-        drawLine(
-            color = color,
-            start = Offset(side * 0.5f, side * 0.5f),
-            end = Offset(side * 0.69f, side * 0.58f),
-            strokeWidth = stroke,
-            cap = StrokeCap.Round,
-        )
-    }
+/** موضع خانة [index] داخل الشبكة (إزاحتها عن الخانة الأولى). */
+private fun slotOf(index: Int, stepX: Float, stepY: Float): Offset =
+    Offset((index % GRID_COLUMNS) * stepX, (index / GRID_COLUMNS) * stepY)
+
+/**
+ * ينقل الريل إلى الخانة التي صار الإصبع فوقها، ثم يعادل الإزاحة بمقدار فرق
+ * الخانتين حتى يبقى الريل تحت الإصبع بالضبط بعد تغيير مكانه.
+ */
+private fun ReelDrag.moved(delta: Offset, gap: Float, range: IntRange): ReelDrag {
+    val shifted = offset + delta
+    if (range.isEmpty() || cell.width <= 0 || cell.height <= 0) return copy(offset = shifted)
+
+    val stepX = cell.width + gap
+    val stepY = cell.height + gap
+    val current = order.indexOfFirst { it.id == id }
+    if (current < 0) return copy(offset = shifted)
+
+    val centre = slotOf(current, stepX, stepY) +
+        shifted +
+        Offset(cell.width / 2f, cell.height / 2f)
+    val column = floor(centre.x / stepX).toInt().coerceIn(0, GRID_COLUMNS - 1)
+    val row = floor(centre.y / stepY).toInt().coerceAtLeast(0)
+    val target = (row * GRID_COLUMNS + column).coerceIn(range.first, range.last)
+    if (target == current) return copy(offset = shifted)
+
+    val shift = slotOf(target, stepX, stepY) - slotOf(current, stepX, stepY)
+    val next = order.toMutableList()
+    next.add(target, next.removeAt(current))
+    return copy(order = next, offset = shifted - shift)
+}
+
+/** الخانات القابلة للسحب: مجدولة وليست في طريق النشر، وهي متجاورة في الترتيب. */
+private fun List<SavedItem>.reorderableRange(): IntRange {
+    val indices = indices.filter { this[it].canDrag() }
+    return if (indices.size < 2) IntRange.EMPTY else indices.first()..indices.last()
+}
+
+/** الريل قابل للسحب فقط إن كان مجدولاً وليس في طريق النشر الآن. */
+private fun SavedItem.canDrag(): Boolean {
+    val slotAt = schedule?.at ?: return false
+    return slotAt > 0L && schedule?.isPublishing != true
 }
 
 private fun reelLabel(item: SavedItem): String {

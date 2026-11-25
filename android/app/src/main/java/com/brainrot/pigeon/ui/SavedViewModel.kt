@@ -6,7 +6,9 @@ import androidx.lifecycle.viewModelScope
 import com.brainrot.pigeon.data.PublishSchedule
 import com.brainrot.pigeon.data.SavedItem
 import com.brainrot.pigeon.data.SavedRepository
+import com.brainrot.pigeon.data.ScheduleSlots
 import com.brainrot.pigeon.data.ServerSchedule
+import com.brainrot.pigeon.data.isPublishing
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -71,12 +73,18 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
     private val serverSchedules = MutableStateFlow<Map<String, ServerSchedule>>(emptyMap())
 
     /**
+     * مواعيد السحب الجديد قبل أن يؤكدها الخادم: تُطبّق فوراً حتى تستقر الشبكة
+     * تحت الإصبع بعد الإفلات، ثم تُمسح بعد قراءة اللقطة التي أكدها الخادم.
+     */
+    private val pendingTimes = MutableStateFlow<Map<String, Long>>(emptyMap())
+
+    /**
      * ما تعرضه الشبكة: القائمة الحيّة مع إبقاء الريل المعلَّم ظاهراً حتى
      * ينتهي أنيميشن الصح أو الحذف، ومع الموعد والحالة اللذين يقررهما الخادم
      * بدل النسخة المحلية.
      */
     val items: StateFlow<List<SavedItem>> =
-        combine(live, marks, serverSchedules) { current, exits, schedules ->
+        combine(live, marks, serverSchedules, pendingTimes) { current, exits, schedules, pending ->
             val liveIds = current.mapTo(HashSet(current.size)) { it.id }
             val held = exits.values.mapNotNull { mark ->
                 mark.item.takeIf { it.id !in liveIds }
@@ -84,7 +92,16 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
             (current + held)
                 .map { item ->
                     val fromServer = schedules[item.id]?.takeIf { it.at > 0L }
-                    if (fromServer == null) item else item.copy(schedule = fromServer.toSchedule())
+                    val moved = pending[item.id]
+                    when {
+                        moved != null -> item.copy(
+                            schedule = (fromServer?.toSchedule() ?: item.schedule ?: PublishSchedule())
+                                .copy(at = moved, state = ScheduleSlots.STATE_SCHEDULED),
+                        )
+
+                        fromServer == null -> item
+                        else -> item.copy(schedule = fromServer.toSchedule())
+                    }
                 }
                 // الأقرب موعداً أولاً: نفس ترتيب النشر على الخادم، وغير المجدول آخراً.
                 .sortedWith(
@@ -213,6 +230,34 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
     }
 
     /**
+     * ترتيب الشبكة بالسحب: المواعيد نفسها تتوزّع على الريلز حسب الترتيب الجديد
+     * (سحب ريل 26 نوفمبر فوق ريل 29 يعطي الأول 26 والثاني 29). التطبيق يطبّق
+     * التوزيع فوراً حتى لا ترتدّ الخانة، والخادم يكتبه ويؤكده بعدها.
+     */
+    fun reorder(orderedIds: List<String>) {
+        val current = items.value.associateBy { it.id }
+        val ids = orderedIds.filter { id -> current[id]?.canReorder() == true }
+        if (ids.size < 2) return
+
+        val times = ids.mapNotNull { id -> current[id]?.schedule?.at?.takeIf { it > 0L } }.sorted()
+        if (times.size != ids.size) return
+
+        val next = ids.mapIndexed { index, id -> id to times[index] }.toMap()
+        // لا تغيير فعلي: لا نرسل طلباً بلا داع.
+        if (next.all { (id, at) -> current[id]?.schedule?.at == at }) return
+
+        pendingTimes.value = next
+        viewModelScope.launch {
+            repository.reorder(ids).onFailure { error ->
+                _scheduleError.value = error.message ?: "could not reorder the reels"
+            }
+            // الترتيب النهائي والمواعيد تأتي من الخادم، لا من التطبيق.
+            refreshSchedules()
+            pendingTimes.value = emptyMap()
+        }
+    }
+
+    /**
      * ينشر الريل الآن: يطلب من الخادم إلغاء العدّاد ثم يمشي الخادم في خطوات
      * النشر العادية نفسها (نشر، تأكيد، تنظيف). لا نشر ولا حساب وقت هنا.
      */
@@ -291,3 +336,9 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
 
 private val SavedItem.isProcessing: Boolean
     get() = archiveState == "queued" || archiveState == "downloading" || archiveState == "storing"
+
+/** الريل يدخل في السحب فقط إن كان مجدولاً وليس في طريق النشر الآن. */
+private fun SavedItem.canReorder(): Boolean {
+    val scheduled = schedule ?: return false
+    return scheduled.at > 0L && !scheduled.isPublishing
+}

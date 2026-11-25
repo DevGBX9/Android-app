@@ -17,6 +17,7 @@ R2، ويحدّث حالة المعالجة والتقدّم في Firebase Realt
     GET  /media/<id>           نفس الملف للعرض العام (لـMeta، بلا مفتاح)
     GET  /schedules            وقت الخادم والوقت المتبقي وحالة كل موعد
     POST /schedules            {"id", "at"} -> يكتب الموعد ويزيحه لو تداخل
+    POST /schedules/order      {"ids": [..]} -> يوزّع المواعيد حسب ترتيب الشبكة
     POST /publish-now          {"id"} -> ينشر الريل الآن (يتجاهل الموعد) ثم يحذف وينظّف
     GET|POST /publish          تشغيل المجدول فوراً (احتياط للـcron)
 
@@ -1075,7 +1076,7 @@ class Default(WorkerEntrypoint):
                 {
                     "ok": True,
                     "service": "pigeon-reels",
-                    "version": 10,
+                    "version": 11,
                     "routes": [
                         "POST /reels",
                         "GET /reels/<id>",
@@ -1085,6 +1086,7 @@ class Default(WorkerEntrypoint):
                         "GET|POST /publish",
                         "GET /schedules",
                         "POST /schedules",
+                        "POST /schedules/order",
                         "POST /publish-now",
                     ],
                     "sources": ["instagram", "tiktok"],
@@ -1122,6 +1124,16 @@ class Default(WorkerEntrypoint):
         # الجدولة تُكتب من هنا لا من التطبيق، فيملك الخادم الموعد والعدّ التنازلي.
         if parts[0] == "schedules" and len(parts) == 1 and method == "POST":
             return await self._set_schedule(request)
+
+        # ترتيب الشبكة الجديد: المواعيد نفسها تُوزّع على الريلز حسب ترتيب السحب،
+        # فسحب ريل 26 نوفمبر فوق ريل 29 نوفمبر يتبادل الموعدين بينهما.
+        if (
+            parts[0] == "schedules"
+            and len(parts) == 2
+            and parts[1] == "order"
+            and method == "POST"
+        ):
+            return await self._reorder_schedules(request)
 
         # النشر الآن من التطبيق: العدّاد يُلغى فوراً ثم تتولى السلسلة العادية
         # بقية الخطوات (نشر، تأكيد، تنظيف) كما لو أن الموعد حلّ هذه اللحظة.
@@ -1633,6 +1645,126 @@ class Default(WorkerEntrypoint):
                 "serverTime": now,
                 "remainingMs": max(0, settled - now),
                 "shifted": settled != at,
+            }
+        )
+
+    async def _reorder_schedules(self, request):
+        """يعيد توزيع المواعيد على الريلز حسب ترتيب الشبكة الجديد.
+
+        الجسم: `{"ids": [id1, id2, ...]}` بترتيب الشبكة من الأعلى إلى الأسفل.
+        قيم المواعيد لا تتغيّر: أصغر موعد يذهب لأول ريل في الترتيب، والذي بعده
+        للثاني، وهكذا. فسحب ريل 26 نوفمبر فوق ريل 29 نوفمبر يعطي الأول 26
+        والثاني 29، ويصير ترتيب النشر على إنستغرام مطابقاً لترتيب الشبكة.
+
+        الموعد يُعاد إلى `scheduled` وتُلغى حاوية Meta المحضّرة، لأن أوان نشرها
+        تغيّر: تُحضّر حاوية جديدة عند الموعد الجديد بدل حاوية قديمة تنتهي صلاحيتها.
+        """
+        try:
+            body = await request.json()
+            raw_ids = _field(body, "ids")
+        except Exception:
+            return _error("invalid json body")
+
+        if not isinstance(raw_ids, list):
+            return _error("missing ids")
+
+        ids = []
+        for raw in raw_ids:
+            clean_id = _safe_id(raw)
+            if not clean_id:
+                return _error("invalid id in ids")
+            if clean_id in ids:
+                return _error("duplicate id in ids")
+            ids.append(clean_id)
+
+        if len(ids) < 2:
+            return _error("at least two reels are needed to reorder", 400)
+
+        db = self._db()
+        now = int(time.time() * 1000)
+        schedules = await _firebase_get(db, "schedules.json") or {}
+        if not isinstance(schedules, dict):
+            return _error("the /schedules node is not an object", 502)
+
+        # كل ريل مشمول بالسحب: يجب أن يكون مجدولاً وليس في طريقه إلى النشر.
+        entries = {}
+        times = []
+        for clean_id in ids:
+            entry = schedules.get(clean_id)
+            if not isinstance(entry, dict):
+                return _error("this reel is not scheduled on the server", 404)
+            state = _stage_of(entry)
+            if state in (
+                STAGE_PUBLISHING,
+                STAGE_VERIFYING,
+                STAGE_CLEANING,
+                STAGE_UNVERIFIED,
+            ):
+                return _error("a reel is being published right now", 409)
+            if state == STAGE_PUBLISHED or _int_of(entry, "publishedAt") > 0:
+                return _error("a reel was already published", 409)
+            at = _int_of(entry, "at")
+            if at <= 0:
+                return _error("a reel has no schedule time", 409)
+            if at <= now + 30_000:
+                return _error("a reel is about to publish: reorder it after", 409)
+            entries[clean_id] = entry
+            times.append(at)
+
+        times.sort()
+
+        # مواعيد الريلز غير المشمولة بالسحب ما زالت محجوزة: نقل موعد فوق موعد
+        # ريل آخر ينشر الريلين في نفس اللحظة، فنرفض الطلب بدل إزاحة صامتة.
+        for other_id, other in schedules.items():
+            other_clean = _safe_id(other_id)
+            if not other_clean or other_clean in entries:
+                continue
+            if not isinstance(other, dict):
+                continue
+            if _stage_of(other) in (STAGE_PUBLISHED, STAGE_FAILED, STAGE_UNVERIFIED):
+                continue
+            other_at = _int_of(other, "at")
+            if other_at <= 0:
+                continue
+            for at in times:
+                if abs(at - other_at) < MIN_SLOT_GAP_MS:
+                    return _error(
+                        "the new order collides with another scheduled reel",
+                        409,
+                    )
+
+        payload = {}
+        result = {}
+        for index, clean_id in enumerate(ids):
+            entry = entries[clean_id]
+            payload[clean_id] = {
+                "at": times[index],
+                "timezone": _clean(entry.get("timezone"), SCHEDULE_TIMEZONE),
+                "state": STAGE_SCHEDULED,
+                "attempts": 0,
+                "error": None,
+                "containerId": None,
+                "stageAt": 0,
+                "scheduledAt": _int_of(entry, "scheduledAt") or now,
+                "updatedAt": now,
+            }
+            result[clean_id] = times[index]
+
+        status = await _firebase_patch(db, "schedules.json", payload)
+        if status != 200:
+            return _error("could not save the new order (firebase %d)" % status, 502)
+
+        moved = sum(
+            1
+            for index, clean_id in enumerate(ids)
+            if times[index] != _int_of(entries[clean_id], "at")
+        )
+        return _json(
+            {
+                "ok": True,
+                "serverTime": now,
+                "moved": moved,
+                "times": result,
             }
         )
 
