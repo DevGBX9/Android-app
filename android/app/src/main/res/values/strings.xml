@@ -32,6 +32,7 @@
     <string name="schedule_change">Change date &amp; time</string>
     <string name="schedule_auto_keep">Default slot · %1$s</string>
     <string name="schedule_auto_hint">Automatic by default — you can change it.</string>
+    <string name="schedule_edit_title">Change date &amp; time</string>
     <string name="schedule_added">Scheduled for %1$s</string>
     <string name="schedule_added_many">Scheduled %1$d reels, first on %2$s</string>
     <string name="schedule_scheduled">Scheduled</string>
@@ -44,6 +45,9 @@
     <string name="reel_download">Download</string>
     <string name="reel_delete">Delete</string>
     <string name="reel_delete_confirm">Tap again to delete</string>
+    <string name="reel_schedule">Schedule date &amp; time</string>
+    <string name="reel_downloading">Downloading %1$d%%</string>
+    <string name="reel_deleted">Deleted</string>
 
     <string name="saved_no_app">No app can open this link</string>
     <string name="saved_no_content">Nothing to open</string>

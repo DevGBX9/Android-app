@@ -7,6 +7,9 @@ import java.io.IOException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -46,6 +49,14 @@ class SavedRepository(
         ignoreUnknownKeys = true
         encodeDefaults = true
     }
+
+    private val _publishedExits = MutableSharedFlow<SavedItem>(extraBufferCapacity = 16)
+
+    /**
+     * الريلز التي نُشرت للتوّ. تُبثّ قبل إزالتها من القائمة حتى تعرض الشبكة
+     * علامة الصح وأنيميشن الاختفاء بدل أن تختفي الخانة فجأة.
+     */
+    val publishedExits: SharedFlow<SavedItem> = _publishedExits.asSharedFlow()
 
     val items: Flow<List<SavedItem>> = context.savedStore.data.map { prefs ->
         decode(prefs[SAVED_ITEMS_KEY])
@@ -116,6 +127,25 @@ class SavedRepository(
     }
 
     /**
+     * يغيّر موعد نشر ريل موجود: يحدّث الموعد على Firebase أولاً (PATCH يحفظ
+     * حالة الـWorker) ثم في النسخة المحلية، فتعرض الخانة الموعد الجديد فوراً.
+     */
+    suspend fun reschedule(item: SavedItem, at: Long): Result<Unit> {
+        val schedule = item.schedule?.copy(at = at) ?: PublishSchedule(at = at)
+        if (!remote.uploadSchedule(item.id, schedule)) {
+            return Result.failure(IOException("could not save the new date"))
+        }
+
+        context.savedStore.edit { prefs ->
+            val next = decode(prefs[SAVED_ITEMS_KEY]).map { saved ->
+                if (saved.id == item.id) saved.copy(schedule = schedule) else saved
+            }
+            prefs[SAVED_ITEMS_KEY] = json.encodeToString(next)
+        }
+        return Result.success(Unit)
+    }
+
+    /**
      * متابعة حيّة: كل تغيير من الـWorker (نشر ناجح، حذف السجل، أرشففة) يُطبّق
      * فوراً بلا انتظار. تُستدعى من الـViewModel وتبقى ما دام التطبيق حياً.
      */
@@ -153,6 +183,15 @@ class SavedRepository(
                 if (item.schedule?.isPublished == true) add(item.id)
             }
         }
+        // الإبلاغ قبل الكتابة: الشبكة تعلّم الخانة أولاً ثم يصلها الحذف.
+        localBefore.forEach { item ->
+            if (item.id in publishedIds) {
+                _publishedExits.tryEmit(
+                    item.copy(schedule = remoteSchedules[item.id] ?: item.schedule),
+                )
+            }
+        }
+
         val liveRemote = remoteItems.filterNot { it.id in publishedIds }
 
         context.savedStore.edit { prefs ->

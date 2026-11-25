@@ -3,6 +3,7 @@ package com.brainrot.pigeon.ui
 import android.content.Context
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
@@ -16,7 +17,6 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -40,9 +40,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -81,6 +85,8 @@ import com.brainrot.pigeon.R
 import com.brainrot.pigeon.data.AvatarLoader
 import com.brainrot.pigeon.data.PublishSchedule
 import com.brainrot.pigeon.data.SavedItem
+import com.brainrot.pigeon.data.SchedulePlanner
+import com.brainrot.pigeon.data.SchedulePolicy
 import com.brainrot.pigeon.data.ScheduleSlots
 import com.brainrot.pigeon.ui.theme.Accent
 import com.brainrot.pigeon.ui.theme.Outline
@@ -88,9 +94,12 @@ import com.brainrot.pigeon.ui.theme.TextMuted
 import com.brainrot.pigeon.ui.theme.TextPrimary
 import com.brainrot.pigeon.ui.util.openExternal
 import com.brainrot.pigeon.ui.util.toast
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 private val CellTop = Color(0xFF1C232B)
 private val CellBottom = Color(0xFF0F141A)
+private val DeleteRed = Color(0xFFFF4D4D)
 
 // نصف قطر الريل: 9:16 مثل تبويب الريلز في إنستغرام.
 private const val REEL_ASPECT = 9f / 16f
@@ -98,9 +107,11 @@ private const val GRID_COLUMNS = 3
 
 /**
  * صفحة الريلز: شريط أيقونة الشبكة مثل إنستغرام ثم خانات ريلز قائمة (9:16)
- * بصور غلاف حقيقية من إنستغرام. الضغط يفتح الريل، والضغط المطوّل يعرض
- * زر تحميل الريل المخزّن على Cloudflare مع نسبة 0..100.
+ * بصور غلاف حقيقية من إنستغرام. الضغط يفتح الريل، والضغط المطوّل يفتح قائمة
+ * سفلية بأنماط إنستغرام (تحميل، تغيير الموعد، حذف). الخانة التي تُنشر أو
+ * تُحذف تعرض علامة صح أو سلة حمراء بأنيميشن ثم تختفي.
  */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ReelsRoute(container: AppContainer) {
     val viewModel: SavedViewModel = viewModel(
@@ -111,9 +122,23 @@ fun ReelsRoute(container: AppContainer) {
     val items by viewModel.items.collectAsStateWithLifecycle()
     val downloads by viewModel.downloads.collectAsStateWithLifecycle()
     val deleteError by viewModel.deleteError.collectAsStateWithLifecycle()
+    val scheduleError by viewModel.scheduleError.collectAsStateWithLifecycle()
+    val exits by viewModel.exits.collectAsStateWithLifecycle()
     val images = remember { container.reelImages }
     val context = LocalContext.current
-    var expandedId by remember { mutableStateOf<String?>(null) }
+
+    // الخانة التي فُتحت لها القائمة السفلية، والريل الذي يُعدَّل موعده.
+    var sheetFor by remember { mutableStateOf<SavedItem?>(null) }
+    var editingFor by remember { mutableStateOf<SavedItem?>(null) }
+
+    // نقرأ العنصر من القائمة الحيّة: لو نُشر أو اختفى أثناء فتح القائمة تُغلق.
+    val sheetItem = sheetFor?.let { target -> items.firstOrNull { it.id == target.id } }
+    val editItem = editingFor?.let { target -> items.firstOrNull { it.id == target.id } }
+
+    LaunchedEffect(sheetItem, editItem) {
+        if (sheetItem == null) sheetFor = null
+        if (editItem == null) editingFor = null
+    }
 
     // سبب فشل التحميل يظهر كرسالة بدل البقاء على 0% أو علامة تعجّب صامتة.
     LaunchedEffect(downloads) {
@@ -128,6 +153,12 @@ fun ReelsRoute(container: AppContainer) {
         val message = deleteError ?: return@LaunchedEffect
         toast(context, message)
         viewModel.dismissDeleteError()
+    }
+
+    LaunchedEffect(scheduleError) {
+        val message = scheduleError ?: return@LaunchedEffect
+        toast(context, message)
+        viewModel.dismissScheduleError()
     }
 
     Column(
@@ -164,23 +195,148 @@ fun ReelsRoute(container: AppContainer) {
                             item = item,
                             images = images,
                             download = downloads[item.id],
-                            expanded = expandedId == item.id,
+                            exit = exits[item.id],
                             onClick = { openReel(context, item) },
-                            onLongClick = { expandedId = item.id },
-                            onDismiss = { expandedId = null },
-                            onDownload = {
-                                expandedId = null
-                                viewModel.download(item)
-                            },
-                            onDelete = {
-                                expandedId = null
-                                viewModel.delete(item)
-                            },
+                            onLongClick = { sheetFor = item },
                         )
                     }
                 }
             }
         }
+    }
+
+    // قائمة إنستغرام السفلية: تنزيل، تغيير تاريخ الجدولة، حذف.
+    sheetItem?.let { target ->
+        ReelSheet(
+            item = target,
+            download = downloads[target.id],
+            onDismiss = { sheetFor = null },
+            onDownload = {
+                sheetFor = null
+                viewModel.download(target)
+            },
+            onReschedule = {
+                sheetFor = null
+                editingFor = target
+            },
+            onDelete = {
+                sheetFor = null
+                viewModel.delete(target)
+            },
+        )
+    }
+
+    editItem?.let { target ->
+        ScheduleEditDialog(
+            initialAt = target.schedule?.at?.takeIf { it > System.currentTimeMillis() }
+                ?: SchedulePlanner.defaultManualDate(
+                    ScheduleSlots.PUBLISH_HOUR,
+                    ScheduleSlots.PUBLISH_MINUTE,
+                ),
+            onDismiss = { editingFor = null },
+            onConfirm = { at ->
+                editingFor = null
+                viewModel.reschedule(target, at)
+            },
+        )
+    }
+}
+
+/**
+ * قائمة سفلية مثل إنستغرام: تُفتح من الضغطة المطوّلة، صفوفها أيقونة ونص،
+ * وتُغلق بالضغط على الخلفية الفارغة أو بالسحب للأسفل.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ReelSheet(
+    item: SavedItem,
+    download: DownloadUi?,
+    onDismiss: () -> Unit,
+    onDownload: () -> Unit,
+    onReschedule: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var confirmingDelete by remember { mutableStateOf(false) }
+    val scheme = MaterialTheme.colorScheme
+    val downloadPercent = download?.percent ?: 0
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = scheme.surfaceContainerHigh,
+        contentColor = scheme.onSurface,
+        tonalElevation = 0.dp,
+    ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(bottom = 10.dp),
+        ) {
+            if (isArchivable(item)) {
+                SheetRow(
+                    label = if (download?.running == true) {
+                        stringResource(R.string.reel_downloading, downloadPercent)
+                    } else {
+                        stringResource(R.string.reel_download)
+                    },
+                    tint = scheme.onSurface,
+                    onClick = onDownload,
+                ) {
+                    DownloadGlyph(color = scheme.onSurface, modifier = Modifier.size(22.dp))
+                }
+            }
+
+            if (SchedulePolicy.canSchedule(item)) {
+                SheetRow(
+                    label = if (item.schedule == null) {
+                        stringResource(R.string.reel_schedule)
+                    } else {
+                        stringResource(R.string.schedule_change)
+                    },
+                    tint = scheme.onSurface,
+                    onClick = onReschedule,
+                ) {
+                    CalendarGlyph(color = scheme.onSurface, modifier = Modifier.size(22.dp))
+                }
+            }
+
+            // الحذف لا رجعة فيه: ضغطة أولى تسأل، والثانية تحذف.
+            SheetRow(
+                label = if (confirmingDelete) {
+                    stringResource(R.string.reel_delete_confirm)
+                } else {
+                    stringResource(R.string.reel_delete)
+                },
+                tint = DeleteRed,
+                onClick = {
+                    if (confirmingDelete) onDelete() else confirmingDelete = true
+                },
+            ) {
+                TrashGlyph(color = DeleteRed, modifier = Modifier.size(22.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun SheetRow(
+    label: String,
+    tint: Color,
+    onClick: () -> Unit,
+    icon: @Composable () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 24.dp, vertical = 15.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Box(Modifier.size(24.dp), contentAlignment = Alignment.Center) { icon() }
+        Text(text = label, color = tint, fontSize = 15.sp)
     }
 }
 
@@ -229,16 +385,10 @@ private fun ReelCell(
     item: SavedItem,
     images: AvatarLoader,
     download: DownloadUi?,
-    expanded: Boolean,
+    exit: ReelExitKind?,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
-    onDismiss: () -> Unit,
-    onDownload: () -> Unit,
-    onDelete: () -> Unit,
 ) {
-    // الحذف لا رجعة فيه: ضغطة أولى تسأل، والثانية تحذف من Cloudflare وFirebase.
-    var confirmingDelete by remember(expanded) { mutableStateOf(false) }
-
     val thumbnail by produceState<ImageBitmap?>(initialValue = null, item.thumbnail) {
         value = item.thumbnail
             ?.takeIf { it.isNotBlank() }
@@ -269,7 +419,11 @@ private fun ReelCell(
             .aspectRatio(REEL_ASPECT)
             .clip(RoundedCornerShape(4.dp))
             .background(Brush.linearGradient(listOf(CellTop, CellBottom)))
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick),
+            .combinedClickable(
+                enabled = exit == null,
+                onClick = onClick,
+                onLongClick = onLongClick,
+            ),
     ) {
         if (bitmap != null) {
             Image(
@@ -432,95 +586,215 @@ private fun ReelCell(
             }
         }
 
-        // ضغطة مطوّلة: زر تحميل الريل المخزّن.
-        AnimatedVisibility(
-            visible = expanded && !busy,
-            enter = fadeIn(tween(150)) +
-                scaleIn(tween(210, easing = FastOutSlowInEasing), initialScale = 0.94f),
-            exit = fadeOut(tween(120)),
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.55f))
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                        onClick = onDismiss,
-                    ),
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(7.dp),
-                ) {
-                    item.schedule?.let { schedule ->
-                        Text(
-                            text = when (schedule.state) {
-                                ScheduleSlots.STATE_PUBLISHED ->
-                                    stringResource(R.string.schedule_published)
+        // علامة النشر أو الحذف: تظهر بأنيميشن ثم تختفي الخانة نفسها.
+        if (exit != null) {
+            ReelExitOverlay(kind = exit)
+        }
+    }
+}
 
-                                ScheduleSlots.STATE_FAILED ->
-                                    stringResource(R.string.schedule_failed)
+/** علامة خروج الخانة: صح أخضر وردي صاعد بعد النشر، أو سلة حمراء بعد الحذف. */
+@Composable
+private fun ReelExitOverlay(kind: ReelExitKind, modifier: Modifier = Modifier) {
+    val published = kind == ReelExitKind.Published
+    val tint = if (published) Accent else DeleteRed
+    val scrim = remember { Animatable(0f) }
+    val scale = remember { Animatable(0.5f) }
+    val stroke = remember { Animatable(0f) }
 
-                                else -> ScheduleSlots.formatShort(schedule.at)
-                            },
-                            color = Color.White.copy(alpha = 0.9f),
-                            fontSize = 9.sp,
-                            textAlign = TextAlign.Center,
-                        )
-                    }
-
-                    if (isArchivable(item)) {
-                        Row(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .background(Color.White)
-                                .clickable(onClick = onDownload)
-                                .padding(horizontal = 11.dp, vertical = 7.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            DownloadGlyph(color = Color.Black, modifier = Modifier.size(11.dp))
-                            Spacer(Modifier.width(5.dp))
-                            Text(
-                                text = stringResource(R.string.reel_download),
-                                color = Color.Black,
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.SemiBold,
-                            )
-                        }
-                    }
-
-                    Text(
-                        text = if (confirmingDelete) {
-                            stringResource(R.string.reel_delete_confirm)
-                        } else {
-                            stringResource(R.string.reel_delete)
-                        },
-                        color = Color(0xFFFF6B6B),
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(50))
-                            .background(Color.White.copy(alpha = 0.12f))
-                            .clickable {
-                                if (confirmingDelete) onDelete() else confirmingDelete = true
-                            }
-                            .padding(horizontal = 11.dp, vertical = 7.dp),
-                    )
-
-                    Text(
-                        text = stringResource(R.string.action_close),
-                        color = Color.White.copy(alpha = 0.85f),
-                        fontSize = 9.sp,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(50))
-                            .clickable(onClick = onDismiss)
-                            .padding(horizontal = 8.dp, vertical = 3.dp),
-                    )
-                }
+    LaunchedEffect(kind) {
+        launch { scrim.animateTo(1f, tween(170, easing = FastOutSlowInEasing)) }
+        launch { scale.animateTo(1f, tween(300, easing = FastOutSlowInEasing)) }
+        if (published) {
+            launch {
+                stroke.animateTo(
+                    targetValue = 1f,
+                    animationSpec = tween(340, delayMillis = 90, easing = FastOutSlowInEasing),
+                )
             }
         }
+        delay(860)
+        scrim.animateTo(0f, tween(240, easing = FastOutSlowInEasing))
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.72f * scrim.value)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Box(
+                modifier = Modifier
+                    .size(32.dp)
+                    .graphicsLayer(scaleX = scale.value, scaleY = scale.value, alpha = scrim.value)
+                    .clip(CircleShape)
+                    .background(tint),
+                contentAlignment = Alignment.Center,
+            ) {
+                if (published) {
+                    CheckGlyph(
+                        progress = stroke.value,
+                        color = Color.White,
+                        modifier = Modifier.size(17.dp),
+                    )
+                } else {
+                    TrashGlyph(color = Color.White, modifier = Modifier.size(16.dp))
+                }
+            }
+            Spacer(Modifier.height(5.dp))
+            Text(
+                text = stringResource(
+                    if (published) R.string.schedule_published else R.string.reel_deleted,
+                ),
+                color = Color.White.copy(alpha = scrim.value),
+                fontSize = 8.sp,
+                fontWeight = FontWeight.SemiBold,
+            )
+        }
+    }
+}
+
+/** صح يُرسم تدريجياً: الجزء الأول ثم الثاني، مثل علامة تُكتب. */
+@Composable
+private fun CheckGlyph(progress: Float, color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        val stroke = w * 0.18f
+        val start = Offset(w * 0.12f, h * 0.54f)
+        val corner = Offset(w * 0.40f, h * 0.82f)
+        val end = Offset(w * 0.90f, h * 0.20f)
+
+        val first = (progress / 0.45f).coerceIn(0f, 1f)
+        val second = ((progress - 0.45f) / 0.55f).coerceIn(0f, 1f)
+
+        drawLine(
+            color = color,
+            start = start,
+            end = Offset(
+                start.x + (corner.x - start.x) * first,
+                start.y + (corner.y - start.y) * first,
+            ),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+        if (second > 0f) {
+            drawLine(
+                color = color,
+                start = corner,
+                end = Offset(
+                    corner.x + (end.x - corner.x) * second,
+                    corner.y + (end.y - corner.y) * second,
+                ),
+                strokeWidth = stroke,
+                cap = StrokeCap.Round,
+            )
+        }
+    }
+}
+
+/** سلة مهملات مرسومة بنفس أسلوب بقية الأيقونات، بلا مكتبة إضافية. */
+@Composable
+fun TrashGlyph(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val s = size.minDimension
+        val stroke = s * 0.11f
+
+        // الغطاء والمقبض.
+        drawLine(
+            color = color,
+            start = Offset(s * 0.14f, s * 0.28f),
+            end = Offset(s * 0.86f, s * 0.28f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = color,
+            start = Offset(s * 0.40f, s * 0.28f),
+            end = Offset(s * 0.40f, s * 0.14f),
+            strokeWidth = stroke * 0.85f,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = color,
+            start = Offset(s * 0.40f, s * 0.14f),
+            end = Offset(s * 0.60f, s * 0.14f),
+            strokeWidth = stroke * 0.85f,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = color,
+            start = Offset(s * 0.60f, s * 0.14f),
+            end = Offset(s * 0.60f, s * 0.28f),
+            strokeWidth = stroke * 0.85f,
+            cap = StrokeCap.Round,
+        )
+
+        // جسم السلة.
+        val body = Path().apply {
+            moveTo(s * 0.24f, s * 0.36f)
+            lineTo(s * 0.30f, s * 0.86f)
+            lineTo(s * 0.70f, s * 0.86f)
+            lineTo(s * 0.76f, s * 0.36f)
+        }
+        drawPath(
+            body,
+            color = color,
+            style = Stroke(stroke, cap = StrokeCap.Round, join = StrokeJoin.Round),
+        )
+
+        drawLine(
+            color = color,
+            start = Offset(s * 0.42f, s * 0.46f),
+            end = Offset(s * 0.44f, s * 0.74f),
+            strokeWidth = stroke * 0.7f,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = color,
+            start = Offset(s * 0.58f, s * 0.46f),
+            end = Offset(s * 0.56f, s * 0.74f),
+            strokeWidth = stroke * 0.7f,
+            cap = StrokeCap.Round,
+        )
+    }
+}
+
+/** تقويم بسيط لصف "تغيير تاريخ الجدولة". */
+@Composable
+internal fun CalendarGlyph(color: Color, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val s = size.minDimension
+        val stroke = s * 0.09f
+
+        drawRoundRect(
+            color = color,
+            topLeft = Offset(s * 0.12f, s * 0.20f),
+            size = Size(s * 0.76f, s * 0.68f),
+            cornerRadius = CornerRadius(s * 0.14f),
+            style = Stroke(stroke),
+        )
+        drawLine(
+            color = color,
+            start = Offset(s * 0.12f, s * 0.40f),
+            end = Offset(s * 0.88f, s * 0.40f),
+            strokeWidth = stroke,
+        )
+        drawLine(
+            color = color,
+            start = Offset(s * 0.34f, s * 0.10f),
+            end = Offset(s * 0.34f, s * 0.28f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
+        drawLine(
+            color = color,
+            start = Offset(s * 0.66f, s * 0.10f),
+            end = Offset(s * 0.66f, s * 0.28f),
+            strokeWidth = stroke,
+            cap = StrokeCap.Round,
+        )
     }
 }
 
