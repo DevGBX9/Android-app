@@ -74,8 +74,8 @@ class SavedRepository(
         if (item.url != null) {
             scope.launch {
                 register(item)
-                //موعد مضى لا يُرفع أبداً: لو رُفع لعاد الـWorker ونشره مرة ثانية.
-                item.schedule?.future()?.let { remote.uploadSchedule(item.id, it) }
+                // موعد مضى لا يُرفع أبداً: لو رُفع لعاد الـWorker ونشره مرة ثانية.
+                item.schedule?.future()?.let { pushSchedule(item.id, it.at) }
             }
         }
     }
@@ -127,22 +127,37 @@ class SavedRepository(
     }
 
     /**
-     * يغيّر موعد نشر ريل موجود: يحدّث الموعد على Firebase أولاً (PATCH يحفظ
-     * حالة الـWorker) ثم في النسخة المحلية، فتعرض الخانة الموعد الجديد فوراً.
+     * يغيّر موعد نشر ريل موجود على الخادم وحده، ثم يحفظ الوقت النهائي محلياً.
+     * الخادم يرجّع موعداً مزاحاً إن كان يتداخل مع موعد ريل آخر.
      */
     suspend fun reschedule(item: SavedItem, at: Long): Result<Unit> {
-        val schedule = item.schedule?.copy(at = at) ?: PublishSchedule(at = at)
-        if (!remote.uploadSchedule(item.id, schedule)) {
-            return Result.failure(IOException("could not save the new date"))
-        }
+        val saved = archive.setSchedule(item.id, at).getOrElse { return Result.failure(it) }
+        saveSchedule(item.id, saved)
+        return Result.success(Unit)
+    }
 
+    /**
+     * العدّ التنازلي من الخادم: وقت الخادم والوقت المتبقي لكل ريل في طلب واحد.
+     * لا حساب لموعد أو لعدّاد داخل التطبيق.
+     */
+    suspend fun scheduleSnapshot(): ScheduleSnapshot? = archive.scheduleSnapshot()
+
+    /**
+     * الموعد يُكتب على الخادم فقط. نحفظ الموعد الذي أقره الخادم (قد يتغيّر
+     * لو كان يتداخل مع موعد ريل آخر) حتى يعرضه العدّاد نفسه.
+     */
+    private suspend fun pushSchedule(id: String, at: Long) {
+        val saved = archive.setSchedule(id, at).getOrNull() ?: return
+        saveSchedule(id, saved)
+    }
+
+    private suspend fun saveSchedule(id: String, schedule: PublishSchedule) {
         context.savedStore.edit { prefs ->
-            val next = decode(prefs[SAVED_ITEMS_KEY]).map { saved ->
-                if (saved.id == item.id) saved.copy(schedule = schedule) else saved
+            val next = decode(prefs[SAVED_ITEMS_KEY]).map { item ->
+                if (item.id == id) item.copy(schedule = schedule) else item
             }
             prefs[SAVED_ITEMS_KEY] = json.encodeToString(next)
         }
-        return Result.success(Unit)
     }
 
     /**
@@ -237,7 +252,7 @@ class SavedRepository(
         pending.forEach { item ->
             register(item)
             // لا نرفع موعداً مضى: إعادة رفعه بعد الحذف تجعل الـWorker ينشر الريل ثانية.
-            item.schedule?.future()?.let { remote.uploadSchedule(item.id, it) }
+            item.schedule?.future()?.let { pushSchedule(item.id, it.at) }
         }
         toArchive.forEach { item ->
             scope.launch { archive.request(item, tiktok.resolve(item.url)) }
@@ -246,12 +261,6 @@ class SavedRepository(
         // لا يحذف التطبيق سجلاً في منتصف عملية النشر؛ هنا نزيله من القائمة فقط.
         return Result.success(Unit)
     }
-
-    /**
-     * يطلب من الـWorker بدء النشر فور حلول الموعد بدل انتظار cron. الـWorker
-     * لا ينشر قبل الوقت المسجل في Firebase، فالطلب آمن لو وصل مبكراً.
-     */
-    suspend fun publishDue(): Result<Unit> = archive.publishDue()
 
     /** الموعد نفسه إن كان ما زال مستقبلاً، وإلا null. */
     private fun PublishSchedule.future(): PublishSchedule? =

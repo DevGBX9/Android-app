@@ -15,6 +15,9 @@ R2، ويحدّث حالة المعالجة والتقدّم في Firebase Realt
     GET  /reels/<id>           حالة الأرشفة (تقرأ من Firebase، وبدونها من R2)
     GET  /download/<id>        ملف الفيديو من R2 (Content-Disposition: attachment)
     GET  /media/<id>           نفس الملف للعرض العام (لـMeta، بلا مفتاح)
+    GET  /schedules            وقت الخادم والوقت المتبقي وحالة كل موعد
+    POST /schedules            {"id", "at"} -> يكتب الموعد ويزيحه لو تداخل
+    GET|POST /publish          تشغيل المجدول فوراً (احتياط للـcron)
 
 كل الطلبات تُرفض إذا لم يكن `API_TOKEN` مضبوطاً في الأسرار، ولم يكن الترويسة
 `X-Api-Key` مطابقة، ما عدا `/media/<id>` و`/health`.
@@ -64,6 +67,19 @@ SCHEDULE_RETRY_LIMIT = 60
 
 # أقصى عدد مواعيد تُعالج في تشغيل واحد حتى تبقى مدة cron قصيرة.
 MAX_PUBLISH_PER_RUN = 3
+
+# المواعيد والعدّ التنازلي ملك الخادم وحده: التطبيق يقرأ الساعة والوقت المتبقي
+# من هنا (GET /schedules) ولا يحسب موعداً بنفسه.
+SCHEDULE_TIMEZONE = "Africa/Algiers"
+
+# موعدان أقرب من هذا يُعتبران متداخلين، فيُزح الموعد الجديد لخانة حرة بعده.
+MIN_SLOT_GAP_MS = 5 * 60 * 1000
+
+# ريل واحد ينشر في المرة: بعد بدء media_publish لا يبدأ ريل آخر قبل هذه المدة،
+# حتى لا ينشر ريلان في نفس اللحظة على الحساب.
+PUBLISH_GAP_MS = 2 * 60 * 1000
+PUBLISH_BUSY = "waiting for the reel that is publishing now"
+PUBLISH_LOCK_PATH = "worker/publishLock.json"
 
 # نُجهّز حاوية إنستغرام قبل الموعد: إنشاء الحاوية من الفيديو يستغرق دقائق عند
 # Meta، ولو انتظرنا لحظة الموعد لظهر الريل متأخراً عن الوقت المعروض في التطبيق.
@@ -1044,7 +1060,7 @@ class Default(WorkerEntrypoint):
                 {
                     "ok": True,
                     "service": "pigeon-reels",
-                    "version": 7,
+                    "version": 8,
                     "routes": [
                         "POST /reels",
                         "GET /reels/<id>",
@@ -1052,9 +1068,11 @@ class Default(WorkerEntrypoint):
                         "GET /download/<id>",
                         "GET /media/<id>",
                         "GET|POST /publish",
+                        "GET /schedules",
+                        "POST /schedules",
                     ],
                     "sources": ["instagram", "tiktok"],
-                    "publishing": "instagram graph api (cron)",
+                    "publishing": "instagram graph api (server countdown)",
                 }
             )
 
@@ -1080,6 +1098,14 @@ class Default(WorkerEntrypoint):
 
         if parts[0] == "download" and len(parts) == 2 and method == "GET":
             return await self._download(parts[1])
+
+        # مصدر الحقيقة الوحيد للعدّ التنازلي: وقت الخادم والوقت المتبقي لكل ريل.
+        if parts[0] == "schedules" and len(parts) == 1 and method == "GET":
+            return _json(await self._schedule_snapshot())
+
+        # الجدولة تُكتب من هنا لا من التطبيق، فيملك الخادم الموعد والعدّ التنازلي.
+        if parts[0] == "schedules" and len(parts) == 1 and method == "POST":
+            return await self._set_schedule(request)
 
         # تشغيل المجدول فوراً بدل انتظار cron: يرجّع تقريراً كاملاً لكل موعد
         # (الحالة، سبب الخطأ، وهل التوكن مضبوط) حتى يمكن تشخيص النشر من المتصفح.
@@ -1422,6 +1448,206 @@ class Default(WorkerEntrypoint):
 
         return report
 
+    # ----------------------------------------------------------------------
+    # العدّ التنازلي: يبدأ وينتهي على الخادم، والتطبيق يعرضه فقط
+    # ----------------------------------------------------------------------
+
+    async def _schedule_snapshot(self):
+        """لقطة واحدة يقرؤها التطبيق: وقت الخادم والوقت المتبقي لكل ريل.
+
+        كل الأعداد تُحسب بساعة الخادم هنا، فلا يهم أن ساعة الهاتف مضبوطة أو
+        لا: العدّاد الذي يراه المالك هو عدّاد الخادم نفسه، و"publishing" حالة
+        حقيقية من السجل لا تقدير من التطبيق.
+        """
+        db = self._db()
+        now = int(time.time() * 1000)
+        snapshot = {
+            "ok": True,
+            "serverTime": now,
+            "timezone": SCHEDULE_TIMEZONE,
+            "reels": {},
+            "publishing": None,
+        }
+
+        schedules = await _firebase_get(db, "schedules.json") or {}
+        if not isinstance(schedules, dict):
+            snapshot["ok"] = False
+            snapshot["error"] = "the /schedules node is not an object"
+            return snapshot
+
+        pending = []
+        for schedule_id, schedule in schedules.items():
+            if not isinstance(schedule, dict):
+                continue
+            clean_id = _safe_id(schedule_id)
+            if not clean_id:
+                continue
+
+            at = _int_of(schedule, "at")
+            state = _stage_of(schedule)
+            snapshot["reels"][clean_id] = {
+                "at": at,
+                "state": state,
+                "serverTime": now,
+                "remainingMs": max(0, at - now) if at > 0 else 0,
+                "error": _clean(schedule.get("error")) or None,
+                "publishedAt": _int_of(schedule, "publishedAt"),
+                "mediaId": _clean(schedule.get("mediaId")) or None,
+            }
+
+            if state in (STAGE_PUBLISHING, STAGE_VERIFYING, STAGE_CLEANING):
+                snapshot["publishing"] = {
+                    "id": clean_id,
+                    "state": state,
+                    "since": _int_of(schedule, "stageAt"),
+                }
+            if at > 0 and state not in (
+                STAGE_PUBLISHED,
+                STAGE_FAILED,
+                STAGE_UNVERIFIED,
+            ):
+                pending.append((at, clean_id))
+
+        # ترتيب النشر: 1 = الريل القادم، ثم الذي بعده، بلا تكرار درجات.
+        pending.sort()
+        for index, (_, clean_id) in enumerate(pending):
+            snapshot["reels"][clean_id]["order"] = index + 1
+
+        return snapshot
+
+    async def _set_schedule(self, request):
+        """يكتب الموعد من الخادم: الوقت والتوقيت وبداية الحالة scheduled.
+
+        الموعد المتداخل مع موعد ريل آخر يُزح لخانة حرة بعده، فيبقى لكل ريل
+        وقت نشر خاص به مهما جدول المالك عدة ريلز.
+        """
+        try:
+            body = await request.json()
+            schedule_id = _safe_id(_field(body, "id"))
+            at = int(_field(body, "at") or 0)
+            timezone = _clean(_field(body, "timezone"), SCHEDULE_TIMEZONE)
+        except Exception:
+            return _error("invalid json body")
+
+        if not schedule_id:
+            return _error("missing id")
+
+        db = self._db()
+        now = int(time.time() * 1000)
+        if at <= now + 30_000:
+            return _error("pick a time in the future", 400)
+
+        # الموعد على بداية دقيقة كاملة: دورة النشر تعمل في الثانية صفر من كل
+        # دقيقة، فيبدأ النشر عند صفر العدّاد نفسه لا في الدورة التي بعدها.
+        settled = at - (at % 60_000)
+        if settled <= now + 30_000:
+            settled += 60_000
+
+        reel = await _firebase_get(db, f"reels/{schedule_id}.json")
+        if not isinstance(reel, dict):
+            return _error("this reel is not registered on the server", 404)
+
+        schedules = await _firebase_get(db, "schedules.json") or {}
+        if not isinstance(schedules, dict):
+            schedules = {}
+
+        current = schedules.get(schedule_id)
+        if isinstance(current, dict):
+            state = _stage_of(current)
+            if state in (
+                STAGE_PUBLISHING,
+                STAGE_VERIFYING,
+                STAGE_CLEANING,
+                STAGE_UNVERIFIED,
+            ):
+                return _error("this reel is being published right now", 409)
+            if state == STAGE_PUBLISHED or _int_of(current, "publishedAt") > 0:
+                return _error("this reel was already published", 409)
+
+        # المواعيد المشغولة: كل ريل آخر ما زال في الطريق إلى النشر.
+        taken = []
+        for other_id, other in schedules.items():
+            if _safe_id(other_id) == schedule_id or not isinstance(other, dict):
+                continue
+            if _stage_of(other) in (STAGE_PUBLISHED, STAGE_FAILED, STAGE_UNVERIFIED):
+                continue
+            other_at = _int_of(other, "at")
+            if other_at > 0:
+                taken.append(other_at)
+        taken.sort()
+
+        for _ in range(len(taken) + 1):
+            moved = False
+            for other_at in taken:
+                if abs(settled - other_at) < MIN_SLOT_GAP_MS:
+                    settled = other_at + MIN_SLOT_GAP_MS
+                    moved = True
+            if not moved:
+                break
+
+        payload = {
+            "at": settled,
+            "timezone": timezone or SCHEDULE_TIMEZONE,
+            "state": STAGE_SCHEDULED,
+            "attempts": 0,
+            "error": None,
+            "containerId": None,
+            "stageAt": 0,
+            "scheduledAt": now,
+            "updatedAt": now,
+        }
+        status = await _firebase_patch(
+            db, f"schedules/{schedule_id}.json", payload
+        )
+        if status != 200:
+            return _error("could not save the schedule (firebase %d)" % status, 502)
+
+        return _json(
+            {
+                "ok": True,
+                "id": schedule_id,
+                "at": settled,
+                "state": STAGE_SCHEDULED,
+                "timezone": payload["timezone"],
+                "serverTime": now,
+                "remainingMs": max(0, settled - now),
+                "shifted": settled != at,
+            }
+        )
+
+    async def _publish_slot_free(self, db, schedule_id, now):
+        """هل يحق لهذا الريل أن يبدأ النشر الآن دون أن يتداخل مع ريل آخر؟"""
+        lock = await _firebase_get(db, PUBLISH_LOCK_PATH) or {}
+        if isinstance(lock, dict):
+            busy_id = _safe_id(lock.get("id"))
+            started = _int_of(lock, "at")
+            if (
+                busy_id
+                and busy_id != schedule_id
+                and started > 0
+                and now - started < PUBLISH_GAP_MS
+            ):
+                return False
+
+        schedules = await _firebase_get(db, "schedules.json") or {}
+        if not isinstance(schedules, dict):
+            return True
+        for other_id, other in schedules.items():
+            if _safe_id(other_id) == schedule_id or not isinstance(other, dict):
+                continue
+            if _stage_of(other) in (STAGE_PUBLISHING, STAGE_VERIFYING, STAGE_CLEANING):
+                return False
+        return True
+
+    async def _lock_publish(self, db, schedule_id, started):
+        """يحجز خانة النشر لهذا الريل، فيمنع بدء نشر ريل آخر قبله مباشرة."""
+        try:
+            await _firebase_put(
+                db, PUBLISH_LOCK_PATH, {"id": schedule_id, "at": started}
+            )
+        except Exception as exc:  # noqa: BLE001 - القفل تحسين، وليس شرطاً للنشر
+            print(f"pigeon publish lock failed: {exc}")
+
     async def _advance(self, db, schedule_id, schedule, now):
         """خطوة واحدة لهذا الموعد، حسب حالته وحدها.
 
@@ -1671,13 +1897,19 @@ class Default(WorkerEntrypoint):
             await _firebase_patch(db, path, payload)
             return _clean(payload.get("state"), state), payload.get("error")
 
-        # 2ب) نحجز خطوة النشر قبل النداء الخارجي نفسه.
+        # 2ب) ريل واحد ينشر في المرة: لا نبدأ media_publish وريل آخر ينشر أو
+        # يتحقق أو ينظف، ولا قبل مدة كافية من بدء نشر الريل السابق.
+        if not await self._publish_slot_free(db, schedule_id, moment):
+            return state, PUBLISH_BUSY
+
+        # 2ج) نحجز خطوة النشر قبل النداء الخارجي نفسه.
         if not await self._claim(
             db, path, etag, current, STAGE_PUBLISHING, {"error": None, "attempts": 0}
         ):
             return state, None
 
         started = int(time.time() * 1000)
+        await self._lock_publish(db, schedule_id, started)
         media_id = None
         error = None
         try:

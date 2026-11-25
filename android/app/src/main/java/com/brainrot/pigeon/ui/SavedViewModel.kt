@@ -1,11 +1,12 @@
 package com.brainrot.pigeon.ui
 
+import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.brainrot.pigeon.data.PublishSchedule
 import com.brainrot.pigeon.data.SavedItem
 import com.brainrot.pigeon.data.SavedRepository
-import com.brainrot.pigeon.data.ScheduleSlots
-import kotlinx.coroutines.Job
+import com.brainrot.pigeon.data.ServerSchedule
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -34,17 +35,19 @@ private data class ExitMark(val item: SavedItem, val kind: ReelExitKind)
 /** مدة بقاء علامة النشر/الحذف على الخانة قبل أن تختفي. */
 private const val EXIT_HOLD_MS = 1_150L
 
-// النشر المجدول يعمل من cron كل دقيقة، فيتأخر بدء النشر حتى 60 ثانية بعد
-// الموعد. التطبيق يطلب من الـWorker البدء لحظة الموعد، ويكرر الطلب داخل هذه
-// النافذة حتى تصل الحالة من Firebase (الـWorker يرفض أي نشر قبل وقته).
-private const val PUBLISH_TRIGGER_WINDOW_MS = 90_000L
-private const val PUBLISH_TRIGGER_GAP_MS = 6_000L
+// العدّ التنازلي وحالة النشر من الخادم وحده: نقرأ لقطة `/schedules` كل خمس
+// ثوانٍ، ونحرّك الساعة المعروضة من نفس نقطة وقت الخادم بين لقطة وأخرى.
+private const val SCHEDULE_POLL_MS = 5_000L
 
-private val PENDING_PUBLISH_STATES = setOf(
-    ScheduleSlots.STATE_SCHEDULED,
-    ScheduleSlots.STATE_CREATING,
-    ScheduleSlots.STATE_PREPARING,
-    ScheduleSlots.STATE_PREPARED,
+/** نقطة ساعة الخادم: وقته لحظة القراءة، وما مضى عليه بساعة الجهاز المستقرة. */
+private data class ClockAnchor(val serverTime: Long, val elapsed: Long)
+
+private fun ServerSchedule.toSchedule() = PublishSchedule(
+    at = at,
+    state = state,
+    error = error,
+    publishedAt = publishedAt,
+    mediaId = mediaId,
 )
 
 /**
@@ -63,17 +66,27 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
     /** خانات تظهر عليها علامة خروج مؤقتاً قبل أن تختفي. */
     private val marks = MutableStateFlow<Map<String, ExitMark>>(emptyMap())
 
+    /** مواعيد الخادم وحالاتها كما وصلت في آخر لقطة ناجحة. */
+    private val serverSchedules = MutableStateFlow<Map<String, ServerSchedule>>(emptyMap())
+
     /**
      * ما تعرضه الشبكة: القائمة الحيّة مع إبقاء الريل المعلَّم ظاهراً حتى
-     * ينتهي أنيميشن الصح أو الحذف، فلا تختفي الخانة قبل ظهور العلامة.
+     * ينتهي أنيميشن الصح أو الحذف، ومع الموعد والحالة اللذين يقررهما الخادم
+     * بدل النسخة المحلية.
      */
-    val items: StateFlow<List<SavedItem>> = combine(live, marks) { current, exits ->
-        val liveIds = current.mapTo(HashSet(current.size)) { it.id }
-        val held = exits.values.mapNotNull { mark ->
-            mark.item.takeIf { it.id !in liveIds }
-        }
-        (current + held).sortedByDescending { it.createdAt }
-    }.stateIn(
+    val items: StateFlow<List<SavedItem>> =
+        combine(live, marks, serverSchedules) { current, exits, schedules ->
+            val liveIds = current.mapTo(HashSet(current.size)) { it.id }
+            val held = exits.values.mapNotNull { mark ->
+                mark.item.takeIf { it.id !in liveIds }
+            }
+            (current + held)
+                .map { item ->
+                    val fromServer = schedules[item.id]?.takeIf { it.at > 0L }
+                    if (fromServer == null) item else item.copy(schedule = fromServer.toSchedule())
+                }
+                .sortedByDescending { it.createdAt }
+        }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),
         initialValue = emptyList(),
@@ -99,8 +112,14 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
     private val _scheduleError = MutableStateFlow<String?>(null)
     val scheduleError: StateFlow<String?> = _scheduleError.asStateFlow()
 
-    /** مؤقّت طلب النشر للموعد القادم؛ يُلغى ويُعاد ضبطه مع كل تغيير في القائمة. */
-    private var publishTrigger: Job? = null
+    /** آخر نقطة ساعة من الخادم؛ كل العرض يُحسب منها. */
+    private val clock = MutableStateFlow(
+        ClockAnchor(System.currentTimeMillis(), SystemClock.elapsedRealtime()),
+    )
+
+    /** ساعة الخادم المعروضة، تتقدّم كل ثانية من نقطة الخادم نفسها. */
+    private val _serverNow = MutableStateFlow(System.currentTimeMillis())
+    val serverNow: StateFlow<Long> = _serverNow.asStateFlow()
 
     init {
         // قبل المزامنة: نلتقط حدث النشر ونعرض عليه علامة الصح.
@@ -120,9 +139,22 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
         }
         // متابعة حيّة: الريل يختفي من الشاشة لحظة حذف الـWorker له بعد النشر.
         viewModelScope.launch { repository.observeRemote() }
-        // توقيت طلب النشر عند الموعد بالضبط بدل انتظار cron.
+        // لقطة العدّ التنازلي من الخادم: الوقت المتبقي والحالة لكل ريل.
         viewModelScope.launch {
-            live.collect { schedulePublishTrigger(it) }
+            while (isActive) {
+                refreshSchedules()
+                delay(SCHEDULE_POLL_MS)
+            }
+        }
+        // ساعة العرض تنطلق من وقت الخادم ولا تتقدّم إلا بساعة الجهاز المستقرة،
+        // فلا يهم ضبط ساعة الهاتف ولا يوجد عدّاد ثانٍ يخالف الخادم.
+        viewModelScope.launch {
+            while (isActive) {
+                val anchor = clock.value
+                _serverNow.value =
+                    anchor.serverTime + (SystemClock.elapsedRealtime() - anchor.elapsed)
+                delay(1_000L)
+            }
         }
         pollArchives()
     }
@@ -155,12 +187,14 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
         _deleteError.value = null
     }
 
-    /** يغيّر موعد النشر من قائمة الضغطة المطوّلة. */
+    /** يغيّر موعد النشر على الخادم من قائمة الضغطة المطوّلة. */
     fun reschedule(item: SavedItem, at: Long) {
         viewModelScope.launch {
             repository.reschedule(item, at).onFailure { error ->
                 _scheduleError.value = error.message ?: "could not change the date"
             }
+            // الموعد الجديد والوقت المتبقي يصلان من الخادم بعد الكتابة.
+            refreshSchedules()
         }
     }
 
@@ -169,33 +203,14 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
     }
 
     /**
-     * يوقّت طلب نشر واحد عند أقرب موعد قادم. الطلب لا ينشر شيئاً بحد ذاته:
-     * الـWorker يقرأ الموعد من Firebase ولا يبدأ قبل حلوله، لكنه يوفّر تأخير
-     * cron (حتى دقيقة). نعيد التوقيت كلما تغيّرت القائمة أو حالة موعد.
+     * يقرأ لقطة العدّ التنازلي من الخادم ويثبّت ساعة العرض عليها. الفشل لا
+     * يمسح آخر لقطة: يبقى العدّاد يتقدّم من آخر نقطة صحيحة حتى تعود الشبكة.
      */
-    private fun schedulePublishTrigger(current: List<SavedItem>) {
-        publishTrigger?.cancel()
-        val next = current
-            .filter { item ->
-                item.schedule?.let { it.at > 0L && it.state in PENDING_PUBLISH_STATES } == true
-            }
-            .minByOrNull { it.schedule?.at ?: Long.MAX_VALUE }
-            ?: return
-        val at = next.schedule?.at ?: return
-
-        publishTrigger = viewModelScope.launch {
-            val wait = at - System.currentTimeMillis()
-            if (wait > 0L) delay(wait)
-
-            val deadline = System.currentTimeMillis() + PUBLISH_TRIGGER_WINDOW_MS
-            while (isActive && System.currentTimeMillis() < deadline) {
-                repository.publishDue()
-                // تغيّر الحالة يعني أن الـWorker بدأ: لا حاجة لمزيد من الطلبات.
-                val state = live.value.firstOrNull { it.id == next.id }?.schedule?.state
-                if (state == null || state !in PENDING_PUBLISH_STATES) return@launch
-                delay(PUBLISH_TRIGGER_GAP_MS)
-            }
-        }
+    private suspend fun refreshSchedules() {
+        val snapshot = repository.scheduleSnapshot() ?: return
+        if (snapshot.serverTime <= 0L) return
+        clock.value = ClockAnchor(snapshot.serverTime, SystemClock.elapsedRealtime())
+        serverSchedules.value = snapshot.reels
     }
 
     /** ينزّل الريل من R2 إلى Downloads مع نسبة 0..100 على البطاقة. */

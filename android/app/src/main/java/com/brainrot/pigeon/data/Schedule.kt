@@ -32,6 +32,15 @@ data class PublishSchedule(
 val PublishSchedule.isPublished: Boolean
     get() = state == ScheduleSlots.STATE_PUBLISHED || publishedAt > 0L
 
+/**
+ * الريل يخرج إلى إنستغرام الآن على الخادم. هذه حالة حقيقية من الـWorker،
+ * لا استنتاج من التطبيق لأن العدّاد وصل صفراً.
+ */
+val PublishSchedule.isPublishing: Boolean
+    get() = state == ScheduleSlots.STATE_PUBLISHING ||
+        state == ScheduleSlots.STATE_VERIFYING ||
+        state == ScheduleSlots.STATE_CLEANING
+
 /** خطة الموعد التي تظهر في نافذة المشاركة. */
 sealed interface SchedulePlan {
     /** لا يوجد أي ريل مجدول بعد: المستخدم يختار الوقت ثم التاريخ. */
@@ -59,7 +68,10 @@ object ScheduleSlots {
     const val STATE_PREPARING = "preparing"
     const val STATE_PREPARED = "prepared"
     const val STATE_PUBLISHING = "publishing"
+    const val STATE_VERIFYING = "verifying"
+    const val STATE_CLEANING = "cleaning"
     const val STATE_PUBLISHED = "published"
+    const val STATE_UNVERIFIED = "unverified"
     const val STATE_FAILED = "failed"
 
     private val zone: ZoneId = ZoneId.of(TIMEZONE)

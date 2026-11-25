@@ -51,6 +51,7 @@
     <string name="reel_number">Reel #%1$d</string>
     <string name="reel_countdown">in %1$s</string>
     <string name="reel_countdown_now">publishing…</string>
+    <string name="reel_state_waiting">on the server…</string>
 
     <string name="saved_no_app">No app can open this link</string>
     <string name="saved_no_content">Nothing to open</string>

@@ -89,6 +89,7 @@ import com.brainrot.pigeon.data.SavedItem
 import com.brainrot.pigeon.data.SchedulePlanner
 import com.brainrot.pigeon.data.SchedulePolicy
 import com.brainrot.pigeon.data.ScheduleSlots
+import com.brainrot.pigeon.data.isPublishing
 import com.brainrot.pigeon.ui.theme.Accent
 import com.brainrot.pigeon.ui.theme.Outline
 import com.brainrot.pigeon.ui.theme.TextMuted
@@ -128,14 +129,8 @@ fun ReelsRoute(container: AppContainer) {
     val images = remember { container.reelImages }
     val context = LocalContext.current
 
-    // ساعة واحدة للشبكة كلها: العدّ التنازلي يتحدّث كل ثانية بلا مؤقّت لكل خانة.
-    var now by remember { mutableStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            now = System.currentTimeMillis()
-            delay(1_000L)
-        }
-    }
+    // ساعة واحدة للشبكة كلها، وهي ساعة الخادم: التطبيق لا يحسب موعداً بنفسه.
+    val now by viewModel.serverNow.collectAsStateWithLifecycle()
 
     // الخانة التي فُتحت لها القائمة السفلية، والريل الذي يُعدَّل موعده.
     var sheetFor by remember { mutableStateOf<SavedItem?>(null) }
@@ -597,15 +592,16 @@ private fun ReelCell(
             }
         }
 
-        // معلومات الريل داخل إطاره: الرقم، تاريخ النشر، والعدّ التنازلي له.
-        val scheduledAt = item.schedule?.at?.takeIf { it > 0L }
+        // معلومات الريل داخل إطاره: تاريخ الخادم، وحالته، والعدّاد من ساعته.
+        val schedule = item.schedule
+        val scheduledAt = schedule?.at?.takeIf { it > 0L }
         Column(
             modifier = Modifier
                 .align(Alignment.BottomStart)
                 .padding(start = 6.dp, end = 26.dp, top = 5.dp, bottom = 5.dp),
             verticalArrangement = Arrangement.spacedBy(1.dp),
         ) {
-            if (scheduledAt != null) {
+            if (scheduledAt != null && schedule != null) {
                 Text(
                     text = ScheduleSlots.formatShort(scheduledAt),
                     color = Color.White,
@@ -615,13 +611,24 @@ private fun ReelCell(
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = if (scheduledAt > now) {
-                        stringResource(
+                    // النص يتبع حالة الخادم: لا "publishing" من تقدير التطبيق.
+                    text = when {
+                        schedule.isPublishing ->
+                            stringResource(R.string.reel_countdown_now)
+
+                        schedule.state == ScheduleSlots.STATE_PUBLISHED ->
+                            stringResource(R.string.schedule_published)
+
+                        schedule.state == ScheduleSlots.STATE_FAILED ||
+                            schedule.state == ScheduleSlots.STATE_UNVERIFIED ->
+                            stringResource(R.string.schedule_failed)
+
+                        scheduledAt > now -> stringResource(
                             R.string.reel_countdown,
                             ScheduleSlots.formatCountdown(scheduledAt - now),
                         )
-                    } else {
-                        stringResource(R.string.reel_countdown_now)
+
+                        else -> stringResource(R.string.reel_state_waiting)
                     },
                     color = Accent,
                     fontSize = 8.sp,
@@ -639,7 +646,6 @@ private fun ReelCell(
             )
         }
 
-        val schedule = item.schedule
         AnimatedVisibility(
             visible = schedule != null,
             enter = fadeIn(tween(220)) +

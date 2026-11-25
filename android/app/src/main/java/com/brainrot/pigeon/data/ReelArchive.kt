@@ -13,8 +13,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -32,6 +35,51 @@ data class ArchiveStatus(
     val progress: Int = 0,
     val url: String? = null,
     val bytes: Long = 0L,
+    val error: String? = null,
+)
+
+/**
+ * موعد ريل واحد كما يعيده الخادم: الوقت المتبقي محسوب بساعة الخادم، والحالة
+ * حقيقية من سلسلة النشر. التطبيق يعرضها ولا يحسبها.
+ */
+@Serializable
+data class ServerSchedule(
+    val at: Long = 0L,
+    val state: String = ScheduleSlots.STATE_SCHEDULED,
+    val remainingMs: Long = 0L,
+    val error: String? = null,
+    val publishedAt: Long = 0L,
+    val mediaId: String? = null,
+    val order: Int = 0,
+)
+
+/** ريل يخرج إلى إنستغرام الآن على الخادم. */
+@Serializable
+data class ServerPublishing(
+    val id: String = "",
+    val state: String = "",
+    val since: Long = 0L,
+)
+
+/** لقطة العدّ التنازلي: وقت الخادم ومواعيد كل الريلز في طلب واحد. */
+@Serializable
+data class ScheduleSnapshot(
+    val ok: Boolean = false,
+    val serverTime: Long = 0L,
+    val reels: Map<String, ServerSchedule> = emptyMap(),
+    val publishing: ServerPublishing? = null,
+)
+
+/** ردّ الخادم عند ضبط موعد: الوقت النهائي بعد منع التداخل. */
+@Serializable
+private data class ScheduleReply(
+    val ok: Boolean = false,
+    val at: Long = 0L,
+    val timezone: String = "",
+    val state: String = ScheduleSlots.STATE_SCHEDULED,
+    val serverTime: Long = 0L,
+    val remainingMs: Long = 0L,
+    val shifted: Boolean = false,
     val error: String? = null,
 )
 
@@ -122,26 +170,71 @@ class ReelArchive(
     }
 
     /**
-     * يطلب من الـWorker تشغيل المجدول الآن. الـWorker يتحقق من الوقت بنفسه،
-     * فلا ينشر شيئاً قبل موعده؛ الفائدة أن النشر يبدأ في الثانية نفسها بدل
-     * انتظار cron الذي قد يتأخر حتى دقيقة كاملة.
+     * يقرأ العدّ التنازلي من الخادم: وقت الخادم نفسه والوقت المتبقي لكل ريل
+     * وحالته الحقيقية. `null` تعني تعذّر الطلب، فتبقى آخر لقطة معروضة.
      */
-    suspend fun publishDue(): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun scheduleSnapshot(): ScheduleSnapshot? = withContext(Dispatchers.IO) {
         runCatching {
-            if (!configured) return@runCatching
+            if (!configured) return@runCatching null
 
             val request = Request.Builder()
-                .url("$base/publish")
+                .url("$base/schedules")
                 .header("Accept", "application/json")
                 .apply { if (token.isNotBlank()) header("X-Api-Key", token) }
-                .post("{}".toRequestBody(ARCHIVE_MEDIA))
                 .build()
 
             http.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw IOException("server HTTP ${response.code}")
+                if (!response.isSuccessful) return@runCatching null
+                val text = runCatching { response.body?.string().orEmpty() }.getOrDefault("")
+                if (text.isBlank()) return@runCatching null
+                json.decodeFromString<ScheduleSnapshot>(text).takeIf { it.serverTime > 0L }
+            }
+        }.getOrNull()
+    }
+
+    /**
+     * يضبط موعد الريل على الخادم. الخادم وحده يكتب الموعد: يمنع التداخل مع
+     * موعد ريل آخر ويرجّع الوقت النهائي، فتبدأ نفس اللحظة عند الطرفين.
+     */
+    suspend fun setSchedule(id: String, at: Long): Result<PublishSchedule> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                if (!configured) throw IOException("the archive service is not configured")
+
+                val payload = buildJsonObject {
+                    put("id", id)
+                    put("at", at)
+                    put("timezone", ScheduleSlots.TIMEZONE)
+                }.toString().toRequestBody(ARCHIVE_MEDIA)
+
+                val request = Request.Builder()
+                    .url("$base/schedules")
+                    .header("Accept", "application/json")
+                    .apply { if (token.isNotBlank()) header("X-Api-Key", token) }
+                    .post(payload)
+                    .build()
+
+                http.newCall(request).execute().use { response ->
+                    val text = runCatching { response.body?.string().orEmpty() }.getOrDefault("")
+                    if (!response.isSuccessful) {
+                        val reason = runCatching {
+                            json.decodeFromString<ScheduleReply>(text).error
+                        }.getOrNull()
+                        throw IOException(
+                            reason?.takeIf { it.isNotBlank() }
+                                ?: "server HTTP ${response.code}",
+                        )
+                    }
+
+                    val reply = json.decodeFromString<ScheduleReply>(text)
+                    PublishSchedule(
+                        at = if (reply.at > 0L) reply.at else at,
+                        timezone = reply.timezone.ifBlank { ScheduleSlots.TIMEZONE },
+                        state = reply.state,
+                    )
+                }
             }
         }
-    }
 
     /**
      * يحذف الريل من الخادم: ملفه من R2 وكل معلوماته من Firebase.
