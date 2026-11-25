@@ -29,6 +29,8 @@
     <string name="schedule_today">Today · %1$s</string>
     <string name="schedule_auto_title">Automatic slot</string>
     <string name="schedule_auto_body">Every new reel is published two full days after the previous one, at 19:00 Algiers time.</string>
+    <string name="schedule_change">Change date &amp; time</string>
+    <string name="schedule_auto_keep">Default slot · %1$s</string>
     <string name="schedule_added">Scheduled for %1$s</string>
     <string name="schedule_added_many">Scheduled %1$d reels, first on %2$s</string>
     <string name="schedule_scheduled">Scheduled</string>

@@ -86,7 +86,7 @@ private sealed interface SharePhase {
     data class Added(val detail: String) : SharePhase
 }
 
-private enum class ScheduleStep { Time, Date }
+private enum class ScheduleStep { Auto, Time, Date }
 
 /**
  * شاشة شفافة فوق التطبيق الذي شارك الريل (إنستغرام مثلاً): تحضّر الريل أولاً،
@@ -140,7 +140,7 @@ class ShareReceiverActivity : ComponentActivity() {
                     hour = ScheduleSlots.timeOf(schedulePlan.at).hour
                     minute = ScheduleSlots.timeOf(schedulePlan.at).minute
                     date = ScheduleSlots.dateOf(schedulePlan.at)
-                    step = ScheduleStep.Date
+                    step = ScheduleStep.Auto
                 }
             }
             phase = SharePhase.Scheduling
@@ -166,21 +166,18 @@ class ShareReceiverActivity : ComponentActivity() {
                         step = ScheduleStep.Date
                     },
                     onBack = { step = ScheduleStep.Time },
+                    onReset = { step = ScheduleStep.Auto },
+                    onEdit = { step = ScheduleStep.Time },
                     onConfirm = {
-                        when (val current = plan) {
-                            is SchedulePlan.Auto -> save(current.at, container.saved)
-                            else -> {
-                                val now = System.currentTimeMillis()
-                                val chosen = date?.let {
-                                    ScheduleSlots.at(it, hour, minute)
-                                }
-                                if (chosen != null && chosen > now) {
-                                    save(chosen, container.saved)
-                                } else {
-                                    // مرّ الوقت المختار أثناء الاختيار: نعيد لموعد صالح.
-                                    date = SchedulePlanner.defaultManualDate(hour, minute, now)
-                                }
-                            }
+                        // الموعد الموجود في الحقول هو الموعد التلقائي ما لم يغيّره
+                        // المستخدم، فنحفظ المختار سواء كان تلقائياً أو معدّلاً يدوياً.
+                        val now = System.currentTimeMillis()
+                        val chosen = date?.let { ScheduleSlots.at(it, hour, minute) }
+                        if (chosen != null && chosen > now) {
+                            save(chosen, container.saved)
+                        } else {
+                            // مرّ الوقت المختار أثناء الاختيار: نعيد لموعد صالح.
+                            date = SchedulePlanner.defaultManualDate(hour, minute, now)
                         }
                     },
                     onCancel = {
@@ -255,6 +252,8 @@ private fun ShareOverlay(
     onDate: (LocalDate) -> Unit,
     onNext: () -> Unit,
     onBack: () -> Unit,
+    onReset: () -> Unit,
+    onEdit: () -> Unit,
     onConfirm: () -> Unit,
     onCancel: () -> Unit,
     onView: () -> Unit,
@@ -323,9 +322,10 @@ private fun ShareOverlay(
                             when (val current = plan) {
                                 null -> BusyContent(stringResource(R.string.share_dialog_saving))
                                 SchedulePlan.Manual -> when (step) {
-                                    ScheduleStep.Time -> TimeStep(
+                                    ScheduleStep.Auto, ScheduleStep.Time -> TimeStep(
                                         hour = hour,
                                         minute = minute,
+                                        cancelLabel = stringResource(R.string.action_close),
                                         onHour = onHour,
                                         onMinute = onMinute,
                                         onCancel = onCancel,
@@ -336,17 +336,41 @@ private fun ShareOverlay(
                                         hour = hour,
                                         minute = minute,
                                         date = date,
+                                        auto = null,
                                         onDate = onDate,
                                         onBack = onBack,
                                         onConfirm = onConfirm,
                                     )
                                 }
 
-                                is SchedulePlan.Auto -> AutoStep(
-                                    at = current.at,
-                                    onCancel = onCancel,
-                                    onConfirm = onConfirm,
-                                )
+                                is SchedulePlan.Auto -> when (step) {
+                                    ScheduleStep.Auto -> AutoStep(
+                                        at = current.at,
+                                        onCancel = onCancel,
+                                        onEdit = onEdit,
+                                        onConfirm = onConfirm,
+                                    )
+
+                                    ScheduleStep.Time -> TimeStep(
+                                        hour = hour,
+                                        minute = minute,
+                                        cancelLabel = stringResource(R.string.schedule_back),
+                                        onHour = onHour,
+                                        onMinute = onMinute,
+                                        onCancel = onReset,
+                                        onNext = onNext,
+                                    )
+
+                                    ScheduleStep.Date -> DateStep(
+                                        hour = hour,
+                                        minute = minute,
+                                        date = date,
+                                        auto = current.at,
+                                        onDate = onDate,
+                                        onBack = onBack,
+                                        onConfirm = onConfirm,
+                                    )
+                                }
                             }
                         }
                     }
@@ -467,6 +491,7 @@ private fun AddedContent(detail: String, onView: () -> Unit, onClose: () -> Unit
 private fun TimeStep(
     hour: Int,
     minute: Int,
+    cancelLabel: String,
     onHour: (Int) -> Unit,
     onMinute: (Int) -> Unit,
     onCancel: () -> Unit,
@@ -584,7 +609,7 @@ private fun TimeStep(
 
     Spacer(Modifier.height(14.dp))
     DialogButtons(
-        cancelLabel = stringResource(R.string.action_close),
+        cancelLabel = cancelLabel,
         confirmLabel = stringResource(R.string.schedule_next),
         onCancel = onCancel,
         onConfirm = onNext,
@@ -597,6 +622,7 @@ private fun DateStep(
     hour: Int,
     minute: Int,
     date: LocalDate?,
+    auto: Long?,
     onDate: (LocalDate) -> Unit,
     onBack: () -> Unit,
     onConfirm: () -> Unit,
@@ -658,6 +684,16 @@ private fun DateStep(
         fontSize = 11.sp,
         textAlign = TextAlign.Center,
     )
+    // في الوضع التلقائي: تنبيه أن الموعد الأصلي محفوظ ويمكن الرجوع إليه بالنقر.
+    if (auto != null) {
+        Spacer(Modifier.height(3.dp))
+        Text(
+            text = stringResource(R.string.schedule_auto_keep, ScheduleSlots.formatFull(auto)),
+            color = TextMuted,
+            fontSize = 10.sp,
+            textAlign = TextAlign.Center,
+        )
+    }
     Spacer(Modifier.height(12.dp))
     DialogButtons(
         cancelLabel = stringResource(R.string.schedule_back),
@@ -669,7 +705,12 @@ private fun DateStep(
 }
 
 @Composable
-private fun AutoStep(at: Long, onCancel: () -> Unit, onConfirm: () -> Unit) {
+private fun AutoStep(
+    at: Long,
+    onCancel: () -> Unit,
+    onEdit: () -> Unit,
+    onConfirm: () -> Unit,
+) {
     Text(
         text = stringResource(R.string.schedule_auto_title),
         color = TextPrimary,
@@ -699,6 +740,23 @@ private fun AutoStep(at: Long, onCancel: () -> Unit, onConfirm: () -> Unit) {
         fontSize = 11.sp,
     )
     Spacer(Modifier.height(16.dp))
+    OutlinedButton(
+        onClick = onEdit,
+        shape = RoundedCornerShape(50),
+        border = BorderStroke(1.dp, Outline),
+        colors = ButtonDefaults.outlinedButtonColors(contentColor = TextPrimary),
+        contentPadding = PaddingValues(0.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(42.dp),
+    ) {
+        Text(
+            text = stringResource(R.string.schedule_change),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+    Spacer(Modifier.height(10.dp))
     DialogButtons(
         cancelLabel = stringResource(R.string.action_close),
         confirmLabel = stringResource(R.string.schedule_confirm),
