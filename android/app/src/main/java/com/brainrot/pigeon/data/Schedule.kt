@@ -112,6 +112,50 @@ object ScheduleSlots {
     fun formatTime(hour24: Int, minute: Int): String =
         LocalTime.of(hour24.coerceIn(0, 23), minute.coerceIn(0, 59)).format(timeFormat)
 
+    /**
+     * عدّاد تنازلي مختصر لموعد النشر: أكبر وحدتين فقط حتى يبقى مقروءاً داخل
+     * خانة صغيرة — "1y 2mo"، "3mo 5d"، "2w 4d"، "5d 3h"، ثم "5:12:33"
+     * للساعات والدقائق والثواني.
+     */
+    fun formatCountdown(remainingMs: Long): String {
+        val seconds = remainingMs.coerceAtLeast(0L) / 1_000L
+        if (seconds <= 0L) return "0s"
+
+        val minute = 60L
+        val hour = 60L * minute
+        val day = 24L * hour
+        val month = 30L * day
+        val year = 365L * day
+
+        val years = seconds / year
+        val months = (seconds % year) / month
+        if (years > 0L) return if (months > 0L) "${years}y ${months}mo" else "${years}y"
+
+        val totalMonths = seconds / month
+        if (totalMonths > 0L) {
+            val days = (seconds % month) / day
+            return if (days > 0L) "${totalMonths}mo ${days}d" else "${totalMonths}mo"
+        }
+
+        val days = seconds / day
+        if (days > 0L) {
+            val weeks = days / 7L
+            val rest = days % 7L
+            if (weeks > 0L) return if (rest > 0L) "${weeks}w ${rest}d" else "${weeks}w"
+            val hours = (seconds % day) / hour
+            return if (hours > 0L) "${days}d ${hours}h" else "${days}d"
+        }
+
+        val hours = seconds / hour
+        val minutes = (seconds % hour) / minute
+        val secs = seconds % minute
+        return if (hours > 0L) {
+            String.format(Locale.US, "%d:%02d:%02d", hours, minutes, secs)
+        } else {
+            String.format(Locale.US, "%d:%02d", minutes, secs)
+        }
+    }
+
     /** 19 → 7، و 0 → 12، و 12 → 12. */
     fun hour12(hour24: Int): Int {
         val hour = hour24.coerceIn(0, 23) % 12

@@ -15,6 +15,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -35,7 +36,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -127,6 +128,15 @@ fun ReelsRoute(container: AppContainer) {
     val images = remember { container.reelImages }
     val context = LocalContext.current
 
+    // ساعة واحدة للشبكة كلها: العدّ التنازلي يتحدّث كل ثانية بلا مؤقّت لكل خانة.
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            now = System.currentTimeMillis()
+            delay(1_000L)
+        }
+    }
+
     // الخانة التي فُتحت لها القائمة السفلية، والريل الذي يُعدَّل موعده.
     var sheetFor by remember { mutableStateOf<SavedItem?>(null) }
     var editingFor by remember { mutableStateOf<SavedItem?>(null) }
@@ -188,11 +198,20 @@ fun ReelsRoute(container: AppContainer) {
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
-                    items(items, key = { it.id }, contentType = { "reel" }) { item ->
+                    itemsIndexed(
+                        items = items,
+                        key = { _, item -> item.id },
+                        contentType = { _, _ -> "reel" },
+                    ) { index, item ->
                         ReelCell(
                             // ظهور الخانة الجديدة وانزلاق الباقي عند الحذف.
                             modifier = Modifier.animateItem(),
                             item = item,
+                            number = index + 1,
+                            now = now,
+                            // بقية الشبكة تبهت والخانة المفتوحة إعداداتها تبرز.
+                            dimmed = sheetItem != null && sheetItem?.id != item.id,
+                            focused = sheetItem?.id == item.id,
                             images = images,
                             download = downloads[item.id],
                             exit = exits[item.id],
@@ -209,6 +228,7 @@ fun ReelsRoute(container: AppContainer) {
     sheetItem?.let { target ->
         ReelSheet(
             item = target,
+            number = items.indexOfFirst { it.id == target.id } + 1,
             download = downloads[target.id],
             onDismiss = { sheetFor = null },
             onDownload = {
@@ -254,6 +274,7 @@ fun ReelsRoute(container: AppContainer) {
 @Composable
 private fun ReelSheet(
     item: SavedItem,
+    number: Int,
     download: DownloadUi?,
     onDismiss: () -> Unit,
     onDownload: () -> Unit,
@@ -278,6 +299,45 @@ private fun ReelSheet(
                 .navigationBarsPadding()
                 .padding(bottom = 10.dp),
         ) {
+            // رقم الريل: تعرف بالضبط أي ريل تعدّل إعداداته.
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 24.dp, end = 24.dp, top = 2.dp, bottom = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(26.dp)
+                        .clip(CircleShape)
+                        .background(Accent.copy(alpha = 0.18f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = "#$number",
+                        color = Accent,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+                Column {
+                    Text(
+                        text = stringResource(R.string.reel_number, number),
+                        color = scheme.onSurface,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    item.schedule?.at?.takeIf { it > 0L }?.let { at ->
+                        Text(
+                            text = ScheduleSlots.formatShort(at),
+                            color = scheme.onSurfaceVariant,
+                            fontSize = 12.sp,
+                        )
+                    }
+                }
+            }
+
             if (isArchivable(item)) {
                 SheetRow(
                     label = if (download?.running == true) {
@@ -387,6 +447,10 @@ private fun ReelsHeader() {
 private fun ReelCell(
     modifier: Modifier = Modifier,
     item: SavedItem,
+    number: Int,
+    now: Long,
+    dimmed: Boolean,
+    focused: Boolean,
     images: AvatarLoader,
     download: DownloadUi?,
     exit: ReelExitKind?,
@@ -416,6 +480,12 @@ private fun ReelCell(
         animationSpec = tween(durationMillis = 260, easing = FastOutSlowInEasing),
         label = "download-fraction",
     )
+    // تعتيم ناعم لبقية الشبكة، وإطار ملوّن حول الريل المفتوح.
+    val dimAlpha by animateFloatAsState(
+        targetValue = if (dimmed) 0.30f else 1f,
+        animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
+        label = "cell-dim",
+    )
 
     Box(
         modifier = modifier
@@ -423,6 +493,14 @@ private fun ReelCell(
             .aspectRatio(REEL_ASPECT)
             .clip(RoundedCornerShape(4.dp))
             .background(Brush.linearGradient(listOf(CellTop, CellBottom)))
+            .graphicsLayer(alpha = dimAlpha)
+            .then(
+                if (focused) {
+                    Modifier.border(1.dp, Accent, RoundedCornerShape(4.dp))
+                } else {
+                    Modifier
+                },
+            )
             .combinedClickable(
                 enabled = exit == null,
                 onClick = onClick,
@@ -484,45 +562,82 @@ private fun ReelCell(
             }
         }
 
-        // تم التحميل على الجهاز.
-        if (download?.done == true) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(5.dp)
-                    .size(19.dp)
-                    .clip(CircleShape)
-                    .background(Color.Black.copy(alpha = 0.55f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                DownloadGlyph(color = Color.White, modifier = Modifier.size(11.dp))
+        // رقم الريل في الشبكة، وأيقونات التحميل بجانبه حتى لا تتراكب.
+        Row(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(5.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ReelNumberBadge(number = number)
+
+            if (download?.done == true) {
+                Box(
+                    modifier = Modifier
+                        .size(19.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.55f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    DownloadGlyph(color = Color.White, modifier = Modifier.size(11.dp))
+                }
+            }
+
+            if (download?.error != null) {
+                Box(
+                    modifier = Modifier
+                        .size(19.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.55f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(text = "!", color = Color(0xFFFF6B6B), fontSize = 11.sp)
+                }
             }
         }
 
-        if (download?.error != null) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .padding(5.dp)
-                    .size(19.dp)
-                    .clip(CircleShape)
-                    .background(Color.Black.copy(alpha = 0.55f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(text = "!", color = Color(0xFFFF6B6B), fontSize = 11.sp)
-            }
-        }
-
-        Text(
-            text = reelLabel(item),
-            color = if (bitmap != null) Color.White else TextMuted,
-            fontSize = 9.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+        // معلومات الريل داخل إطاره: الرقم، تاريخ النشر، والعدّ التنازلي له.
+        val scheduledAt = item.schedule?.at?.takeIf { it > 0L }
+        Column(
             modifier = Modifier
                 .align(Alignment.BottomStart)
-                .padding(start = 6.dp, end = 30.dp, top = 5.dp, bottom = 5.dp),
-        )
+                .padding(start = 6.dp, end = 26.dp, top = 5.dp, bottom = 5.dp),
+            verticalArrangement = Arrangement.spacedBy(1.dp),
+        ) {
+            if (scheduledAt != null) {
+                Text(
+                    text = ScheduleSlots.formatShort(scheduledAt),
+                    color = Color.White,
+                    fontSize = 8.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = if (scheduledAt > now) {
+                        stringResource(
+                            R.string.reel_countdown,
+                            ScheduleSlots.formatCountdown(scheduledAt - now),
+                        )
+                    } else {
+                        stringResource(R.string.reel_countdown_now)
+                    },
+                    color = Accent,
+                    fontSize = 8.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+
+            Text(
+                text = reelLabel(item),
+                color = if (bitmap != null) Color.White.copy(alpha = 0.78f) else TextMuted,
+                fontSize = 7.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
 
         val schedule = item.schedule
         AnimatedVisibility(
@@ -798,6 +913,24 @@ internal fun CalendarGlyph(color: Color, modifier: Modifier = Modifier) {
             end = Offset(s * 0.66f, s * 0.28f),
             strokeWidth = stroke,
             cap = StrokeCap.Round,
+        )
+    }
+}
+
+/** رقم الريل (#3) داخل شارة صغيرة أعلى الخانة، حتى تعرف أي ريل تعدّله. */
+@Composable
+private fun ReelNumberBadge(number: Int) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(Color.Black.copy(alpha = 0.55f))
+            .padding(horizontal = 5.dp, vertical = 1.dp),
+    ) {
+        Text(
+            text = "#$number",
+            color = Color.White,
+            fontSize = 8.sp,
+            fontWeight = FontWeight.Bold,
         )
     }
 }
