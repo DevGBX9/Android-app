@@ -478,7 +478,10 @@ async def _firebase_get(base, path):
     text = await response.text()
     if not text or text == "null":
         return None
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except Exception:  # noqa: BLE001 - رد غير JSON (صفحة HTML مثلاً)
+        return None
 
 
 async def _firebase_read(base, path):
@@ -1204,6 +1207,14 @@ def _snap_to_minute(at, now):
 # --------------------------------------------------------------------------
 
 
+def _node_path(path):
+    """مسار Firebase REST دائماً ينتهي بـ`.json`: بدونه يرجع الموقع صفحة HTML."""
+    clean = _clean(path).strip("/")
+    if not clean:
+        return ".json"
+    return clean if clean.endswith(".json") else clean + ".json"
+
+
 class Store:
     """يغلّف Firebase: قراءة، كتابة مشروطة، وحذف. لا أحد يكتب خارجه."""
 
@@ -1211,26 +1222,26 @@ class Store:
         self.db = db
 
     async def get(self, path):
-        return await _firebase_get(self.db, path)
+        return await _firebase_get(self.db, _node_path(path))
 
     async def read(self, path):
         """(السجل، ETag) — أساس كل حجز آمن."""
-        return await _firebase_read(self.db, path)
+        return await _firebase_read(self.db, _node_path(path))
 
     async def put(self, path, payload):
-        status = await _firebase_put(self.db, path, payload)
+        status = await _firebase_put(self.db, _node_path(path), payload)
         if status not in (200, 204):
             raise ApiError("store_failed", "firebase write failed (HTTP %s)" % status, 502)
         return payload
 
     async def patch(self, path, payload):
-        status = await _firebase_patch(self.db, path, payload)
+        status = await _firebase_patch(self.db, _node_path(path), payload)
         if status not in (200, 204):
             raise ApiError("store_failed", "firebase write failed (HTTP %s)" % status, 502)
         return payload
 
     async def delete(self, path):
-        return await _firebase_delete(self.db, path)
+        return await _firebase_delete(self.db, _node_path(path))
 
     async def commit(self, path, etag, current, patch):
         """كتابة مشروطة مع إعادة محاولة واحدة عند تغيّر السجل.
@@ -1240,13 +1251,14 @@ class Store:
         """
         merged = dict(current) if isinstance(current, dict) else {}
         merged.update(patch)
+        node = _node_path(path)
         for _attempt in range(CAS_ATTEMPTS):
             if etag:
                 status = await _firebase_compare_write(
-                    self.db, path, etag, current or {}, patch
+                    self.db, node, etag, current or {}, patch
                 )
             else:
-                status = await _firebase_patch(self.db, path, patch)
+                status = await _firebase_patch(self.db, node, patch)
             if status in (200, 204):
                 return merged
             if status not in (400, 409, 412):
