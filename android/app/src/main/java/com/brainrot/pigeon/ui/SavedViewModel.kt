@@ -3,6 +3,7 @@ package com.brainrot.pigeon.ui
 import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.brainrot.pigeon.data.PublishOutcome
 import com.brainrot.pigeon.data.PublishSchedule
 import com.brainrot.pigeon.data.SavedItem
 import com.brainrot.pigeon.data.SavedRepository
@@ -100,7 +101,16 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
                         )
 
                         fromServer == null -> item
-                        else -> item.copy(schedule = fromServer.toSchedule())
+                        else -> item.copy(
+                            schedule = fromServer.toSchedule(),
+                            // حالة الأرشيف تأتي من الخادم أيضاً، لا من Firebase.
+                            archiveState = fromServer.archiveState ?: item.archiveState,
+                            archiveProgress = if (fromServer.archiveState != null) {
+                                fromServer.archiveProgress
+                            } else {
+                                item.archiveProgress
+                            },
+                        )
                     }
                 }
                 // الأقرب موعداً أولاً: نفس ترتيب النشر على الخادم، وغير المجدول آخراً.
@@ -267,13 +277,16 @@ class SavedViewModel(private val repository: SavedRepository) : ViewModel() {
         _publishingIds.update { it + item.id }
 
         viewModelScope.launch {
-            repository.publishNow(item)
-                // الخادم أكّد النشر: الريل يخرج من الشبكة الآن مع علامة صح،
-                // بدل بقائه "publishing" إلى أن ينتهي الخادم من التنظيف.
-                .onSuccess { repository.markPublished(item) }
-                .onFailure { error ->
-                    _scheduleError.value = error.message ?: "could not publish now"
-                }
+            // الخادم يقرر النتيجة: نُشر، أو ما زال يعمل، أو رُفض.
+            when (val outcome = repository.publishNow(item)) {
+                is PublishOutcome.Published -> repository.markPublished(item)
+                // السلسلة تعمل على الخادم: لا نشر ثانٍ ولا رسالة خطأ،
+                // والريل يبقى ينتظر وصول الحالة النهائية عبر اللقطة.
+                is PublishOutcome.InProgress -> Unit
+                is PublishOutcome.Failed ->
+                    _scheduleError.value = outcome.message.takeIf { it.isNotBlank() }
+                        ?: "could not publish now"
+            }
             _publishingIds.update { it - item.id }
             // الحالة بعد الطلب تأتي من الخادم، لا من التطبيق.
             refreshSchedules()

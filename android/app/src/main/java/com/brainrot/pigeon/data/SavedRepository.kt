@@ -151,7 +151,7 @@ class SavedRepository(
     }
 
     /** ينشر الريل الآن: الخادم يلغي العدّاد ثم يكمل بخطوات النشر العادية. */
-    suspend fun publishNow(item: SavedItem): Result<Unit> = archive.publishNow(item.id)
+    suspend fun publishNow(item: SavedItem): PublishOutcome = archive.publishNow(item.id)
 
     /**
      * بعد رد الخادم بأن النشر نجح: الريل يخرج فوراً من الشبكة ومن التخزين
@@ -377,7 +377,8 @@ class SavedRepository(
 
         while (System.currentTimeMillis() < deadline) {
             delay(1200)
-            val status = remote.fetchArchive(current.id)
+            // حالة المهمة تُقرأ من الخادم وحده؛ Firebase ليس مصدر قرار هنا.
+            val status = archive.archiveStatus(current.id)
 
             // غابت عقدة الأرشيف (طلب ضاع قبل أن يكتبه الخادم): نعيد الطلب.
             if (status == null) {

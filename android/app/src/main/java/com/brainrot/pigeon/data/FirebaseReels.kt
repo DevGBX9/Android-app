@@ -99,21 +99,6 @@ class FirebaseReels(
             }.onFailure { error -> Log.w(LOG_TAG, "schedules fetch failed: ${error.message}") }
         }
 
-    /** يقرأ حالة الأرشيف لسجل واحد من نفس العقدة التي يكتبها الـWorker. */
-    suspend fun fetchArchive(id: String): ArchiveStatus? = withContext(Dispatchers.IO) {
-        runCatching {
-            val url = "$endpoint/$id/archive.json".toHttpUrlOrNull() ?: return@runCatching null
-
-            client.newCall(Request.Builder().url(url).build()).execute().use { response ->
-                val body = response.body?.string().orEmpty()
-                if (!response.isSuccessful || body.isBlank() || body.trim() == "null") {
-                    return@use null
-                }
-                json.decodeFromString<ArchiveStatus>(body)
-            }
-        }.getOrNull()
-    }
-
     /** يسحب كل الريلز؛ القيمة `null` تعني قائمة فاضية وليست خطأ. */
     suspend fun fetchAll(): Result<List<SavedItem>> = withContext(Dispatchers.IO) {
         runCatching {

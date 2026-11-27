@@ -227,6 +227,13 @@ GET   <db>/schedules.json       # كل المواعيد
   القواعد لاحقاً لازم إضافة توكن/مصادقة في `FirebaseReels`.
 - عنوان القاعدة: `BuildConfig.DEFAULT_FIREBASE_DB` ويمكن تجاوزه بـ
   `pigeon.firebaseDb` في `local.properties` وقت البناء فقط.
+- **الخادم هو المرجع**: التطبيق يرسل أوامر (`POST /schedules`,
+  `POST /schedules/order`, `POST /publish-now`, `DELETE /reels/<id>`,
+  `POST /reels`) ويعرض ما يعود من `GET /state` و`GET /reels/<id>`.
+  `ReelArchive.publishNow` يعيد `PublishOutcome` (Published / InProgress /
+  Failed) ولا يستنتج النجاح من رمز HTTP، وحالة الأرشيف تُقرأ من
+  `ReelArchive.archiveStatus` لا من Firebase مباشرة. الموعد والعدّ التنازلي
+  وحالة النشر والأوامر المسموحة (`allowedActions`) كلها من الخادم.
 
 ## 7. API البروفايل (مساران + سبب فشل ظاهر)
 

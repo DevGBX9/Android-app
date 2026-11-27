@@ -51,6 +51,12 @@ data class ServerSchedule(
     val publishedAt: Long = 0L,
     val mediaId: String? = null,
     val order: Int = 0,
+    // حالة الأرشيف والأوامر المسموحة يقررها الخادم، والتطبيق يعرضها فقط.
+    val archiveState: String? = null,
+    val archiveProgress: Int = 0,
+    val downloadable: Boolean = false,
+    val publishable: Boolean = true,
+    val allowedActions: List<String> = emptyList(),
 )
 
 /** ريل يخرج إلى إنستغرام الآن على الخادم. */
@@ -68,6 +74,7 @@ data class ScheduleSnapshot(
     val serverTime: Long = 0L,
     val reels: Map<String, ServerSchedule> = emptyMap(),
     val publishing: ServerPublishing? = null,
+    val revision: Long = 0L,
 )
 
 /** ردّ الخادم عند ضبط موعد: الوقت النهائي بعد منع التداخل. */
@@ -87,8 +94,33 @@ private data class ScheduleReply(
 private data class PublishReply(
     val ok: Boolean = false,
     val state: String = "",
+    val published: Boolean = false,
+    val inProgress: Boolean = false,
+    val error: String? = null,
+    val errorCode: String? = null,
+)
+
+/** ردّ الخادم لحالة ريل واحد: الأرشيف والأوامر التي يسمح بها الآن. */
+@Serializable
+private data class ReelStatusReply(
+    val ok: Boolean = false,
+    val archive: ArchiveStatus? = null,
+    val downloadable: Boolean = false,
+    val allowedActions: List<String> = emptyList(),
     val error: String? = null,
 )
+
+/** نتيجة أمر النشر: الخادم وحده يقرر إن نُشر أو ما زال يعمل. */
+sealed interface PublishOutcome {
+    /** الخادم أكّد النشر: يخرج الريل من الشبكة. */
+    data object Published : PublishOutcome
+
+    /** السلسلة تعمل على الخادم الآن: لا نشر ثانٍ ولا رسالة خطأ. */
+    data class InProgress(val state: String, val message: String?) : PublishOutcome
+
+    /** رُفض الأمر بسبب واضح من الخادم أو الشبكة. */
+    data class Failed(val message: String) : PublishOutcome
+}
 
 /** ردّ الخادم بعد ترتيب الشبكة: المواعيد التي أقرّها لكل ريل. */
 @Serializable
@@ -253,10 +285,10 @@ class ReelArchive(
         }
 
     /**
-     * ينشر الريل الآن: يطلب من الخادم إلغاء العدّاد وبدء سلسلة النشر نفسها
-     * (نشر، تأكيد، تنظيف) التي تعمل عند صفر العدّاد.
+     * يرسل أمر "انشر الآن" ويعيد قرار الخادم كما هو: نُشر، أو ما زال يعمل،
+     * أو رُفض بسبب. التطبيق لا يستنتج النجاح من رمز HTTP وحده.
      */
-    suspend fun publishNow(id: String): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun publishNow(id: String): PublishOutcome = withContext(Dispatchers.IO) {
         runCatching {
             if (!configured) throw IOException("the archive service is not configured")
 
@@ -277,17 +309,52 @@ class ReelArchive(
                     json.decodeFromString<PublishReply>(text)
                 }.getOrNull()
 
-                if (!response.isSuccessful) {
-                    throw IOException(
+                val published = reply?.published == true &&
+                    (reply.state == ScheduleSlots.STATE_PUBLISHED ||
+                        reply.state == ScheduleSlots.STATE_CLEANING)
+
+                when {
+                    published -> PublishOutcome.Published
+                    reply?.inProgress == true -> PublishOutcome.InProgress(
+                        state = reply.state,
+                        message = reply.error,
+                    )
+                    !response.isSuccessful -> PublishOutcome.Failed(
                         reply?.error?.takeIf { it.isNotBlank() }
                             ?: "server HTTP ${response.code}",
                     )
+                    else -> PublishOutcome.Failed(
+                        reply?.error?.takeIf { it.isNotBlank() }
+                            ?: "the reel was not published",
+                    )
                 }
-                // ردّ غير ناجح مع سبب واضح (مثلاً ريل آخر يُنشر الآن).
-                val problem = reply?.takeIf { !it.ok }?.error?.takeIf { it.isNotBlank() }
-                if (problem != null) throw IOException(problem)
             }
+        }.getOrElse { error ->
+            PublishOutcome.Failed(error.message ?: "network error")
         }
+    }
+
+    /**
+     * حالة أرشيف ريل واحد من الخادم: التطبيق لا يقرأ تقدّم الأرشفة من Firebase
+     * مباشرة، فالخادم وحده يملك حالة المهمة.
+     */
+    suspend fun archiveStatus(id: String): ArchiveStatus? = withContext(Dispatchers.IO) {
+        runCatching {
+            if (!configured) return@runCatching null
+
+            val request = Request.Builder()
+                .url("$base/reels/$id")
+                .header("Accept", "application/json")
+                .apply { if (token.isNotBlank()) header("X-Api-Key", token) }
+                .build()
+
+            http.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) return@runCatching null
+                val text = runCatching { response.body?.string().orEmpty() }.getOrDefault("")
+                if (text.isBlank()) return@runCatching null
+                json.decodeFromString<ReelStatusReply>(text).archive
+            }
+        }.getOrNull()
     }
 
     /**

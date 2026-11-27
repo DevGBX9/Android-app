@@ -8,21 +8,35 @@ R2، ويحدّث حالة المعالجة والتقدّم في Firebase Realt
 (19:00 بتوقيت الجزائر) عبر Instagram Graph API، من cron داخل الـWorker، لا من
 جدولة إنستغرام نفسها. الملف العام الذي يقرأه Meta من `GET /media/<id>`.
 
-المسارات:
-    GET  /                     معلومات الخدمة
-    GET  /health               فحص سريع
-    POST /reels                {"id", "url", "thumbnail"?} -> 202 ويبدأ المعالجة
-    GET  /reels/<id>           حالة الأرشفة (تقرأ من Firebase، وبدونها من R2)
-    GET  /download/<id>        ملف الفيديو من R2 (Content-Disposition: attachment)
-    GET  /media/<id>           نفس الملف للعرض العام (لـMeta، بلا مفتاح)
-    GET  /schedules            وقت الخادم والوقت المتبقي وحالة كل موعد
-    POST /schedules            {"id", "at"} -> يكتب الموعد ويزيحه لو تداخل
-    POST /schedules/order      {"ids": [..]} -> يوزّع المواعيد حسب ترتيب الشبكة
-    POST /publish-now          {"id"} -> ينشر الريل الآن (يتجاهل الموعد) ثم يحذف وينظّف
-    GET|POST /publish          تشغيل المجدول فوراً (احتياط للـcron)
+البنية (أربع طبقات في هذا الملف، بالترتيب):
+    1) أدوات التنزيل والاستخراج وGraph API (دوال مساعدة نقية).
+    2) الأخطاء والعقد الموحّد والمخزن `Store`: كل قراءة/كتابة Firebase تمر منه،
+       وكل تغيير حالة كتابة مشروطة بـETag (لا كتابة عشوائية على سجل يتغير).
+    3) محرّك النشر `Engine`: سلسلة واحدة، وخطوة واحدة لكل نداء، وحجز قبل كل
+       نداء خارجي. ثم `Commands`: أوامر idempotent بقواعد صلاحية صريحة.
+    4) الراوتر `Default`: مصادقة واحدة، ورد JSON موحّد، ولا منطق نشر فيه.
 
-كل الطلبات تُرفض إذا لم يكن `API_TOKEN` مضبوطاً في الأسرار، ولم يكن الترويسة
-`X-Api-Key` مطابقة، ما عدا `/media/<id>` و`/health`.
+المسارات:
+    GET    /                  معلومات الخدمة
+    GET    /health            فحص سريع
+    GET    /state             لقطة الحالة الكاملة (المصدر الوحيد للتطبيق)
+    GET    /schedules         اسم قديم لنفس اللقطة (توافق خلفي)
+    POST   /schedules         {"id", "at"} -> يكتب الموعد ويزيح المتداخل
+    POST   /schedules/order   {"ids": [..]} -> يوزّع المواعيد حسب ترتيب الشبكة
+    POST   /publish-now       {"id"} -> ينشر الآن ثم ينظّف (idempotent)
+    GET|POST /publish         تشغيل المجدول فوراً وتقرير كامل (احتياط للـcron)
+    POST   /reels             {"id", "url", "thumbnail"?, "media"?} -> أرشفة
+    GET    /reels/<id>        حالة ريل واحد (أرشيف + الأوامر المسموحة)
+    DELETE /reels/<id>        حذف الملف والسجلات (409 أثناء النشر)
+    GET    /download/<id>     ملف الفيديو من R2 للتحميل على الجهاز
+    GET    /media/<id>        نفس الملف للعرض العام (لـMeta، بلا مفتاح)
+
+كل رد JSON: {"ok", "service", "version", "serverTime", "requestId"} ثم حقول
+النتيجة، أو {"ok": false, "error", "errorCode"} عند الفشل. الأوامر المتكررة
+تعيد النتيجة نفسها ولا تكرر أثرها.
+
+كل الطلبات تُرفض بلا `X-Api-Key` مطابق إن كان `API_TOKEN` مضبوطاً، ما عدا
+`/media/<id>` و`/health` و`/`.
 """
 
 import asyncio
@@ -1047,1556 +1061,367 @@ async def _ig_publish(user_id, token, container_id):
         raise RuntimeError(_ig_message(data, int(response.status)))
     return str(data["id"])
 
+# ==========================================================================
+# الطبقة 1 — العقد الموحّد: الأخطاء، الثوابت، التحقق، والمخزن
+# ==========================================================================
+# كل مسار في هذا الملف يتبع نفس القواعد:
+#   1) أي طلب يُقرأ ويُتحقق منه قبل أي كتابة (لا كتابة على مدخل ناقص).
+#   2) أي تغيير حالة يمر عبر Store.transition/commit = كتابة مشروطة بـETag.
+#   3) أي فشل يرفع ApiError، والراوتر وحده يحوّله إلى رد JSON موحّد.
+#   4) الأوامر idempotent: تكرار الأمر لا يكرر أثره (لا نشر مزدوج، لا حذف أعمى).
+
+CAS_ATTEMPTS = 4
+SERVICE_VERSION = 13
+
+# الحالات النهائية: لا تُعاد تلقائياً أبداً.
+FINAL_STAGES = (STAGE_PUBLISHED, STAGE_FAILED, STAGE_UNVERIFIED)
+# الحالات التي يجري فيها عمل خارجي الآن: لا تعديل ولا حذف ولا نشر ثانٍ.
+IN_FLIGHT_STAGES = (STAGE_PUBLISHING, STAGE_VERIFYING, STAGE_CLEANING)
+
+# نطاق المواعيد المقبول من التطبيق.
+MAX_FUTURE_MS = 366 * 24 * 60 * 60 * 1000
+MIN_LEAD_MS = 30_000
+
+# قفل تعاوني بين cron وترتيب الشبكة: احتياط تنظيمي فوق حجز كل سجل بـETag.
+MUTEX_PATH = "worker/mutex.json"
+MUTEX_LEASE_MS = 120_000
+# مؤشر عرض فقط: يتغيّر مع كل أمر حتى تعرف الواجهة أن اللقطة تغيّرت.
+REVISION_PATH = "worker/revision.json"
+
+
+class ApiError(Exception):
+    """خطأ واحد موحّد لكل مسارات الفشل، يحمل رمزاً ورسالة وحالة HTTP."""
+
+    def __init__(self, code, message, status=400):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status = status
+
+
+def _now():
+    return int(time.time() * 1000)
+
+
+def _new_request_id():
+    from uuid import uuid4
+
+    return uuid4().hex[:16]
+
+
+def _reply(payload=None, status=200, request_id=None):
+    """رد ناجح موحّد. الحقول القديمة تبقى في الجذر لأن التطبيق يقرأها."""
+    body = {
+        "ok": True,
+        "service": "pigeon-reels",
+        "version": SERVICE_VERSION,
+        "serverTime": _now(),
+    }
+    if request_id:
+        body["requestId"] = request_id
+    if payload:
+        body.update(payload)
+    return _json(body, status)
+
+
+def _fail(code, message, status=400, request_id=None):
+    body = {
+        "ok": False,
+        "service": "pigeon-reels",
+        "version": SERVICE_VERSION,
+        "serverTime": _now(),
+        "error": _clean(message, "request failed"),
+        "errorCode": code,
+    }
+    if request_id:
+        body["requestId"] = request_id
+    return _json(body, status)
+
 
 # --------------------------------------------------------------------------
-# الـWorker
+# التحقق من المدخلات: كل شيء يُرفض برمز واضح قبل أي كتابة
 # --------------------------------------------------------------------------
 
 
-class Default(WorkerEntrypoint):
-    """نقطة الدخول: راوتر صغير للمسارات + خلفية الأرشفة + cron النشر."""
+def _require_id(value):
+    clean = _safe_id(value)
+    if not clean:
+        raise ApiError("invalid_request", "missing or invalid id")
+    return clean
 
-    def _db(self):
-        return _clean(getattr(self.env, "FIREBASE_DB", None), RTDB_FALLBACK)
 
-    def _authorized(self, request):
-        expected = _clean(getattr(self.env, "API_TOKEN", None))
-        if not expected:
-            return True
-        provided = _clean(request.headers.get("x-api-key"))
-        return provided == expected
+def _require_at(value):
+    try:
+        at = int(value or 0)
+    except (TypeError, ValueError):
+        raise ApiError("invalid_request", "at must be epoch milliseconds")
+    now = _now()
+    if at <= 0:
+        raise ApiError("invalid_request", "missing at")
+    if at < now - 60_000:
+        raise ApiError("invalid_request", "pick a time in the future")
+    if at > now + MAX_FUTURE_MS:
+        raise ApiError("invalid_request", "the date is too far in the future")
+    return at
 
-    async def fetch(self, request):
-        method = _clean(request.method, "GET").upper()
-        path = _path_of(str(request.url))
-        parts = [part for part in path.split("/") if part]
 
-        if not parts:
-            return _json(
-                {
-                    "ok": True,
-                    "service": "pigeon-reels",
-                    "version": 12,
-                    "routes": [
-                        "POST /reels",
-                        "GET /reels/<id>",
-                        "DELETE /reels/<id>",
-                        "GET /download/<id>",
-                        "GET /media/<id>",
-                        "GET|POST /publish",
-                        "GET /schedules",
-                        "POST /schedules",
-                        "POST /schedules/order",
-                        "POST /publish-now",
-                    ],
-                    "sources": ["instagram", "tiktok"],
-                    "publishing": "instagram graph api (server countdown)",
-                }
-            )
+def _require_ids(value, minimum=2):
+    if not isinstance(value, list):
+        raise ApiError("invalid_request", "missing ids")
+    ids = []
+    for raw in value:
+        clean = _safe_id(raw)
+        if not clean:
+            raise ApiError("invalid_request", "invalid id in ids")
+        if clean in ids:
+            raise ApiError("invalid_request", "duplicate id in ids")
+        ids.append(clean)
+    if len(ids) < minimum:
+        raise ApiError("invalid_request", "at least two reels are needed")
+    return ids
 
-        if parts[0] == "health":
-            return _json({"ok": True, "time": int(time.time() * 1000)})
 
-        # ملف عام يقرأه Meta وقت النشر: بلا X-Api-Key لأن Graph API لا يرسله.
-        if parts[0] == "media" and len(parts) == 2 and method in ("GET", "HEAD"):
-            return await self._media(parts[1], method)
+async def _body_of(request):
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 - جسم غير JSON
+        raise ApiError("invalid_body", "invalid json body")
+    if not isinstance(body, dict):
+        raise ApiError("invalid_body", "json body must be an object")
+    return body
 
-        if not self._authorized(request):
-            return _error("unauthorized", 401)
 
-        if parts[0] == "reels" and len(parts) == 1 and method == "POST":
-            return await self._start(request)
+def _snap_to_minute(at, now):
+    """الموعد على بداية دقيقة كاملة، ولا يقل عن مهلة قصيرة من الآن."""
+    settled = at - (at % 60_000)
+    if settled <= now + MIN_LEAD_MS:
+        settled += 60_000
+    return settled
 
-        if parts[0] == "reels" and len(parts) == 2 and method == "GET":
-            return await self._status(parts[1])
 
-        # حذف ريل مجدول من التطبيق: يمسح ملفه من R2 وكل معلوماته من Firebase.
-        if parts[0] == "reels" and len(parts) == 2 and method == "DELETE":
-            return await self._delete_reel(parts[1])
+# --------------------------------------------------------------------------
+# المخزن: المسار الوحيد للكتابة في Firebase
+# --------------------------------------------------------------------------
 
-        if parts[0] == "download" and len(parts) == 2 and method == "GET":
-            return await self._download(parts[1])
 
-        # مصدر الحقيقة الوحيد للعدّ التنازلي: وقت الخادم والوقت المتبقي لكل ريل.
-        if parts[0] == "schedules" and len(parts) == 1 and method == "GET":
-            return _json(await self._schedule_snapshot())
+class Store:
+    """يغلّف Firebase: قراءة، كتابة مشروطة، وحذف. لا أحد يكتب خارجه."""
 
-        # الجدولة تُكتب من هنا لا من التطبيق، فيملك الخادم الموعد والعدّ التنازلي.
-        if parts[0] == "schedules" and len(parts) == 1 and method == "POST":
-            return await self._set_schedule(request)
+    def __init__(self, db):
+        self.db = db
 
-        # ترتيب الشبكة الجديد: المواعيد نفسها تُوزّع على الريلز حسب ترتيب السحب،
-        # فسحب ريل 26 نوفمبر فوق ريل 29 نوفمبر يتبادل الموعدين بينهما.
-        if (
-            parts[0] == "schedules"
-            and len(parts) == 2
-            and parts[1] == "order"
-            and method == "POST"
-        ):
-            return await self._reorder_schedules(request)
+    async def get(self, path):
+        return await _firebase_get(self.db, path)
 
-        # النشر الآن من التطبيق: العدّاد يُلغى فوراً ثم تتولى السلسلة العادية
-        # بقية الخطوات (نشر، تأكيد، تنظيف) كما لو أن الموعد حلّ هذه اللحظة.
-        if parts[0] == "publish-now" and len(parts) == 1 and method == "POST":
-            return await self._publish_now(request)
+    async def read(self, path):
+        """(السجل، ETag) — أساس كل حجز آمن."""
+        return await _firebase_read(self.db, path)
 
-        # تشغيل المجدول فوراً بدل انتظار cron: يرجّع تقريراً كاملاً لكل موعد
-        # (الحالة، سبب الخطأ، وهل التوكن مضبوط) حتى يمكن تشخيص النشر من المتصفح.
-        if parts[0] == "publish" and len(parts) == 1 and method in ("GET", "POST"):
-            summary = await self._publish_due()
-            await self._record_run(summary)
-            return _json(summary)
+    async def put(self, path, payload):
+        status = await _firebase_put(self.db, path, payload)
+        if status not in (200, 204):
+            raise ApiError("store_failed", "firebase write failed (HTTP %s)" % status, 502)
+        return payload
 
-        if method == "OPTIONS":
-            return Response(
-                "",
-                status=204,
-                headers={
-                    "access-control-allow-origin": "*",
-                    "access-control-allow-headers": "content-type,x-api-key",
-                    "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
-                },
-            )
+    async def patch(self, path, payload):
+        status = await _firebase_patch(self.db, path, payload)
+        if status not in (200, 204):
+            raise ApiError("store_failed", "firebase write failed (HTTP %s)" % status, 502)
+        return payload
 
-        return _error("not found", 404)
+    async def delete(self, path):
+        return await _firebase_delete(self.db, path)
 
-    async def _start(self, request):
-        try:
-            body = await request.json()
-            reel_id = _safe_id(_field(body, "id"))
-            link = _clean(_field(body, "url"))
-            thumbnail = _clean(_field(body, "thumbnail"))
-            app_media = _safe_media_url(_field(body, "media"))
-        except Exception:
-            return _error("invalid json body")
+    async def commit(self, path, etag, current, patch):
+        """كتابة مشروطة مع إعادة محاولة واحدة عند تغيّر السجل.
 
-        if not reel_id:
-            return _error("missing id")
+        إن لم يأتِ ETag (سجل جديد) نستخدم PATCH (دمج) لأنه لا يمكن أن يمسح
+        حقولاً لم نرسلها. وجود ETag يعني PUT مشروطاً: إما ننجح أو 412.
+        """
+        merged = dict(current) if isinstance(current, dict) else {}
+        merged.update(patch)
+        for _attempt in range(CAS_ATTEMPTS):
+            if etag:
+                status = await _firebase_compare_write(
+                    self.db, path, etag, current or {}, patch
+                )
+            else:
+                status = await _firebase_patch(self.db, path, patch)
+            if status in (200, 204):
+                return merged
+            if status not in (400, 409, 412):
+                raise ApiError(
+                    "store_failed", "firebase write failed (HTTP %s)" % status, 502
+                )
+            current, etag = await self.read(path)
+            if not isinstance(current, dict):
+                current, etag = {}, None
+            merged = dict(current)
+            merged.update(patch)
+        raise ApiError("conflict", "the record kept changing; try again", 409)
 
-        code = _instagram_code(link)
-        tiktok = None if code else _tiktok_link(link)
-        if not code and not tiktok:
-            return _error("only instagram reel and tiktok video links are supported")
-        source = "instagram" if code else "tiktok"
+    async def transition(self, path, expected, to_state, extra=None):
+        """انتقال حالة واحد: ينجح فقط إن كانت الحالة ما زالت [expected].
 
-        origin = _origin_of(str(request.url))
-        db = self._db()
-        now = int(time.time() * 1000)
-
-        try:
-            await _firebase_put(
-                db,
-                f"reels/{reel_id}/archive.json",
-                {"state": "queued", "progress": 0, "updatedAt": now},
-            )
-        except Exception as exc:  # noqa: BLE001 - نبلّغ التطبيق بدل 500 غامض
-            return _json(
-                {
-                    "ok": False,
-                    "error": "could not queue the archive: %s" % str(exc)[:160],
-                },
-                status=503,
-            )
-
-        # نحفظ الرابط الذي حلّه الهاتف حتى يستطيع cron إعادة الأرشفة بنفسه
-        # لو انقطعت الأرشفة الأولى قبل أن يُخزّن الملف في R2.
-        if app_media:
+        يرجّع السجل بعد الكتابة، أو السجل الحالي كما هو إن لم تكن الحالة
+        متوقعة (أي أن تشغيلاً آخر سبقنا)، أو None إن تعذّر الحجز.
+        """
+        for _attempt in range(CAS_ATTEMPTS):
+            current, etag = await self.read(path)
+            if not isinstance(current, dict):
+                return None
+            if expected is not None and _stage_of(current) not in expected:
+                # سبقنا تشغيل آخر إلى الحالة: لا حجز ولا كتابة.
+                return None
+            moment = _now()
+            patch = {"state": to_state, "stageAt": moment, "updatedAt": moment}
+            if extra:
+                patch.update(extra)
             try:
-                await _firebase_patch(
-                    db,
-                    f"reels/{reel_id}.json",
-                    {"media": app_media, "source": source},
-                )
-            except Exception:  # noqa: BLE001 - تحسين فقط
-                pass
+                return await self.commit(path, etag, current, patch)
+            except ApiError as exc:
+                if exc.code != "conflict":
+                    raise
+        return None
 
-        job = self._archive(
-            reel_id=reel_id,
-            code=code,
-            tiktok=tiktok,
-            source=source,
-            origin=origin,
-            thumbnail=thumbnail,
-            app_media=app_media if source == "tiktok" else None,
-        )
-        # ننتظر الأرشفة داخل الطلب: `waitUntil` تُلغى بعد انتهاء الاستجابة،
-        # وهذا هو سبب أن الملف كان لا يصل R2 إلا عند إعادة الطلب من زر التنزيل.
+    async def bump_revision(self):
+        """مؤشر عرض فقط (للمزامنة في الواجهة): لا يُفشل أي عملية."""
         try:
-            await asyncio.wait_for(job, ARCHIVE_BUDGET_S + 8)
-        except BaseException:  # noqa: BLE001 - نكمل بالحالة المسجلة
-            pass
+            current = await self.get(REVISION_PATH)
+            rev = _int_of(current, "rev") if isinstance(current, dict) else 0
+            await self.patch(REVISION_PATH, {"rev": rev + 1, "at": _now()})
+        except Exception:  # noqa: BLE001 - تجميلي
+            return
 
-        stored = await _object_exists(self.env, self._key(reel_id))
-        if stored is True:
-            return _json({"ok": True, "id": reel_id, "state": "ready"}, status=202)
 
-        return _json({"ok": True, "id": reel_id, "state": "queued"}, status=202)
+# --------------------------------------------------------------------------
+# صورة الريل: المكان الوحيد الذي يُشتق منه ما يعرضه التطبيق وما يحق له
+# --------------------------------------------------------------------------
 
-    async def _status(self, reel_id):
-        reel_id = _safe_id(reel_id)
-        if not reel_id:
-            return _error("bad id", 404)
 
-        archive = await _firebase_get(self._db(), f"reels/{reel_id}/archive.json")
-        if archive:
-            # مهمة الخلفية قد تُلغى من المنصّة بلا أثر؛ نعتبر الحالة القديمة فاشلة
-            # حتى يقدر التطبيق يطلب الأرشفة من جديد بدل الانتظار بلا نهاية.
-            state = _clean(archive.get("state"))
-            updated = int(archive.get("updatedAt") or 0)
-            age = int(time.time() * 1000) - updated
-            if state in ("queued", "downloading", "storing") and age > STALE_JOB_MS:
-                return _json(
-                    {
-                        "ok": True,
-                        "id": reel_id,
-                        "archive": {
-                            "state": "failed",
-                            "progress": int(archive.get("progress") or 0),
-                            "error": "the server stopped before finishing, try again",
-                        },
-                    }
-                )
-            return _json({"ok": True, "id": reel_id, "archive": archive})
+def _archive_view(archive):
+    record = archive if isinstance(archive, dict) else {}
+    state = _clean(record.get("state"), "unknown") or "unknown"
+    return {
+        "state": state,
+        "progress": max(0, min(100, _int_of(record, "progress"))),
+        "bytes": _int_of(record, "bytes"),
+        "ready": state == "ready",
+        "error": _clean(record.get("error")) or None,
+    }
 
-        if await _object_exists(self.env, self._key(reel_id)) is True:
-            return _json(
-                {
-                    "ok": True,
-                    "id": reel_id,
-                    "archive": {"state": "ready", "progress": 100},
-                }
-            )
 
-        return _json(
-            {"ok": True, "id": reel_id, "archive": {"state": "unknown", "progress": 0}}
-        )
+def _actions_for(state, archive_state):
+    """الأوامر المسموحة الآن — يقررها الخادم من الحالة وحدها، لا التطبيق."""
+    if state in (STAGE_PUBLISHED, STAGE_PUBLISHING, STAGE_VERIFYING, STAGE_CLEANING):
+        return []
+    if state == STAGE_UNVERIFIED:
+        # نُشر؟ غير مؤكد: لا نشر ولا إعادة جدولة، فقط الحذف (بيد المالك).
+        return ["delete"]
+    actions = ["publish_now", "reschedule", "delete"]
+    if archive_state == "ready":
+        actions.insert(0, "download")
+    return actions
 
-    async def _download(self, reel_id):
-        reel_id = _safe_id(reel_id)
-        if not reel_id:
-            return _error("bad id", 404)
 
-        obj = await self.env.FILES.get(self._key(reel_id))
-        if obj is None:
-            return _error("not stored yet", 404)
+def _reel_view(record, archive, now, order=0):
+    at = _int_of(record, "at")
+    state = _stage_of(record)
+    archive_view = _archive_view(archive)
+    actions = _actions_for(state, archive_view["state"])
+    return {
+        "at": at,
+        "state": state,
+        "order": order,
+        "remainingMs": max(0, at - now) if at > 0 else 0,
+        "error": _clean(record.get("error")) or None,
+        "publishedAt": _int_of(record, "publishedAt"),
+        "mediaId": _clean(record.get("mediaId")) or None,
+        "archive": archive_view,
+        "allowedActions": actions,
+        "downloadable": "download" in actions,
+        "publishable": "publish_now" in actions,
+        "reschedulable": "reschedule" in actions,
+        "deletable": "delete" in actions,
+    }
 
-        return Response(
-            obj.body,
-            headers={
-                "content-type": "video/mp4",
-                "content-disposition": f'attachment; filename="pigeon-{reel_id}.mp4"',
-                "cache-control": "public, max-age=86400",
-                "access-control-allow-origin": "*",
-            },
-        )
 
-    async def _media(self, reel_id, method="GET"):
-        """نسخة عامة من الملف لـMeta: بلا Content-Disposition: attachment."""
-        reel_id = _safe_id(reel_id)
-        if not reel_id:
-            return _error("bad id", 404)
+# --------------------------------------------------------------------------
+# قفل تعاوني بين cron وترتيب الشبكة
+# --------------------------------------------------------------------------
 
-        headers = {
-            "content-type": "video/mp4",
-            "content-disposition": f'inline; filename="pigeon-{reel_id}.mp4"',
-            "cache-control": "public, max-age=86400",
-            "access-control-allow-origin": "*",
-        }
 
-        # HEAD لا يحتاج جسم الملف: نقرأ البيانات الوصفية فقط.
-        if method == "HEAD":
-            obj = await self.env.FILES.head(self._key(reel_id))
-            if obj is None:
-                return _error("not stored yet", 404)
-            size = getattr(obj, "size", None)
-            if size is not None:
-                headers["content-length"] = str(size)
-            return Response("", headers=headers)
+async def _acquire_mutex(store, owner, lease_ms=MUTEX_LEASE_MS):
+    try:
+        current = await store.get(MUTEX_PATH)
+    except ApiError:
+        current = None
+    now = _now()
+    if isinstance(current, dict):
+        held = _clean(current.get("id"))
+        held_at = _int_of(current, "at")
+        if held and held != owner and now - held_at < lease_ms:
+            return False
+    try:
+        await store.patch(MUTEX_PATH, {"id": owner, "at": now})
+    except ApiError:
+        return False
+    return True
 
-        obj = await self.env.FILES.get(self._key(reel_id))
-        if obj is None:
-            return _error("not stored yet", 404)
-        # Meta تحتاج content-length صريحاً لتقبل تنزيل الفيديو من هذا الرابط.
-        size = getattr(obj, "size", None)
-        if size is not None:
-            headers["content-length"] = str(size)
-        headers["accept-ranges"] = "bytes"
-        return Response(obj.body, headers=headers)
 
-    def _key(self, reel_id):
+async def _release_mutex(store, owner):
+    try:
+        current = await store.get(MUTEX_PATH)
+        if isinstance(current, dict) and _clean(current.get("id")) == owner:
+            await store.delete(MUTEX_PATH)
+    except Exception:  # noqa: BLE001 - القفل تحسين لا شرط
+        return
+# ==========================================================================
+# الطبقة 2 — محرّك النشر: سلسلة واحدة تُقرأ من السجل وتُحجز قبل كل نداء خارجي
+# ==========================================================================
+# المحرّك لا يعرف HTTP ولا التطبيق. مداخله: معرّف الريل وسجل Firebase، ومخرجاته:
+# (الحالة، رسالة الخطأ). كل كتابة حالة تمر بStore.transition، فتشغيلان في نفس
+# اللحظة لا ينشران الريل مرتين ولا يحذفان ملفاً تحت إنستغرام.
+
+
+class Engine:
+    def __init__(self, env, store):
+        self.env = env
+        self.store = store
+
+    def key(self, reel_id):
         return f"reels/{reel_id}.mp4"
 
-    # ----------------------------------------------------------------------
-    # cron: نشر الريلز التي حان موعدها من Cloudflare إلى إنستغرام
-    # ----------------------------------------------------------------------
+    async def exists(self, reel_id):
+        return await _object_exists(self.env, self.key(reel_id))
 
-    async def scheduled(self, controller, env, ctx):
-        """يُستدعى من cron في wrangler.jsonc كل 5 دقائق."""
-        try:
-            summary = await self._publish_due()
-        except Exception as exc:  # noqa: BLE001 - لا نُفشل الـcron كله
-            summary = {"ok": False, "error": str(exc)[:300]}
-            print(f"pigeon schedule run failed: {exc}")
-        await self._record_run(summary)
+    # ------------------------------------------------------------------
+    # الأرشفة: تنزيل الفيديو إلى R2 مع تقدّم، ثم حالة ready نهائية
+    # ------------------------------------------------------------------
 
-    async def _record_run(self, summary):
-        """يحفظ نتيجة آخر تشغيل تحت `/worker/status` لتظهر من أي متصفح."""
-        try:
-            # PUT على العقدة الفرعية حتى لا تبقى حقول من تشغيل سابق.
-            await _firebase_put(self._db(), "worker/status/lastRun.json", summary)
-            await _firebase_patch(
-                self._db(),
-                "worker/status.json",
-                {"updatedAt": int(time.time() * 1000)},
-            )
-        except Exception:  # noqa: BLE001 - تشخيص فقط، لا نُفشل التشغيل
-            pass
-
-    async def _archive_missing(self, db):
-        """يؤرشف ريلاً مجدولاً ما زال ملفه غائباً عن R2.
-
-        الأرشفة وقت المشاركة قد لا تكتمل (الهاتف أغلق التطبيق أو المهمة أُلغيت)،
-        فيصل الموعد بلا فيديو في التخزين ولا ينشر شيء. نعيد المحاولة من cron
-        قبل الموعد بوقت كافٍ.
-        """
-        schedules = await _firebase_get(db, "schedules.json") or {}
-        if not isinstance(schedules, dict):
-            return 0
-
-        candidates = []
-        for schedule_id, schedule in schedules.items():
-            if not isinstance(schedule, dict):
-                continue
-            try:
-                at = int(schedule.get("at") or 0)
-            except (TypeError, ValueError):
-                continue
-            if at <= 0:
-                continue
-            if _stage_of(schedule) not in (
-                STAGE_SCHEDULED,
-                STAGE_PREPARING,
-                STAGE_PREPARED,
-            ):
-                continue
-            if _clean(schedule.get("containerId")):
-                continue  # الحاوية موجودة: الملف سبق أن وصل R2
-            candidates.append((at, schedule_id))
-
-        candidates.sort()
-        started = 0
-        for _at, schedule_id in candidates[:1]:
-            clean_id = _safe_id(schedule_id)
-            if not clean_id:
-                continue
-            if await _object_exists(self.env, self._key(clean_id)) is True:
-                continue
-            reel = await _firebase_get(db, f"reels/{clean_id}.json") or {}
-            if not isinstance(reel, dict):
-                continue
-            link = _clean(reel.get("url"))
-            if not link:
-                continue
-            code = _instagram_code(link)
-            tiktok = None if code else _tiktok_link(link)
-            if not code and not tiktok:
-                continue
-            await self._archive(
-                reel_id=clean_id,
-                code=code,
-                tiktok=tiktok,
-                source="instagram" if code else "tiktok",
-                origin=_ig_public_base(self.env),
-                thumbnail=_clean(reel.get("thumbnail")) or None,
-                app_media=_safe_media_url(reel.get("media")),
-            )
-            started += 1
-        return started
-
-    async def _publish_due(self):
-        """يمرّ على المواعيد وينفّذ لكل موعد خطوة واحدة من سلسلته.
-
-        لا يوجد "نشر مباشر" هنا: الموعد يتحرك في حالاته بالترتيب، وكل تشغيل
-        يبدأ من الحالة التي انتهت عندها الخطوة السابقة (نجاحاً أو فشلاً).
-        """
-        db = self._db()
-        now = int(time.time() * 1000)
-        report = {
-            "ok": True,
-            "checkedAt": now,
-            "tokenPresent": bool(_ig_token(self.env)),
-            "total": 0,
-            "due": 0,
-            "results": [],
-            "archived": 0,
-        }
-
-        schedules = await _firebase_get(db, "schedules.json") or {}
-        if not isinstance(schedules, dict):
-            report["ok"] = False
-            report["error"] = "the /schedules node is not an object"
-            return report
-
-        report["total"] = len(schedules)
-        work = []
-        for schedule_id, schedule in schedules.items():
-            if not isinstance(schedule, dict):
-                continue
-            state = _stage_of(schedule)
-            # الحالات النهائية لا تُعاد تلقائياً أبداً.
-            if state in (STAGE_PUBLISHED, STAGE_FAILED, STAGE_UNVERIFIED):
-                continue
-            at = _int_of(schedule, "at")
-            if at <= 0:
-                continue
-            work.append((at, _safe_id(schedule_id), schedule))
-
-        work.sort(key=lambda entry: entry[0])
-        report["due"] = len(work)
-
-        for at, clean_id, schedule in work[:MAX_PUBLISH_PER_RUN]:
-            if not clean_id:
-                continue
-            entry = {"id": clean_id, "at": at, "state": _stage_of(schedule)}
-            try:
-                state, error = await self._advance(db, clean_id, schedule, now)
-                entry["state"] = state
-                if error:
-                    entry["error"] = error
-            except Exception as exc:  # noqa: BLE001 - لا نُسقط بقية المواعيد
-                print(f"pigeon schedule {clean_id} failed: {exc}")
-                entry["error"] = str(exc)[:300]
-            report["results"].append(entry)
-
-        # تشغيل واحد لأرشفة ريل ناقص: إما لأن لا موعد مستحقاً، أو لأن موعداً
-        # وصل إلى خطوة التجهيز وملفه ما زال غائباً عن R2.
-        waiting_archive = any(
-            entry.get("error") == ARCHIVE_WAIT for entry in report["results"]
-        )
-        if not work or waiting_archive:
-            try:
-                report["archived"] = await self._archive_missing(db)
-            except Exception as exc:  # noqa: BLE001 - ليس حرجاً
-                print(f"pigeon archive retry failed: {exc}")
-
-        return report
-
-    # ----------------------------------------------------------------------
-    # العدّ التنازلي: يبدأ وينتهي على الخادم، والتطبيق يعرضه فقط
-    # ----------------------------------------------------------------------
-
-    async def _schedule_snapshot(self):
-        """لقطة واحدة يقرؤها التطبيق: وقت الخادم والوقت المتبقي لكل ريل.
-
-        كل الأعداد تُحسب بساعة الخادم هنا، فلا يهم أن ساعة الهاتف مضبوطة أو
-        لا: العدّاد الذي يراه المالك هو عدّاد الخادم نفسه، و"publishing" حالة
-        حقيقية من السجل لا تقدير من التطبيق.
-        """
-        db = self._db()
-        now = int(time.time() * 1000)
-        snapshot = {
-            "ok": True,
-            "serverTime": now,
-            "timezone": SCHEDULE_TIMEZONE,
-            "reels": {},
-            "publishing": None,
-        }
-
-        schedules = await _firebase_get(db, "schedules.json") or {}
-        if not isinstance(schedules, dict):
-            snapshot["ok"] = False
-            snapshot["error"] = "the /schedules node is not an object"
-            return snapshot
-
-        pending = []
-        for schedule_id, schedule in schedules.items():
-            if not isinstance(schedule, dict):
-                continue
-            clean_id = _safe_id(schedule_id)
-            if not clean_id:
-                continue
-
-            at = _int_of(schedule, "at")
-            state = _stage_of(schedule)
-            snapshot["reels"][clean_id] = {
-                "at": at,
-                "state": state,
-                "serverTime": now,
-                "remainingMs": max(0, at - now) if at > 0 else 0,
-                "error": _clean(schedule.get("error")) or None,
-                "publishedAt": _int_of(schedule, "publishedAt"),
-                "mediaId": _clean(schedule.get("mediaId")) or None,
-            }
-
-            if state in (STAGE_PUBLISHING, STAGE_VERIFYING, STAGE_CLEANING):
-                snapshot["publishing"] = {
-                    "id": clean_id,
-                    "state": state,
-                    "since": _int_of(schedule, "stageAt"),
-                }
-            if at > 0 and state not in (
-                STAGE_PUBLISHED,
-                STAGE_FAILED,
-                STAGE_UNVERIFIED,
-            ):
-                pending.append((at, clean_id))
-
-        # ترتيب النشر: 1 = الريل القادم، ثم الذي بعده، بلا تكرار درجات.
-        pending.sort()
-        for index, (_, clean_id) in enumerate(pending):
-            snapshot["reels"][clean_id]["order"] = index + 1
-
-        return snapshot
-
-    async def _set_schedule(self, request):
-        """يكتب الموعد من الخادم: الوقت والتوقيت وبداية الحالة scheduled.
-
-        الموعد المتداخل مع موعد ريل آخر يُزح لخانة حرة بعده، فيبقى لكل ريل
-        وقت نشر خاص به مهما جدول المالك عدة ريلز.
-        """
-        try:
-            body = await request.json()
-            schedule_id = _safe_id(_field(body, "id"))
-            at = int(_field(body, "at") or 0)
-            timezone = _clean(_field(body, "timezone"), SCHEDULE_TIMEZONE)
-        except Exception:
-            return _error("invalid json body")
-
-        if not schedule_id:
-            return _error("missing id")
-
-        db = self._db()
-        now = int(time.time() * 1000)
-        if at <= now + 30_000:
-            return _error("pick a time in the future", 400)
-
-        # الموعد على بداية دقيقة كاملة: دورة النشر تعمل في الثانية صفر من كل
-        # دقيقة، فيبدأ النشر عند صفر العدّاد نفسه لا في الدورة التي بعدها.
-        settled = at - (at % 60_000)
-        if settled <= now + 30_000:
-            settled += 60_000
-
-        reel = await _firebase_get(db, f"reels/{schedule_id}.json")
-        if not isinstance(reel, dict):
-            return _error("this reel is not registered on the server", 404)
-
-        schedules = await _firebase_get(db, "schedules.json") or {}
-        if not isinstance(schedules, dict):
-            schedules = {}
-
-        current = schedules.get(schedule_id)
-        if isinstance(current, dict):
-            state = _stage_of(current)
-            if state in (
-                STAGE_PUBLISHING,
-                STAGE_VERIFYING,
-                STAGE_CLEANING,
-                STAGE_UNVERIFIED,
-            ):
-                return _error("this reel is being published right now", 409)
-            if state == STAGE_PUBLISHED or _int_of(current, "publishedAt") > 0:
-                return _error("this reel was already published", 409)
-
-        # المواعيد المشغولة: كل ريل آخر ما زال في الطريق إلى النشر.
-        taken = []
-        for other_id, other in schedules.items():
-            if _safe_id(other_id) == schedule_id or not isinstance(other, dict):
-                continue
-            if _stage_of(other) in (STAGE_PUBLISHED, STAGE_FAILED, STAGE_UNVERIFIED):
-                continue
-            other_at = _int_of(other, "at")
-            if other_at > 0:
-                taken.append(other_at)
-        taken.sort()
-
-        for _ in range(len(taken) + 1):
-            moved = False
-            for other_at in taken:
-                if abs(settled - other_at) < MIN_SLOT_GAP_MS:
-                    settled = other_at + MIN_SLOT_GAP_MS
-                    moved = True
-            if not moved:
-                break
-
-        payload = {
-            "at": settled,
-            "timezone": timezone or SCHEDULE_TIMEZONE,
-            "state": STAGE_SCHEDULED,
-            "attempts": 0,
-            "error": None,
-            "containerId": None,
-            "stageAt": 0,
-            "scheduledAt": now,
-            "updatedAt": now,
-        }
-        status = await _firebase_patch(
-            db, f"schedules/{schedule_id}.json", payload
-        )
-        if status != 200:
-            return _error("could not save the schedule (firebase %d)" % status, 502)
-
-        return _json(
-            {
-                "ok": True,
-                "id": schedule_id,
-                "at": settled,
-                "state": STAGE_SCHEDULED,
-                "timezone": payload["timezone"],
-                "serverTime": now,
-                "remainingMs": max(0, settled - now),
-                "shifted": settled != at,
-            }
-        )
-
-    async def _reorder_schedules(self, request):
-        """يعيد توزيع المواعيد على الريلز حسب ترتيب الشبكة الجديد.
-
-        الجسم: `{"ids": [id1, id2, ...]}` بترتيب الشبكة من الأعلى إلى الأسفل.
-        قيم المواعيد لا تتغيّر: أصغر موعد يذهب لأول ريل في الترتيب، والذي بعده
-        للثاني، وهكذا. فسحب ريل 26 نوفمبر فوق ريل 29 نوفمبر يعطي الأول 26
-        والثاني 29، ويصير ترتيب النشر على إنستغرام مطابقاً لترتيب الشبكة.
-
-        الموعد يُعاد إلى `scheduled` وتُلغى حاوية Meta المحضّرة، لأن أوان نشرها
-        تغيّر: تُحضّر حاوية جديدة عند الموعد الجديد بدل حاوية قديمة تنتهي صلاحيتها.
-        """
-        try:
-            body = await request.json()
-            raw_ids = _field(body, "ids")
-        except Exception:
-            return _error("invalid json body")
-
-        if not isinstance(raw_ids, list):
-            return _error("missing ids")
-
-        ids = []
-        for raw in raw_ids:
-            clean_id = _safe_id(raw)
-            if not clean_id:
-                return _error("invalid id in ids")
-            if clean_id in ids:
-                return _error("duplicate id in ids")
-            ids.append(clean_id)
-
-        if len(ids) < 2:
-            return _error("at least two reels are needed to reorder", 400)
-
-        db = self._db()
-        now = int(time.time() * 1000)
-        schedules = await _firebase_get(db, "schedules.json") or {}
-        if not isinstance(schedules, dict):
-            return _error("the /schedules node is not an object", 502)
-
-        # كل ريل مشمول بالسحب: يجب أن يكون مجدولاً وليس في طريقه إلى النشر.
-        entries = {}
-        times = []
-        for clean_id in ids:
-            entry = schedules.get(clean_id)
-            if not isinstance(entry, dict):
-                return _error("this reel is not scheduled on the server", 404)
-            state = _stage_of(entry)
-            if state in (
-                STAGE_PUBLISHING,
-                STAGE_VERIFYING,
-                STAGE_CLEANING,
-                STAGE_UNVERIFIED,
-            ):
-                return _error("a reel is being published right now", 409)
-            if state == STAGE_PUBLISHED or _int_of(entry, "publishedAt") > 0:
-                return _error("a reel was already published", 409)
-            at = _int_of(entry, "at")
-            if at <= 0:
-                return _error("a reel has no schedule time", 409)
-            if at <= now + 30_000:
-                return _error("a reel is about to publish: reorder it after", 409)
-            entries[clean_id] = entry
-            times.append(at)
-
-        times.sort()
-
-        # مواعيد الريلز غير المشمولة بالسحب ما زالت محجوزة: نقل موعد فوق موعد
-        # ريل آخر ينشر الريلين في نفس اللحظة، فنرفض الطلب بدل إزاحة صامتة.
-        for other_id, other in schedules.items():
-            other_clean = _safe_id(other_id)
-            if not other_clean or other_clean in entries:
-                continue
-            if not isinstance(other, dict):
-                continue
-            if _stage_of(other) in (STAGE_PUBLISHED, STAGE_FAILED, STAGE_UNVERIFIED):
-                continue
-            other_at = _int_of(other, "at")
-            if other_at <= 0:
-                continue
-            for at in times:
-                if abs(at - other_at) < MIN_SLOT_GAP_MS:
-                    return _error(
-                        "the new order collides with another scheduled reel",
-                        409,
-                    )
-
-        payload = {}
-        result = {}
-        for index, clean_id in enumerate(ids):
-            entry = entries[clean_id]
-            payload[clean_id] = {
-                "at": times[index],
-                "timezone": _clean(entry.get("timezone"), SCHEDULE_TIMEZONE),
-                "state": STAGE_SCHEDULED,
-                "attempts": 0,
-                "error": None,
-                "containerId": None,
-                "stageAt": 0,
-                "scheduledAt": _int_of(entry, "scheduledAt") or now,
-                "updatedAt": now,
-            }
-            result[clean_id] = times[index]
-
-        status = await _firebase_patch(db, "schedules.json", payload)
-        if status != 200:
-            return _error("could not save the new order (firebase %d)" % status, 502)
-
-        moved = sum(
-            1
-            for index, clean_id in enumerate(ids)
-            if times[index] != _int_of(entries[clean_id], "at")
-        )
-        return _json(
-            {
-                "ok": True,
-                "serverTime": now,
-                "moved": moved,
-                "times": result,
-            }
-        )
-
-    async def _publish_now(self, request):
-        """ينشر الريل الآن ويتجاهل الموعد: سلسلة كاملة داخل هذا الطلب.
-
-        الخطوات بالترتيب: تأكيد أن الفيديو في R2 (وأرشفته فوراً لو ما وصل)،
-        إنشاء حاوية إنستغرام الآن بلا انتظار مهلة التجهيز المسبق، إلغاء العدّاد
-        (at = الآن)، ثم الانتظار حتى تصير الحاوية FINISHED عند Meta والنشر
-        والتأكيد وحذف الملف من R2 وسجلات Firebase.
-
-        السبب: الضغطة الأولى كانت تنتهي بعد ~16 ثانية والحاوية ما زالت تُعالج،
-        فترجع الحالة prepared بلا نشر، ولا ينشر إلا بعد ضغطة ثانية بعد دقائق.
-        """
-        try:
-            body = await request.json()
-            schedule_id = _safe_id(_field(body, "id"))
-        except Exception:
-            return _error("invalid json body")
-
-        if not schedule_id:
-            return _error("missing id")
-
-        db = self._db()
-        now = int(time.time() * 1000)
-        path = f"schedules/{schedule_id}.json"
-        current, _etag = await _firebase_read(db, path)
-        if not isinstance(current, dict):
-            return _error("this reel has no schedule on the server", 404)
-
-        state = _stage_of(current)
-        if state in (STAGE_PUBLISHING, STAGE_VERIFYING, STAGE_CLEANING):
-            return _error("this reel is being published right now", 409)
-        if state == STAGE_PUBLISHED or _int_of(current, "publishedAt") > 0:
-            return _error("this reel was already published", 409)
-        if state == STAGE_UNVERIFIED:
-            return _error("the last publish is unconfirmed; check Instagram first", 409)
-
-        # ريل واحد ينشر في المرة، لكن الضغط اليدوي لا ينتظر فاصل الدقيقتين.
-        if not await self._publish_slot_free(db, schedule_id, now, ignore_gap=True):
-            return _error(PUBLISH_BUSY, 409)
-
-        # 1) الفيديو في التخزين: لو الأرشفة وقت المشاركة ما كملت، تؤرشف الآن.
-        if await _object_exists(self.env, self._key(schedule_id)) is not True:
-            if not await self._archive_now(db, schedule_id):
-                return _error(
-                    "the reel could not be archived yet, try again", 503
-                )
-
-        # 2) حاوية إنستغرام: تُنشأ الآن، لا تُترك لخطوة التجهيز المجدولة.
-        container_id = _clean(current.get("containerId"))
-        if not container_id:
-            container_id, error = await self._prepare_container(schedule_id)
-            if not container_id:
-                await _firebase_patch(
-                    db,
-                    path,
-                    {"error": error, "updatedAt": int(time.time() * 1000)},
-                )
-                return _json(
-                    {
-                        "ok": False,
-                        "id": schedule_id,
-                        "state": state,
-                        "error": error or "instagram did not return a container id",
-                        "serverTime": int(time.time() * 1000),
-                        "remainingMs": 0,
-                    },
-                    status=503,
-                )
-
-        # 3) العدّاد يُلغى: الموعد صار الآن، و"انشر الآن" يعلَّم على السجل.
-        moment = int(time.time() * 1000)
-        status = await _firebase_patch(
-            db,
-            path,
-            {
-                "at": moment,
-                "state": STAGE_PREPARED,
-                "containerId": container_id,
-                "attempts": 0,
-                "error": None,
-                "stageAt": 0,
-                "manualPublish": True,
-                "manualAt": moment,
-                "updatedAt": moment,
-            },
-        )
-        if status != 200:
-            return _error("could not start the publish (firebase %d)" % status, 502)
-
-        # 4) النشر ثم التأكيد ثم الحذف والتنظيف، كلها قبل الردّ.
-        state, error = await self._advance_now(db, schedule_id)
-        if error == ARCHIVE_WAIT:
-            error = "the reel archive is not ready on the server"
-
-        published = state in (STAGE_PUBLISHED, STAGE_CLEANING)
-        if not published and error is None:
-            error = "instagram is still processing the video; press again in a minute"
-
-        return _json(
-            {
-                "ok": published,
-                "id": schedule_id,
-                "state": state,
-                "error": None if published else error,
-                "serverTime": int(time.time() * 1000),
-                "remainingMs": 0,
-            },
-            status=200 if published else 202,
-        )
-
-    async def _archive_now(self, db, schedule_id):
-        """يؤرشف ريلاً فوراً لو ملفه مو في R2 بعد (نفس منطق `_archive_missing`).
-
-        يرجّع True فقط إذا صار الملف موجوداً فعلاً في R2 بعد المحاولة.
-        """
-        reel = await _firebase_get(db, f"reels/{schedule_id}.json") or {}
-        if not isinstance(reel, dict):
-            return False
-
-        link = _clean(reel.get("url"))
-        code = _instagram_code(link)
-        tiktok = None if code else _tiktok_link(link)
-        if not code and not tiktok:
-            return False
-
-        await self._archive(
-            reel_id=schedule_id,
-            code=code,
-            tiktok=tiktok,
-            source="instagram" if code else "tiktok",
-            origin=_ig_public_base(self.env),
-            thumbnail=_clean(reel.get("thumbnail")) or None,
-            app_media=_safe_media_url(reel.get("media")),
-        )
-        return await _object_exists(self.env, self._key(schedule_id)) is True
-
-    async def _advance_now(self, db, schedule_id, budget_s=PUBLISH_NOW_BUDGET_S):
-        """يمشي بالسلسلة فوراً بعد إلغاء العدّاد، حتى النشر والتنظيف.
-
-        معالجة الفيديو عند Meta تحتاج ثواني إلى دقائق قبل أن تصير الحاوية
-        `FINISHED`، فالمتابعة هنا زمنية (نوم بين المحاولات) لا بعدد دورات: المهلة
-        القديمة (ثماني دورات ≈ 16 ثانية) كانت ترجع وفيها الحاوية ما زالت تُعالج،
-        فيظهر للمالك أن "انشر الآن" ما عمل شي حتى يضغط مرة ثانية بعد دقائق.
-        """
-        deadline = time.monotonic() + budget_s
-        state = STAGE_SCHEDULED
-        error = None
-        final = (STAGE_PUBLISHED, STAGE_FAILED, STAGE_UNVERIFIED)
-
-        while time.monotonic() < deadline:
-            current, _etag = await _firebase_read(db, f"schedules/{schedule_id}.json")
-            if not isinstance(current, dict):
-                # خطوة التنظيف مسحت السجل: النشر تمّ فعلاً وانتهى.
-                if state in (STAGE_VERIFYING, STAGE_CLEANING, STAGE_PUBLISHED):
-                    return STAGE_PUBLISHED, None
-                return state, "the schedule record disappeared"
-
-            state = _stage_of(current)
-            if state in final:
-                break
-
-            state, error = await self._advance(
-                db, schedule_id, current, int(time.time() * 1000)
-            )
-            if state in final:
-                break
-            if error in (ARCHIVE_WAIT, PUBLISH_BUSY):
-                break  # لا فائدة من الانتظار: يحتاج الملف أو خانة نشر حرّة
-            await asyncio.sleep(PUBLISH_NOW_POLL_S)
-
-        return state, error
-
-    async def _publish_slot_free(self, db, schedule_id, now, ignore_gap=False):
-        """هل يحق لهذا الريل أن يبدأ النشر الآن دون أن يتداخل مع ريل آخر؟
-
-        [ignore_gap] لنشر يدوي من المالك: يتجاهل فاصل الدقيقتين بعد نشر الريل
-        السابق، لكنه لا يسمح أبداً بالتداخل مع ريل ما زال ينشر الآن.
-        """
-        lock = await _firebase_get(db, PUBLISH_LOCK_PATH) or {}
-        if isinstance(lock, dict) and not ignore_gap:
-            busy_id = _safe_id(lock.get("id"))
-            started = _int_of(lock, "at")
-            if (
-                busy_id
-                and busy_id != schedule_id
-                and started > 0
-                and now - started < PUBLISH_GAP_MS
-            ):
-                return False
-
-        schedules = await _firebase_get(db, "schedules.json") or {}
-        if not isinstance(schedules, dict):
-            return True
-        for other_id, other in schedules.items():
-            if _safe_id(other_id) == schedule_id or not isinstance(other, dict):
-                continue
-            if _stage_of(other) in (STAGE_PUBLISHING, STAGE_VERIFYING, STAGE_CLEANING):
-                return False
-        return True
-
-    async def _lock_publish(self, db, schedule_id, started):
-        """يحجز خانة النشر لهذا الريل، فيمنع بدء نشر ريل آخر قبله مباشرة."""
-        try:
-            await _firebase_put(
-                db, PUBLISH_LOCK_PATH, {"id": schedule_id, "at": started}
-            )
-        except Exception as exc:  # noqa: BLE001 - القفل تحسين، وليس شرطاً للنشر
-            print(f"pigeon publish lock failed: {exc}")
-
-    async def _advance(self, db, schedule_id, schedule, now):
-        """خطوة واحدة لهذا الموعد، حسب حالته وحدها.
-
-        كل خطوة تقرأ السجل مع بصمته (ETag) ثم تحجز نفسها بكتابة مشروطة قبل أن
-        تلمس إنستغرام أو R2: لو كان تشغيل آخر يعمل على نفس الخطوة تفشل
-        المطالبة (412) فلا يتداخل تشغيلان ولا يتكرر النشر.
-        """
-        state = _stage_of(schedule)
-        # الحجز يُقرأ من stageAt وحده: updatedAt يتغيّر مع كل تحديث حالة، فلو
-        # اعتمدناه لتوقف التأكيد والتنظيف دقيقتين بعد كل كتابة.
-        stage_at = _int_of(schedule, "stageAt")
-        busy = stage_at > 0 and now - stage_at < STAGE_LEASE_MS
-
-        if busy and state in (
-            STAGE_PREPARING,
-            STAGE_PUBLISHING,
-            STAGE_VERIFYING,
-            STAGE_CLEANING,
-        ):
-            # الخطوة محجوزة لتشغيل آخر لم ينته بعد: لا نلمس شيئاً.
-            return state, None
-
-        if state == STAGE_SCHEDULED:
-            at = _int_of(schedule, "at")
-            if at > now and at - now > PREPARE_LEAD_MS:
-                return state, None  # موعد بعيد: لا خطوة بعد
-            return await self._stage_prepare(db, schedule_id)
-
-        if state == STAGE_PREPARING:
-            return await self._stage_prepare(db, schedule_id)
-
-        if state == STAGE_PREPARED:
-            if _int_of(schedule, "at") > now:
-                return state, None  # الحاوية جاهزة، ننتظر الموعد
-            return await self._stage_publish(db, schedule_id)
-
-        if state == STAGE_PUBLISHING:
-            return await self._stage_publish(db, schedule_id)
-
-        if state == STAGE_VERIFYING:
-            return await self._stage_verify(db, schedule_id)
-
-        if state == STAGE_CLEANING:
-            return await self._stage_clean(db, schedule_id)
-
-        return state, None
-
-    async def _claim(self, db, path, etag, current, to_state, extra=None):
-        """يحجز خطوة: لا تنجح إلا إن كان السجل ما زال كما قرأناه (if-match)."""
-        moment = int(time.time() * 1000)
-        payload = {
-            "state": to_state,
-            "stageAt": moment,
-            "updatedAt": moment,
-        }
-        if extra:
-            payload.update(extra)
-        status = await _firebase_compare_write(db, path, etag, current, payload)
-        return status == 200
-
-    async def _stage_prepare(self, db, schedule_id):
-        """الخطوة 1: إنشاء حاوية إنستغرام قبل الموعد.
-
-        نتيجتها واحدة من: prepared (نجاح) / scheduled (إعادة لاحقة) / failed.
-        """
-        path = f"schedules/{schedule_id}.json"
-        current, etag = await _firebase_read(db, path)
-        if not isinstance(current, dict):
-            return STAGE_SCHEDULED, "the schedule record disappeared"
-
-        state = _stage_of(current)
-        if state not in (STAGE_SCHEDULED, STAGE_PREPARING):
-            return state, None
-
-        if _clean(current.get("containerId")):
-            moment = int(time.time() * 1000)
-            await _firebase_patch(
-                db, path, {"state": STAGE_PREPARED, "error": None, "updatedAt": moment}
-            )
-            return STAGE_PREPARED, None
-
-        # الملف ليس في R2 بعد: ننتظر الأرشفة، وهذه ليست محاولة فاشلة.
-        if await _object_exists(self.env, self._key(schedule_id)) is not True:
-            return STAGE_SCHEDULED, ARCHIVE_WAIT
-
-        if not await self._claim(
-            db, path, etag, current, STAGE_PREPARING, {"error": None}
-        ):
-            return state, None  # تشغيل آخر حجز خطوة التجهيز
-
-        container_id, error = await self._prepare_container(schedule_id)
-        moment = int(time.time() * 1000)
-
-        if error is None and container_id:
-            await _firebase_patch(
-                db,
-                path,
-                {
-                    "state": STAGE_PREPARED,
-                    "containerId": container_id,
-                    "preparedAt": moment,
-                    "attempts": 0,
-                    "error": None,
-                    "stageAt": moment,
-                    "updatedAt": moment,
-                },
-            )
-            return STAGE_PREPARED, None
-
-        attempts = _int_of(current, "attempts") + 1
-        error = error or "instagram did not return a container id"
-        if attempts >= PREPARE_RETRY_LIMIT:
-            await _firebase_patch(
-                db,
-                path,
-                {
-                    "state": STAGE_FAILED,
-                    "attempts": attempts,
-                    "error": error,
-                    "stageAt": moment,
-                    "updatedAt": moment,
-                },
-            )
-            return STAGE_FAILED, error
-
-        await _firebase_patch(
-            db,
-            path,
-            {
-                "state": STAGE_SCHEDULED,
-                "attempts": attempts,
-                "error": error,
-                "stageAt": moment,
-                "updatedAt": moment,
-            },
-        )
-        return STAGE_SCHEDULED, error
-
-    async def _prepare_container(self, schedule_id):
-        """ينشئ الحاوية فقط. يرجّع (container_id, error) ولا يكتب في Firebase."""
-        token = _ig_token(self.env)
-        if not token:
-            return None, "IG_ACCESS_TOKEN is not configured"
-
-        media_url = f"{_ig_public_base(self.env)}/media/{schedule_id}"
-        try:
-            container_id = await _ig_create_container(
-                _ig_user(self.env), token, media_url, ""
-            )
-        except Exception as exc:  # noqa: BLE001 - يعيد المتصل المحاولة
-            return None, _describe(exc)[:300]
-        return container_id, None
-
-    async def _stage_publish(self, db, schedule_id):
-        """الخطوة 2: media_publish. نتيجتها: verifying / prepared / failed."""
-        path = f"schedules/{schedule_id}.json"
-        current, etag = await _firebase_read(db, path)
-        if not isinstance(current, dict):
-            return STAGE_SCHEDULED, "the schedule record disappeared"
-
-        state = _stage_of(current)
-        if state not in (STAGE_PREPARED, STAGE_PUBLISHING):
-            return state, None
-
-        token = _ig_token(self.env)
-        if not token:
-            moment = int(time.time() * 1000)
-            await _firebase_patch(
-                db,
-                path,
-                {
-                    "state": STAGE_FAILED,
-                    "error": "IG_ACCESS_TOKEN is not configured",
-                    "updatedAt": moment,
-                },
-            )
-            return STAGE_FAILED, "IG_ACCESS_TOKEN is not configured"
-
-        user_id = _ig_user(self.env)
-        moment = int(time.time() * 1000)
-
-        # تشغيل سابق بدأ media_publish ثم انقطع: لا نعيد النشر أبداً، بل
-        # نسأل الحساب أولاً إن كان الريل ظهر فعلاً.
-        if state == STAGE_PUBLISHING:
-            stage_at = _int_of(current, "stageAt") or moment
-            published_id = await _ig_published_media(
-                user_id, token, stage_at - 180_000
-            )
-            if published_id:
-                await self._enter_verifying(
-                    db, path, published_id, moment, stage_at, "scan"
-                )
-                # نُكمل السلسلة في نفس التشغيل: تأكيد ثم تنظيف بعد 5 ثوانٍ.
-                return await self._stage_verify(db, schedule_id)
-            if moment - stage_at < PUBLISH_STUCK_MS:
-                return state, None
-            error = "publishing was interrupted; check Instagram before retrying"
-            await _firebase_patch(
-                db,
-                path,
-                {"state": STAGE_FAILED, "error": error, "updatedAt": moment},
-            )
-            return STAGE_FAILED, error
-
-        container_id = _clean(current.get("containerId"))
-        if not container_id:
-            await _firebase_patch(
-                db,
-                path,
-                {
-                    "state": STAGE_SCHEDULED,
-                    "error": "the Instagram container id is missing",
-                    "updatedAt": moment,
-                },
-            )
-            return STAGE_SCHEDULED, "the Instagram container id is missing"
-
-        # 2أ) لا ننشر إلا حاوية FINISHED: الحاوية ما زالت تنزّل الفيديو.
-        try:
-            status_code, status_text = await _ig_container_status(
-                container_id, token
-            )
-        except Exception as exc:  # noqa: BLE001 - نعيد المحاولة في التشغيل القادم
-            error = _describe(exc)[:300]
-            attempts = _int_of(current, "attempts") + 1
-            payload = {"attempts": attempts, "error": error, "updatedAt": moment}
-            if attempts >= SCHEDULE_RETRY_LIMIT:
-                payload["state"] = STAGE_FAILED
-            await _firebase_patch(db, path, payload)
-            return _clean(payload.get("state"), state), error
-
-        if status_code in ("ERROR", "EXPIRED"):
-            error = f"instagram container {status_code.lower()}: {status_text}"[:300]
-            await _firebase_patch(
-                db,
-                path,
-                {"state": STAGE_FAILED, "error": error, "updatedAt": moment},
-            )
-            return STAGE_FAILED, error
-
-        if status_code != "FINISHED":
-            attempts = _int_of(current, "attempts") + 1
-            payload = {"attempts": attempts, "error": None, "updatedAt": moment}
-            if attempts >= SCHEDULE_RETRY_LIMIT:
-                payload["state"] = STAGE_FAILED
-                payload["error"] = "instagram did not finish processing the video"
-            await _firebase_patch(db, path, payload)
-            return _clean(payload.get("state"), state), payload.get("error")
-
-        # 2ب) ريل واحد ينشر في المرة: لا نبدأ media_publish وريل آخر ينشر أو
-        # يتحقق أو ينظف، ولا قبل مدة كافية من بدء نشر الريل السابق. النشر اليدوي
-        # (manualPublish) يتجاوز الفاصل الزمني فقط، لا التداخل مع نشر جارٍ.
-        manual = _truthy(current.get("manualPublish"))
-        if not await self._publish_slot_free(
-            db, schedule_id, moment, ignore_gap=manual
-        ):
-            return state, PUBLISH_BUSY
-
-        # 2ج) نحجز خطوة النشر قبل النداء الخارجي نفسه.
-        if not await self._claim(
-            db, path, etag, current, STAGE_PUBLISHING, {"error": None, "attempts": 0}
-        ):
-            return state, None
-
-        started = int(time.time() * 1000)
-        await self._lock_publish(db, schedule_id, started)
-        media_id = None
-        error = None
-        try:
-            media_id = await _ig_publish(user_id, token, container_id)
-        except Exception as exc:  # noqa: BLE001 - قد يكون النشر نجح والرد ضاع
-            error = _describe(exc)[:300]
-
-        # رد media_publish الناجح نفسه دليل النشر؛ البحث في الحساب احتياط فقط.
-        source = "api"
-        if not media_id:
-            source = "scan"
-            media_id = await _ig_published_media(
-                user_id, token, started - 180_000
-            )
-
-        moment = int(time.time() * 1000)
-        if media_id:
-            await self._enter_verifying(
-                db, path, media_id, moment, started, source
-            )
-            # التأكيد والتنظيف في نفس التشغيل حتى تُحذف المخلفات بعد 5 ثوانٍ
-            # من نجاح النشر، لا مع cron لاحق.
-            return await self._stage_verify(db, schedule_id)
-
-        attempts = _int_of(current, "attempts") + 1
-        error = error or "media_publish returned no id"
-        payload = {"attempts": attempts, "error": error, "updatedAt": moment}
-        if attempts >= PUBLISH_RETRY_LIMIT:
-            payload["state"] = STAGE_FAILED
-        else:
-            payload["state"] = STAGE_PREPARED
-        await _firebase_patch(db, path, payload)
-        return _clean(payload.get("state"), state), error
-
-    async def _enter_verifying(
-        self, db, path, media_id, moment, published_at, source="api"
-    ):
-        """ينقل السجل من publishing إلى verifying مع موعد التنظيف (بعد 5 ثوانٍ).
-
-        [source] مصدر معرّف المنشور: `api` من رد media_publish نفسه، أو `scan`
-        من البحث في منشورات الحساب. الأول دليل نشر قاطع، فلا يتوقف التنظيف لو
-        تعذّرت قراءة المنشور بعد ذلك.
-        """
-        if published_at <= 0 or published_at > moment:
-            published_at = moment
-        await _firebase_patch(
-            db,
-            path,
-            {
-                "state": STAGE_VERIFYING,
-                "mediaId": media_id,
-                "publishedAt": published_at,
-                "cleanupAt": published_at + CLEANUP_DELAY_MS,
-                "publishSource": source,
-                "attempts": 0,
-                "error": None,
-                "stageAt": moment,
-                "updatedAt": moment,
-            },
-        )
-        return STAGE_VERIFYING, None
-
-    async def _stage_verify(self, db, schedule_id):
-        """الخطوة 3: تأكيد أن المنشور موجود فعلاً على الحساب (Graph API)."""
-        path = f"schedules/{schedule_id}.json"
-        current, etag = await _firebase_read(db, path)
-        if not isinstance(current, dict):
-            return STAGE_SCHEDULED, "the schedule record disappeared"
-
-        state = _stage_of(current)
-        if state != STAGE_VERIFYING:
-            return state, None
-
-        media_id = _clean(current.get("mediaId"))
-        token = _ig_token(self.env)
-        moment = int(time.time() * 1000)
-
-        if not media_id or not token:
-            error = "cannot confirm the published reel"
-            await _firebase_patch(
-                db,
-                path,
-                {"state": STAGE_UNVERIFIED, "error": error, "updatedAt": moment},
-            )
-            return STAGE_UNVERIFIED, error
-
-        confirmed = await self._published_confirmed(current, media_id, token)
-
-        if confirmed is True:
-            if not await self._claim(
-                db, path, etag, current, STAGE_CLEANING, {"error": None, "attempts": 0}
-            ):
-                return state, None
-            published_at = _int_of(current, "publishedAt") or moment
-            await _firebase_patch(
-                db,
-                path,
-                {
-                    "cleanupAt": published_at + CLEANUP_DELAY_MS,
-                    "stageAt": moment,
-                    "updatedAt": moment,
-                },
-            )
-            return await self._stage_clean(db, schedule_id)
-
-        attempts = _int_of(current, "attempts") + 1
-        if confirmed is False:
-            error = "instagram did not confirm the published reel"
-        else:
-            error = "could not confirm the published reel with instagram"
-        if attempts >= VERIFY_RETRY_LIMIT:
-            # بلا تأكيد لا نحذف الملف أبداً: نترك الريل والمعلومات للمراجعة.
-            await _firebase_patch(
-                db,
-                path,
-                {
-                    "state": STAGE_UNVERIFIED,
-                    "attempts": attempts,
-                    "error": error,
-                    "updatedAt": moment,
-                },
-            )
-            return STAGE_UNVERIFIED, error
-        await _firebase_patch(
-            db, path, {"attempts": attempts, "error": error, "updatedAt": moment}
-        )
-        return state, error
-
-    async def _published_confirmed(self, schedule, media_id, token):
-        """هل النشر مؤكد بما يكفي لحذف ملف R2؟
-
-        الفحص المباشر لمنشور واحد أولاً. لو قال Graph إن المنشور غير موجود فلا
-        نحذف شيئاً. أما إذا كان معرّف المنشور نفسه من رد `media_publish` الناجح
-        (`publishSource=api`) أو كان النشر يدوياً من المالك، فذلك دليل نشر قاطع
-        حتى لو تعذّرت قراءة المنشور بعد النشر — وإلا بقي السجل عالقاً في
-        `cleaning` وبقي الفيديو في R2 وسجلاته في Firebase إلى الأبد.
-        """
-        if not media_id:
-            return False
-
-        if token:
-            confirmed = await _ig_media_exists(_ig_user(self.env), token, media_id)
-            if confirmed is True:
-                return True
-            proof = (
-                _clean(schedule.get("publishSource")) == "api"
-                or _truthy(schedule.get("manualPublish"))
-            )
-            if confirmed is False and not proof:
-                return False
-
-        return _int_of(schedule, "publishedAt") > 0
-
-    async def _stage_clean(self, db, schedule_id):
-        """الخطوة 4: حذف الملف من R2 ثم كل معلومات الريل من Firebase.
-
-        لا حذف قبل تأكيد ثانٍ من إنستغرام، ولا مسح لسجلات Firebase قبل التأكد
-        أن الملف غاب فعلاً من R2: هكذا لا يضيع فيديو نُشر أو ما زال يُنشر.
-        """
-        path = f"schedules/{schedule_id}.json"
-        current, etag = await _firebase_read(db, path)
-        if not isinstance(current, dict):
-            return STAGE_PUBLISHED, None
-
-        state = _stage_of(current)
-        if state != STAGE_CLEANING:
-            return state, None
-
-        media_id = _clean(current.get("mediaId"))
-        token = _ig_token(self.env)
-        now = int(time.time() * 1000)
-
-        # 4أ) مهلة 5 ثوانٍ بعد النشر لتستقر الحاوية عند Meta.
-        target = _int_of(current, "cleanupAt") or (
-            _int_of(current, "publishedAt") + CLEANUP_DELAY_MS
-        )
-        remaining = target - now
-        if remaining > 0:
-            await asyncio.sleep(min(CLEANUP_DELAY_MS, remaining) / 1000)
-
-        key = self._key(schedule_id)
-
-        # 4ب) تأكيد أخير قبل الحذف (لأن الحذف لا رجعة فيه).
-        if not media_id or not token:
-            error = "cannot confirm the published reel before deleting its file"
-            await _firebase_patch(
-                db,
-                path,
-                {"state": STAGE_UNVERIFIED, "error": error, "updatedAt": int(time.time() * 1000)},
-            )
-            return STAGE_UNVERIFIED, error
-
-        confirmed = await self._published_confirmed(current, media_id, token)
-        moment = int(time.time() * 1000)
-        if confirmed is not True:
-            attempts = _int_of(current, "attempts") + 1
-            error = "instagram did not confirm the published reel; the file was kept"
-            if attempts >= CLEAN_RETRY_LIMIT:
-                await _firebase_patch(
-                    db,
-                    path,
-                    {
-                        "state": STAGE_UNVERIFIED,
-                        "attempts": attempts,
-                        "error": error,
-                        "updatedAt": moment,
-                    },
-                )
-                return STAGE_UNVERIFIED, error
-            await _firebase_patch(
-                db, path, {"attempts": attempts, "error": error, "updatedAt": moment}
-            )
-            return state, error
-
-        # 4ج) حذف الملف من R2.
-        try:
-            await self.env.FILES.delete(key)
-        except Exception as exc:  # noqa: BLE001 - نعيد المحاولة في التشغيل القادم
-            return await self._clean_failed(
-                db, path, current, "could not delete the archived file: %s" % _describe(exc)[:200]
-            )
-
-        if await _object_exists(self.env, key) is True:
-            return await self._clean_failed(
-                db, path, current, "the archived file is still in R2 after delete"
-            )
-
-        # 4د) بعد التأكد من الحذف فقط: تُمسح معلومات الريل كاملة من Firebase.
-        if not await self._forget_reel(db, schedule_id):
-            return STAGE_CLEANING, "the file is gone but the database records are still there"
-        return STAGE_PUBLISHED, None
-
-    async def _clean_failed(self, db, path, current, error):
-        """تسجيل فشل خطوة الحذف: محاولات محدودة ثم تُترك الحالة للمراجعة."""
-        attempts = _int_of(current, "attempts") + 1
-        moment = int(time.time() * 1000)
-        if attempts >= CLEAN_RETRY_LIMIT:
-            await _firebase_patch(
-                db,
-                path,
-                {
-                    "state": STAGE_PUBLISHED,
-                    "attempts": attempts,
-                    "error": error,
-                    "cleanupError": error,
-                    "updatedAt": moment,
-                },
-            )
-            return STAGE_PUBLISHED, error
-        await _firebase_patch(
-            db, path, {"attempts": attempts, "error": error, "updatedAt": moment}
-        )
-        return STAGE_CLEANING, error
-
-    async def _forget_reel(self, db, reel_id):
-        """يحذف سجل الريل كاملاً (عنوانه وروابطه وغلافه) وموعده من Firebase."""
-        clean_id = _safe_id(reel_id)
-        if not clean_id:
-            return False
-        ok = True
-        for path in (f"reels/{clean_id}.json", f"schedules/{clean_id}.json"):
-            try:
-                status = await _firebase_delete(db, path)
-            except Exception as exc:  # noqa: BLE001
-                ok = False
-                print(f"pigeon cleanup {path} failed: {exc}")
-                continue
-            if status not in (200, 204):
-                ok = False
-                print(f"pigeon cleanup {path} -> HTTP {status}")
-        return ok
-
-    async def _delete_reel(self, reel_id):
-        """حذف ريل مجدول من التطبيق: ملف R2 أولاً ثم سجلات Firebase.
-
-        يُرفض أثناء خطوة نشر جارية حتى لا يُحذف الفيديو من تحت إنستغرام.
-        """
-        reel_id = _safe_id(reel_id)
-        if not reel_id:
-            return _error("bad id", 404)
-
-        db = self._db()
-        schedule = await _firebase_get(db, f"schedules/{reel_id}.json")
-        if isinstance(schedule, dict):
-            state = _stage_of(schedule)
-            if state in (STAGE_PUBLISHING, STAGE_VERIFYING, STAGE_CLEANING):
-                return _json(
-                    {
-                        "ok": False,
-                        "error": "the reel is being published right now",
-                        "state": state,
-                    },
-                    status=409,
-                )
-
-        key = self._key(reel_id)
-        try:
-            await self.env.FILES.delete(key)
-        except Exception as exc:  # noqa: BLE001
-            return _json(
-                {
-                    "ok": False,
-                    "error": "could not delete the archived file: %s"
-                    % _describe(exc)[:200],
-                },
-                status=503,
-            )
-
-        if await _object_exists(self.env, key) is True:
-            return _json(
-                {"ok": False, "error": "the archived file is still in R2"},
-                status=503,
-            )
-
-        if not await self._forget_reel(db, reel_id):
-            return _json(
-                {
-                    "ok": False,
-                    "error": "the file is gone but the database records could not be removed",
-                },
-                status=503,
-            )
-
-        return _json({"ok": True, "id": reel_id, "deleted": True})
-
-    async def _archive(
-        self, reel_id, code, tiktok, source, origin, thumbnail, app_media=None
-    ):
-        db = self._db()
+    async def archive(self, reel_id, code, tiktok, source, origin, thumbnail, app_media=None):
         state_path = f"reels/{reel_id}/archive.json"
-        started = int(time.time() * 1000)
+        started = _now()
         deadline = time.monotonic() + ARCHIVE_BUDGET_S
 
         def remaining():
             return deadline - time.monotonic()
 
         async def report(state, progress, **extra):
-            payload = {
-                "state": state,
-                "progress": int(progress),
-                "updatedAt": int(time.time() * 1000),
-            }
+            payload = {"state": state, "progress": int(progress), "updatedAt": _now()}
             payload.update(extra)
             try:
-                # سجل "ready" نهائي: محاولة أرشفة فاشلة بعده لا ترجعه إلى failed
-                # ولا تمسح رابطه وحجمه (وإلا ظهر الريل بلا بيانات في التطبيق).
+                # الحالة ready نهائية: محاولة فاشلة بعدها لا ترجعها إلى failed
+                # ولا تمسح رابط الملف وحجمه.
                 if state != "ready":
-                    existing = await _firebase_get(db, state_path)
+                    existing = await self.store.get(state_path)
                     if (
                         isinstance(existing, dict)
                         and _clean(existing.get("state")) == "ready"
                     ):
                         return
-                await _firebase_patch(db, state_path, payload)
-            except Exception:
+                await self.store.patch(state_path, payload)
+            except Exception:  # noqa: BLE001 - تقدّم فقط، ولا يُفشل التنزيل
                 pass
 
         try:
@@ -2607,9 +1432,6 @@ class Default(WorkerEntrypoint):
             hosts = []
             last_error = "no media url"
 
-            # تيك توك: كل مرشّح يحمل ترويساته. روابط `*.tiktokcdn.com` التي
-            # يحلّها التطبيق من شبكة الهاتف تعمل على Cloudflare، بينما روابط
-            # صفحة الويب (`*-prime.tiktok.com`) ترد 403 دائماً.
             if source == "tiktok":
                 base_headers = {"user-agent": BROWSER_UA, "accept": "*/*"}
             else:
@@ -2622,7 +1444,6 @@ class Default(WorkerEntrypoint):
                 await report("downloading", percent)
 
             async def attempt(items):
-                """يجرّب المرشّحين بالترتيب ويرجّع بايتات الفيديو أو None."""
                 nonlocal last_error
                 for candidate in items:
                     if remaining() <= 6:
@@ -2668,7 +1489,9 @@ class Default(WorkerEntrypoint):
                 try:
                     if source == "tiktok":
                         found, resolved_info, log = await asyncio.wait_for(
-                            _resolve_tiktok(tiktok, deadline=time.monotonic() + budget),
+                            _resolve_tiktok(
+                                tiktok, deadline=time.monotonic() + budget
+                            ),
                             budget,
                         )
                     else:
@@ -2681,12 +1504,12 @@ class Default(WorkerEntrypoint):
                     attempts = list(log) + attempts
                     return found
                 except asyncio.TimeoutError:
-                    attempts.append(f"{source} -> no answer in {budget:.0f}s")
+                    attempts.append("%s -> no answer in %.0fs" % (source, budget))
                     return []
 
             await report("downloading", 6)
 
-            # المسار السريع: رابط CDN النظيف القادم من التطبيق (بلا علامة مائية).
+            # المسار السريع: رابط CDN النظيف الذي حلّه الهاتف.
             data = None
             if app_media:
                 data = await attempt(
@@ -2694,7 +1517,10 @@ class Default(WorkerEntrypoint):
                         {
                             "url": app_media,
                             "bytes": 0,
-                            "headers": {"user-agent": BROWSER_UA, "accept": "*/*"},
+                            "headers": {
+                                "user-agent": BROWSER_UA,
+                                "accept": "*/*",
+                            },
                             "label": "app/media",
                         }
                     ]
@@ -2716,23 +1542,1418 @@ class Default(WorkerEntrypoint):
                 )
 
             await report("storing", 95)
-            await self.env.FILES.put(self._key(reel_id), data)
+            await self.env.FILES.put(self.key(reel_id), data)
 
-            download_url = f"{origin}/download/{reel_id}"
             await report(
                 "ready",
                 100,
-                url=download_url,
+                url="%s/download/%s" % (origin, reel_id),
                 bytes=len(data),
                 source=source,
                 title=info.get("title") or None,
                 thumbnail=thumbnail or info.get("thumbnail") or None,
                 videoDurationMs=info.get("durationMs") or None,
-                durationMs=int(time.time() * 1000) - started,
+                durationMs=_now() - started,
             )
-        except Exception as exc:  # noqa: BLE001
+            return True
+        except Exception as exc:  # noqa: BLE001 - نسجّل السبب ونعيد false
             await report(
                 "failed",
                 0,
                 error=("%s: %s" % (exc.__class__.__name__, exc))[:300],
             )
+            return False
+
+    async def archive_now(self, reel_id):
+        """يؤرشف فوراً إن لم يكن الملف في R2. يرجّع True فقط إذا صار موجوداً."""
+        if await self.exists(reel_id) is True:
+            return True
+
+        reel = await self.store.get(f"reels/{reel_id}.json") or {}
+        if not isinstance(reel, dict):
+            return False
+
+        link = _clean(reel.get("url"))
+        code = _instagram_code(link)
+        tiktok = None if code else _tiktok_link(link)
+        if not code and not tiktok:
+            return False
+
+        await self.archive(
+            reel_id=reel_id,
+            code=code,
+            tiktok=tiktok,
+            source="instagram" if code else "tiktok",
+            origin=_ig_public_base(self.env),
+            thumbnail=_clean(reel.get("thumbnail")) or None,
+            app_media=_safe_media_url(reel.get("media")),
+        )
+        return await self.exists(reel_id) is True
+
+    async def archive_missing(self):
+        """يعيد أرشفة موعد قادم ما زال ملفه غائباً عن R2 (حماية من فقدان الأرشفة)."""
+        schedules = await self.store.get("schedules") or {}
+        if not isinstance(schedules, dict):
+            return 0
+
+        candidates = []
+        for schedule_id, schedule in schedules.items():
+            if not isinstance(schedule, dict):
+                continue
+            at = _int_of(schedule, "at")
+            if at <= 0:
+                continue
+            if _stage_of(schedule) not in (
+                STAGE_SCHEDULED,
+                STAGE_PREPARING,
+                STAGE_PREPARED,
+            ):
+                continue
+            if _clean(schedule.get("containerId")):
+                continue  # الحاوية موجودة: الملف وصل R2 سابقاً
+            clean_id = _safe_id(schedule_id)
+            if clean_id:
+                candidates.append((at, clean_id))
+
+        candidates.sort()
+        started = 0
+        for _at, clean_id in candidates[:1]:
+            if await self.exists(clean_id) is True:
+                continue
+            if await self.archive_now(clean_id):
+                started += 1
+        return started
+
+    # ------------------------------------------------------------------
+    # الحاوية: تُنشأ قبل الموعد حتى لا يتأخر النشر
+    # ------------------------------------------------------------------
+
+    async def prepare_container(self, reel_id):
+        token = _ig_token(self.env)
+        if not token:
+            return None, "IG_ACCESS_TOKEN is not configured"
+
+        media_url = f"{_ig_public_base(self.env)}/media/{reel_id}"
+        try:
+            container_id = await _ig_create_container(
+                _ig_user(self.env), token, media_url, ""
+            )
+        except Exception as exc:  # noqa: BLE001 - المتصل يعيد المحاولة
+            return None, _describe(exc)[:300]
+        return container_id, None
+
+    # ------------------------------------------------------------------
+    # التقدّم: خطوة واحدة في كل نداء
+    # ------------------------------------------------------------------
+
+    async def advance(self, reel_id, record=None):
+        path = f"schedules/{reel_id}.json"
+        if not isinstance(record, dict):
+            record, _etag = await self.store.read(path)
+        if not isinstance(record, dict):
+            return STAGE_SCHEDULED, "the schedule record disappeared"
+
+        now = _now()
+        state = _stage_of(record)
+        stage_at = _int_of(record, "stageAt")
+        if state in IN_FLIGHT_STAGES or state == STAGE_PREPARING:
+            # الخطوة محجوزة لتشغيل آخر لم ينته بعد.
+            if stage_at > 0 and now - stage_at < STAGE_LEASE_MS:
+                return state, None
+
+        if state in (STAGE_SCHEDULED, STAGE_PREPARING):
+            at = _int_of(record, "at") if state == STAGE_SCHEDULED else 0
+            if state == STAGE_SCHEDULED and at <= 0:
+                return state, None
+            if state == STAGE_SCHEDULED and at > now and at - now > PREPARE_LEAD_MS:
+                return state, None
+            return await self._prepare(reel_id)
+
+        if state == STAGE_PREPARED:
+            if _int_of(record, "at") > now:
+                return state, None  # الحاوية جاهزة، ننتظر الموعد
+            return await self._publish(reel_id)
+
+        if state == STAGE_PUBLISHING:
+            return await self._publish(reel_id)
+        if state == STAGE_VERIFYING:
+            return await self._verify(reel_id)
+        if state == STAGE_CLEANING:
+            return await self._clean(reel_id)
+        return state, None
+
+    async def _prepare(self, reel_id):
+        path = f"schedules/{reel_id}.json"
+        current, _etag = await self.store.read(path)
+        if not isinstance(current, dict):
+            return STAGE_SCHEDULED, "the schedule record disappeared"
+
+        state = _stage_of(current)
+        if state not in (STAGE_SCHEDULED, STAGE_PREPARING):
+            return state, None
+
+        # حاوية موجودة من محاولة سابقة: لا ننشئ ثانية، نعتمدها.
+        if _clean(current.get("containerId")):
+            merged = await self.store.transition(
+                path,
+                (STAGE_SCHEDULED, STAGE_PREPARING),
+                STAGE_PREPARED,
+                {"error": None},
+            )
+            return (STAGE_PREPARED, None) if merged else (state, None)
+
+        if await self.exists(reel_id) is not True:
+            return STAGE_SCHEDULED, ARCHIVE_WAIT
+
+        claimed = await self.store.transition(
+            path,
+            (STAGE_SCHEDULED, STAGE_PREPARING),
+            STAGE_PREPARING,
+            {"error": None},
+        )
+        if not claimed:
+            return state, None
+
+        container_id, error = await self.prepare_container(reel_id)
+        if error is None and container_id:
+            ready = await self.store.transition(
+                path,
+                (STAGE_PREPARING,),
+                STAGE_PREPARED,
+                {
+                    "containerId": container_id,
+                    "preparedAt": _now(),
+                    "attempts": 0,
+                    "error": None,
+                },
+            )
+            return (STAGE_PREPARED, None) if ready else (STAGE_PREPARING, None)
+
+        attempts = _int_of(current, "attempts") + 1
+        error = error or "instagram did not return a container id"
+        target = STAGE_FAILED if attempts >= PREPARE_RETRY_LIMIT else STAGE_SCHEDULED
+        merged = await self.store.transition(
+            path, (STAGE_PREPARING,), target, {"attempts": attempts, "error": error}
+        )
+        return (target if merged else STAGE_PREPARING), error
+
+    async def _publish(self, reel_id):
+        path = f"schedules/{reel_id}.json"
+        current, _etag = await self.store.read(path)
+        if not isinstance(current, dict):
+            return STAGE_SCHEDULED, "the schedule record disappeared"
+
+        state = _stage_of(current)
+        if state not in (STAGE_PREPARED, STAGE_PUBLISHING):
+            return state, None
+
+        token = _ig_token(self.env)
+        if not token:
+            error = "IG_ACCESS_TOKEN is not configured"
+            await self.store.transition(
+                path, (STAGE_PREPARED, STAGE_PUBLISHING), STAGE_FAILED, {"error": error}
+            )
+            return STAGE_FAILED, error
+
+        user_id = _ig_user(self.env)
+        moment = _now()
+
+        # تشغيل سابق بدأ media_publish ثم انقطع: لا نعيد النشر أبداً، نسأل
+        # الحساب أولاً إن كان الريل ظهر فعلاً.
+        if state == STAGE_PUBLISHING:
+            stage_at = _int_of(current, "stageAt") or moment
+            published_id = await _ig_published_media(
+                user_id, token, stage_at - 180_000
+            )
+            if published_id:
+                await self._enter_verifying(reel_id, published_id, stage_at, "scan")
+                return await self._verify(reel_id)
+            if moment - stage_at < PUBLISH_STUCK_MS:
+                return state, None
+            error = "publishing was interrupted; check Instagram before retrying"
+            await self.store.transition(
+                path, (STAGE_PUBLISHING,), STAGE_FAILED, {"error": error}
+            )
+            return STAGE_FAILED, error
+
+        container_id = _clean(current.get("containerId"))
+        if not container_id:
+            error = "the Instagram container id is missing"
+            await self.store.transition(
+                path, (STAGE_PREPARED,), STAGE_SCHEDULED, {"error": error}
+            )
+            return STAGE_SCHEDULED, error
+
+        try:
+            status_code, status_text = await _ig_container_status(container_id, token)
+        except Exception as exc:  # noqa: BLE001 - نعيد المحاولة في التشغيل القادم
+            error = _describe(exc)[:300]
+            attempts = _int_of(current, "attempts") + 1
+            exhausted = attempts >= SCHEDULE_RETRY_LIMIT
+            target = STAGE_FAILED if exhausted else STAGE_PREPARED
+            await self.store.transition(
+                path, (STAGE_PREPARED,), target, {"attempts": attempts, "error": error}
+            )
+            return target, error
+
+        if status_code in ("ERROR", "EXPIRED"):
+            error = ("instagram container %s: %s" % (status_code.lower(), status_text))[
+                :300
+            ]
+            await self.store.transition(
+                path, (STAGE_PREPARED,), STAGE_FAILED, {"error": error}
+            )
+            return STAGE_FAILED, error
+
+        if status_code != "FINISHED":
+            attempts = _int_of(current, "attempts") + 1
+            exhausted = attempts >= SCHEDULE_RETRY_LIMIT
+            error = "instagram did not finish processing the video" if exhausted else None
+            target = STAGE_FAILED if exhausted else STAGE_PREPARED
+            await self.store.transition(
+                path, (STAGE_PREPARED,), target, {"attempts": attempts, "error": error}
+            )
+            return target, error
+
+        # ريل واحد ينشر في المرة. النشر اليدوي يتجاوز فاصل الدقيقتين فقط،
+        # ولا يتجاوز أبداً التداخل مع ريل ينشر الآن.
+        manual = _truthy(current.get("manualPublish"))
+        if not await self.publish_slot_free(reel_id, moment, ignore_gap=manual):
+            return state, PUBLISH_BUSY
+
+        claimed = await self.store.transition(
+            path, (STAGE_PREPARED,), STAGE_PUBLISHING, {"error": None, "attempts": 0}
+        )
+        if not claimed:
+            return state, None
+
+        started = _now()
+        await self.lock_publish(reel_id, started)
+        media_id = None
+        error = None
+        try:
+            media_id = await _ig_publish(user_id, token, container_id)
+        except Exception as exc:  # noqa: BLE001 - قد يكون النشر نجح والرد ضاع
+            error = _describe(exc)[:300]
+
+        # رد media_publish الناجح نفسه دليل النشر؛ البحث في الحساب احتياط فقط.
+        source = "api"
+        if not media_id:
+            source = "scan"
+            media_id = await _ig_published_media(user_id, token, started - 180_000)
+
+        if media_id:
+            await self._enter_verifying(reel_id, media_id, started, source)
+            return await self._verify(reel_id)
+
+        attempts = _int_of(current, "attempts") + 1
+        error = error or "media_publish returned no id"
+        exhausted = attempts >= PUBLISH_RETRY_LIMIT
+        target = STAGE_FAILED if exhausted else STAGE_PREPARED
+        await self.store.transition(
+            path, (STAGE_PUBLISHING,), target, {"attempts": attempts, "error": error}
+        )
+        return target, error
+
+    async def _enter_verifying(self, reel_id, media_id, published_at, source):
+        path = f"schedules/{reel_id}.json"
+        moment = _now()
+        if published_at <= 0 or published_at > moment:
+            published_at = moment
+        await self.store.transition(
+            path,
+            (STAGE_PUBLISHING,),
+            STAGE_VERIFYING,
+            {
+                "mediaId": media_id,
+                "publishedAt": published_at,
+                "cleanupAt": published_at + CLEANUP_DELAY_MS,
+                "publishSource": source,
+                "attempts": 0,
+                "error": None,
+            },
+        )
+
+    async def _verify(self, reel_id):
+        path = f"schedules/{reel_id}.json"
+        current, _etag = await self.store.read(path)
+        if not isinstance(current, dict):
+            return STAGE_SCHEDULED, "the schedule record disappeared"
+
+        state = _stage_of(current)
+        if state != STAGE_VERIFYING:
+            return state, None
+
+        media_id = _clean(current.get("mediaId"))
+        token = _ig_token(self.env)
+        if not media_id or not token:
+            error = "cannot confirm the published reel"
+            await self.store.transition(
+                path, (STAGE_VERIFYING,), STAGE_UNVERIFIED, {"error": error}
+            )
+            return STAGE_UNVERIFIED, error
+
+        confirmed = await self.published_confirmed(current, media_id, token)
+        if confirmed is True:
+            published_at = _int_of(current, "publishedAt") or _now()
+            cleaned = await self.store.transition(
+                path,
+                (STAGE_VERIFYING,),
+                STAGE_CLEANING,
+                {
+                    "error": None,
+                    "attempts": 0,
+                    "cleanupAt": published_at + CLEANUP_DELAY_MS,
+                },
+            )
+            if not cleaned:
+                return STAGE_VERIFYING, None
+            return await self._clean(reel_id)
+
+        attempts = _int_of(current, "attempts") + 1
+        if confirmed is False:
+            error = "instagram did not confirm the published reel"
+        else:
+            error = "could not confirm the published reel with instagram"
+
+        if attempts >= VERIFY_RETRY_LIMIT:
+            # بلا تأكيد لا نحذف الملف أبداً: يبقى الريل للمراجعة.
+            await self.store.transition(
+                path,
+                (STAGE_VERIFYING,),
+                STAGE_UNVERIFIED,
+                {"attempts": attempts, "error": error},
+            )
+            return STAGE_UNVERIFIED, error
+
+        # نكتب المحاولة بلا تجديد "stageAt": الحجز انتهى بعد نافذته، والتشغيل
+        # القادم (كل دقيقة) يعيد الفحص بدل أن يُحجب حجزاً قديماً.
+        await self.store.commit(
+            path,
+            _etag,
+            current,
+            {"state": STAGE_VERIFYING, "attempts": attempts, "error": error, "updatedAt": _now()},
+        )
+        return STAGE_VERIFYING, error
+
+    async def published_confirmed(self, schedule, media_id, token):
+        """هل النشر مؤكد بما يكفي لحذف الملف من R2؟"""
+        if not media_id:
+            return False
+
+        if token:
+            confirmed = await _ig_media_exists(_ig_user(self.env), token, media_id)
+            if confirmed is True:
+                return True
+            proof = (
+                _clean(schedule.get("publishSource")) == "api"
+                or _truthy(schedule.get("manualPublish"))
+            )
+            if confirmed is False and not proof:
+                return False
+
+        return _int_of(schedule, "publishedAt") > 0
+
+    async def _clean(self, reel_id):
+        """حذف الملف من R2 ثم سجلات Firebase — بعد تأكيد ثانٍ فقط."""
+        path = f"schedules/{reel_id}.json"
+        current, _etag = await self.store.read(path)
+        if not isinstance(current, dict):
+            return STAGE_PUBLISHED, None
+
+        state = _stage_of(current)
+        if state != STAGE_CLEANING:
+            return state, None
+
+        media_id = _clean(current.get("mediaId"))
+        token = _ig_token(self.env)
+        now = _now()
+
+        target = _int_of(current, "cleanupAt") or (
+            _int_of(current, "publishedAt") + CLEANUP_DELAY_MS
+        )
+        remaining = target - now
+        if remaining > 0:
+            await asyncio.sleep(min(CLEANUP_DELAY_MS, remaining) / 1000)
+
+        if not media_id or not token:
+            error = "cannot confirm the published reel before deleting its file"
+            await self.store.transition(
+                path, (STAGE_CLEANING,), STAGE_UNVERIFIED, {"error": error}
+            )
+            return STAGE_UNVERIFIED, error
+
+        confirmed = await self.published_confirmed(current, media_id, token)
+        if confirmed is not True:
+            attempts = _int_of(current, "attempts") + 1
+            error = "instagram did not confirm the published reel; the file was kept"
+            if attempts >= CLEAN_RETRY_LIMIT:
+                await self.store.transition(
+                    path,
+                    (STAGE_CLEANING,),
+                    STAGE_UNVERIFIED,
+                    {"attempts": attempts, "error": error},
+                )
+                return STAGE_UNVERIFIED, error
+            # نفس قاعدة التأكيد: عدّ المحاولة بلا تجديد الحجز.
+            await self.store.commit(
+                path,
+                _etag,
+                current,
+                {"state": STAGE_CLEANING, "attempts": attempts, "error": error, "updatedAt": _now()},
+            )
+            return STAGE_CLEANING, error
+
+        key = self.key(reel_id)
+        try:
+            await self.env.FILES.delete(key)
+        except Exception as exc:  # noqa: BLE001 - نعيد المحاولة في تشغيل لاحق
+            return await self._clean_failed(
+                reel_id,
+                "could not delete the archived file: %s" % _describe(exc)[:200],
+            )
+
+        if await self.exists(reel_id) is True:
+            return await self._clean_failed(
+                reel_id, "the archived file is still in R2 after delete"
+            )
+
+        if not await self.forget(reel_id):
+            return STAGE_CLEANING, "the file is gone but the database records are still there"
+        return STAGE_PUBLISHED, None
+
+    async def _clean_failed(self, reel_id, error):
+        path = f"schedules/{reel_id}.json"
+        current, _etag = await self.store.read(path)
+        current = current if isinstance(current, dict) else {}
+        attempts = _int_of(current, "attempts") + 1
+        if attempts >= CLEAN_RETRY_LIMIT:
+            await self.store.transition(
+                path,
+                (STAGE_CLEANING,),
+                STAGE_PUBLISHED,
+                {"attempts": attempts, "error": error, "cleanupError": error},
+            )
+            return STAGE_PUBLISHED, error
+        await self.store.transition(
+            path, (STAGE_CLEANING,), STAGE_CLEANING, {"attempts": attempts, "error": error}
+        )
+        return STAGE_CLEANING, error
+
+    async def forget(self, reel_id):
+        """يحذف سجل الريل وموعده وأرشيفه من Firebase. True إذا نُظّف كله."""
+        clean_id = _safe_id(reel_id)
+        if not clean_id:
+            return False
+        ok = True
+        # حذف عقدة الريل يحذف أرشيفها معها (عقدة فرعية).
+        for path in (f"reels/{clean_id}.json", f"schedules/{clean_id}.json"):
+            try:
+                status = await self.store.delete(path)
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                print("pigeon cleanup %s failed: %s" % (path, exc))
+                continue
+            if status not in (200, 204):
+                ok = False
+                print("pigeon cleanup %s -> HTTP %s" % (path, status))
+        return ok
+
+    # ------------------------------------------------------------------
+    # تنسيق النشر: خانة واحدة وقفل قصير
+    # ------------------------------------------------------------------
+
+    async def publish_slot_free(self, reel_id, now, ignore_gap=False):
+        lock = await self.store.get(PUBLISH_LOCK_PATH) or {}
+        if isinstance(lock, dict) and not ignore_gap:
+            busy_id = _safe_id(lock.get("id"))
+            started = _int_of(lock, "at")
+            if (
+                busy_id
+                and busy_id != reel_id
+                and started > 0
+                and now - started < PUBLISH_GAP_MS
+            ):
+                return False
+
+        schedules = await self.store.get("schedules") or {}
+        if not isinstance(schedules, dict):
+            return True
+        for other_id, other in schedules.items():
+            if _safe_id(other_id) == reel_id or not isinstance(other, dict):
+                continue
+            if _stage_of(other) in IN_FLIGHT_STAGES:
+                return False
+        return True
+
+    async def lock_publish(self, reel_id, started):
+        try:
+            await self.store.put(
+                PUBLISH_LOCK_PATH, {"id": reel_id, "at": started}
+            )
+        except Exception as exc:  # noqa: BLE001 - القفل تحسين لا شرط
+            print("pigeon publish lock failed: %s" % exc)
+
+    async def advance_until_settled(self, reel_id, budget_s=PUBLISH_NOW_BUDGET_S):
+        """يمشي بالسلسلة زمنياً حتى النهاية أو نهاية الميزانية (للنشر اليدوي)."""
+        deadline = time.monotonic() + budget_s
+        state = STAGE_SCHEDULED
+        error = None
+
+        while time.monotonic() < deadline:
+            current, _etag = await self.store.read(f"schedules/{reel_id}.json")
+            if not isinstance(current, dict):
+                if state in (STAGE_VERIFYING, STAGE_CLEANING, STAGE_PUBLISHED):
+                    return STAGE_PUBLISHED, None
+                return state, "the schedule record disappeared"
+
+            state = _stage_of(current)
+            if state in FINAL_STAGES:
+                break
+
+            state, error = await self.advance(reel_id, current)
+            if state in FINAL_STAGES:
+                break
+            if error in (ARCHIVE_WAIT, PUBLISH_BUSY):
+                break  # لا فائدة من الانتظار: يحتاج ملفاً أو خانة نشر حرّة
+            await asyncio.sleep(PUBLISH_NOW_POLL_S)
+
+        return state, error
+# ==========================================================================
+# الطبقة 3 — الأوامر: التطبيق يرسل أمراً، والخادم يقرر ويحفظ ويعيد الحالة
+# ==========================================================================
+# كل أمر هنا idempotent: تكراره بنفس الشروط لا يكرر أثره، ويعيد الحالة الحالية
+# بدل خطأ. وكل أمر يتحقق من الحالة المسموح بها قبل أي كتابة أو نداء خارجي.
+
+
+class Commands:
+    def __init__(self, env, store, engine):
+        self.env = env
+        self.store = store
+        self.engine = engine
+
+    # ------------------------------------------------------------------
+    # archive.start
+    # ------------------------------------------------------------------
+
+    async def archive(self, request_id, body):
+        reel_id = _require_id(_field(body, "id"))
+        link = _clean(_field(body, "url"))
+        thumbnail = _clean(_field(body, "thumbnail"))
+        app_media = _safe_media_url(_field(body, "media"))
+        archive_path = f"reels/{reel_id}/archive.json"
+
+        current = await self.store.get(archive_path)
+        current = current if isinstance(current, dict) else {}
+        state = _clean(current.get("state"), "unknown") or "unknown"
+
+        # ready نهائية، والمهمة الجارية حديثاً لا تُصفَّر (كانت إعادة الطلب
+        # تُرجع التقدّم من 8% إلى 2%).
+        if state == "ready":
+            return {"id": reel_id, "state": "ready", "archive": _archive_view(current)}, 200
+        if (
+            state in ("queued", "downloading", "storing")
+            and _now() - _int_of(current, "updatedAt") < STALE_JOB_MS
+        ):
+            return {
+                "id": reel_id,
+                "state": state,
+                "archive": _archive_view(current),
+            }, 202
+
+        code = _instagram_code(link)
+        tiktok = None if code else _tiktok_link(link)
+        if not code and not tiktok:
+            raise ApiError(
+                "unsupported_link",
+                "only instagram reel and tiktok video links are supported",
+            )
+        source = "instagram" if code else "tiktok"
+
+        try:
+            await self.store.patch(
+                archive_path,
+                {
+                    "state": "queued",
+                    "progress": 0,
+                    "updatedAt": _now(),
+                    "jobId": request_id,
+                },
+            )
+        except ApiError:
+            pass  # الحالة تُكتب داخل التنزيل على أي حال
+
+        # الرابط الذي حلّه الهاتف يُحفظ حتى يستطيع cron إعادة الأرشفة بنفسه.
+        if app_media:
+            try:
+                await self.store.patch(
+                    f"reels/{reel_id}.json", {"media": app_media, "source": source}
+                )
+            except ApiError:
+                pass
+
+        # ننتظر الأرشفة داخل الطلب: `waitUntil` تُلغى بعد الاستجابة، وهذا سبب
+        # أن الملف كان لا يصل R2 إلا بإعادة الطلب.
+        try:
+            await asyncio.wait_for(
+                self.engine.archive(
+                    reel_id=reel_id,
+                    code=code,
+                    tiktok=tiktok,
+                    source=source,
+                    origin=_origin_of(str(self.env_base())),
+                    thumbnail=thumbnail,
+                    app_media=app_media if source == "tiktok" else None,
+                ),
+                ARCHIVE_BUDGET_S + 8,
+            )
+        except BaseException:  # noqa: BLE001 - نكمل بالحالة المسجلة
+            pass
+
+        final = await self.store.get(archive_path)
+        view = _archive_view(final)
+        stored = await self.engine.exists(reel_id)
+        return {
+            "id": reel_id,
+            "state": "ready" if stored is True else view["state"],
+            "archive": view,
+        }, 202
+
+    def env_base(self):
+        return _ig_public_base(self.env)
+
+    # ------------------------------------------------------------------
+    # schedule.set
+    # ------------------------------------------------------------------
+
+    async def set_schedule(self, body):
+        reel_id = _require_id(_field(body, "id"))
+        at = _require_at(_field(body, "at"))
+        timezone = _clean(_field(body, "timezone"), SCHEDULE_TIMEZONE) or SCHEDULE_TIMEZONE
+        path = f"schedules/{reel_id}.json"
+        now = _now()
+
+        reel = await self.store.get(f"reels/{reel_id}.json")
+        if not isinstance(reel, dict):
+            raise ApiError("not_found", "this reel is not registered on the server", 404)
+
+        settled = _snap_to_minute(at, now)
+        shifted = settled != at
+
+        current, etag = await self.store.read(path)
+        current = current if isinstance(current, dict) else {}
+
+        if current:
+            state = _stage_of(current)
+            if state in IN_FLIGHT_STAGES or state == STAGE_UNVERIFIED:
+                raise ApiError("in_progress", "this reel is being published right now", 409)
+            if state == STAGE_PUBLISHED or _int_of(current, "publishedAt") > 0:
+                raise ApiError("already_published", "this reel was already published", 409)
+            # نفس الموعد ونفس الحالة = الأمر مكرر، نعيد النتيجة بلا كتابة.
+            if _int_of(current, "at") == settled and state == STAGE_SCHEDULED:
+                return {
+                    "id": reel_id,
+                    "at": settled,
+                    "state": STAGE_SCHEDULED,
+                    "timezone": timezone,
+                    "remainingMs": max(0, settled - now),
+                    "shifted": False,
+                    "idempotent": True,
+                }, 200
+
+        schedules = await self.store.get("schedules") or {}
+        if not isinstance(schedules, dict):
+            schedules = {}
+
+        # المواعيد المشغولة: كل ريل آخر ما زال في الطريق إلى النشر.
+        taken = []
+        for other_id, other in schedules.items():
+            clean_id = _safe_id(other_id)
+            if not clean_id or clean_id == reel_id or not isinstance(other, dict):
+                continue
+            if _stage_of(other) in FINAL_STAGES:
+                continue
+            other_at = _int_of(other, "at")
+            if other_at > 0:
+                taken.append(other_at)
+        taken.sort()
+
+        for _round in range(len(taken) + 1):
+            moved = False
+            for other_at in taken:
+                if abs(settled - other_at) < MIN_SLOT_GAP_MS:
+                    settled = other_at + MIN_SLOT_GAP_MS
+                    moved = True
+            if not moved:
+                break
+        shifted = shifted or settled != at
+
+        payload = {
+            "at": settled,
+            "timezone": timezone,
+            "state": STAGE_SCHEDULED,
+            "attempts": 0,
+            "error": None,
+            "containerId": None,
+            "stageAt": 0,
+            "scheduledAt": _int_of(current, "scheduledAt") or now,
+            "updatedAt": now,
+        }
+        await self.store.commit(path, etag, current, payload)
+        await self.store.bump_revision()
+
+        return {
+            "id": reel_id,
+            "at": settled,
+            "state": STAGE_SCHEDULED,
+            "timezone": timezone,
+            "remainingMs": max(0, settled - now),
+            "shifted": shifted,
+            "idempotent": False,
+        }, 200
+
+    # ------------------------------------------------------------------
+    # schedule.reorder
+    # ------------------------------------------------------------------
+
+    async def reorder(self, request_id, body):
+        ids = _require_ids(_field(body, "ids"))
+        now = _now()
+        owner = "order:" + request_id
+
+        if not await _acquire_mutex(self.store, owner):
+            raise ApiError("busy", "another operation is running; try again", 409)
+
+        try:
+            schedules = await self.store.get("schedules") or {}
+            if not isinstance(schedules, dict):
+                raise ApiError("store_failed", "the /schedules node is not an object", 502)
+
+            entries = {}
+            times = []
+            for clean_id in ids:
+                entry = schedules.get(clean_id)
+                if not isinstance(entry, dict):
+                    raise ApiError("not_found", "this reel is not scheduled on the server", 404)
+                state = _stage_of(entry)
+                if state in IN_FLIGHT_STAGES or state == STAGE_UNVERIFIED:
+                    raise ApiError("in_progress", "a reel is being published right now", 409)
+                if state in (STAGE_PUBLISHED, STAGE_FAILED):
+                    raise ApiError("invalid_state", "a reel is no longer scheduled", 409)
+                at = _int_of(entry, "at")
+                if at <= now + MIN_LEAD_MS:
+                    raise ApiError(
+                        "too_late", "a reel is about to publish; reorder it after", 409
+                    )
+                entries[clean_id] = entry
+                times.append(at)
+            times.sort()
+
+            # مواعيد الريلز غير المشمولة بالسحب محجوزة: لا نزيحها صامتين.
+            for other_id, other in schedules.items():
+                clean_id = _safe_id(other_id)
+                if not clean_id or clean_id in entries or not isinstance(other, dict):
+                    continue
+                if _stage_of(other) in FINAL_STAGES:
+                    continue
+                other_at = _int_of(other, "at")
+                if other_at <= 0:
+                    continue
+                for at in times:
+                    if abs(at - other_at) < MIN_SLOT_GAP_MS:
+                        raise ApiError(
+                            "conflict",
+                            "the new order collides with another scheduled reel",
+                            409,
+                        )
+
+            result = {}
+            for index, clean_id in enumerate(ids):
+                entry = entries[clean_id]
+                merged = await self.store.transition(
+                    f"schedules/{clean_id}.json",
+                    (STAGE_SCHEDULED, STAGE_PREPARING, STAGE_PREPARED),
+                    STAGE_SCHEDULED,
+                    {
+                        "at": times[index],
+                        "timezone": _clean(entry.get("timezone"), SCHEDULE_TIMEZONE),
+                        "attempts": 0,
+                        "error": None,
+                        "containerId": None,
+                        "stageAt": 0,
+                        "scheduledAt": _int_of(entry, "scheduledAt") or now,
+                    },
+                )
+                if not merged:
+                    # تغيّر السجل بين التحقق والكتابة: لا نصفّ ترتيباً ناقصاً.
+                    raise ApiError("conflict", "the order changed while saving; try again", 409)
+                result[clean_id] = times[index]
+
+            await self.store.bump_revision()
+            moved = sum(
+                1
+                for index, clean_id in enumerate(ids)
+                if times[index] != _int_of(entries[clean_id], "at")
+            )
+            return {"moved": moved, "times": result, "ids": ids}, 200
+        finally:
+            await _release_mutex(self.store, owner)
+
+    # ------------------------------------------------------------------
+    # publish.now
+    # ------------------------------------------------------------------
+
+    async def publish_now(self, reel_id):
+        path = f"schedules/{reel_id}.json"
+        current, _etag = await self.store.read(path)
+        if not isinstance(current, dict):
+            raise ApiError("not_found", "this reel has no schedule on the server", 404)
+
+        state = _stage_of(current)
+        if state == STAGE_PUBLISHED or _int_of(current, "publishedAt") > 0:
+            # مكرر: نُشر بالفعل. لا نشر ثانٍ ولا خطأ.
+            return {
+                "id": reel_id,
+                "state": STAGE_PUBLISHED,
+                "published": True,
+                "inProgress": False,
+                "idempotent": True,
+            }, 200
+
+        if state == STAGE_UNVERIFIED:
+            raise ApiError(
+                "unverified",
+                "the last publish is unconfirmed; check Instagram first",
+                409,
+            )
+
+        if state in IN_FLIGHT_STAGES:
+            # أمر مكرر بينما السلسلة تعمل: نعيد الحالة الحالية ولا نبدأ ثانية.
+            return {
+                "ok": False,
+                "errorCode": "in_progress",
+                "error": "the server is already publishing this reel",
+                "id": reel_id,
+                "state": state,
+                "published": False,
+                "inProgress": True,
+            }, 202
+
+        if state == STAGE_FAILED:
+            # المحاولة اليدوية تعيد الفاشل إلى الطابور بدل تركه ميتاً للأبد.
+            await self.store.transition(
+                path,
+                (STAGE_FAILED,),
+                STAGE_SCHEDULED,
+                {"attempts": 0, "error": None, "containerId": None},
+            )
+            current, _etag = await self.store.read(path)
+            current = current if isinstance(current, dict) else current
+
+        if not await self.engine.archive_now(reel_id):
+            raise ApiError("not_ready", "the reel could not be archived yet, try again", 503)
+
+        container_id = _clean(current.get("containerId"))
+        if not container_id:
+            container_id, error = await self.engine.prepare_container(reel_id)
+            if not container_id:
+                error = error or "instagram did not return a container id"
+                await self.store.transition(
+                    path,
+                    (STAGE_SCHEDULED, STAGE_PREPARED, STAGE_PREPARING),
+                    STAGE_FAILED,
+                    {"error": error},
+                )
+                raise ApiError("upstream_failed", error, 503)
+
+        moment = _now()
+        fresh, fresh_etag = await self.store.read(path)
+        fresh = fresh if isinstance(fresh, dict) else {}
+        if _stage_of(fresh) in IN_FLIGHT_STAGES:
+            return {
+                "ok": False,
+                "errorCode": "in_progress",
+                "error": "the server is already publishing this reel",
+                "id": reel_id,
+                "state": _stage_of(fresh),
+                "published": False,
+                "inProgress": True,
+            }, 202
+        await self.store.commit(
+            path,
+            fresh_etag,
+            fresh,
+            {
+                "at": moment,
+                "state": STAGE_PREPARED,
+                "containerId": container_id,
+                "attempts": 0,
+                "error": None,
+                "stageAt": 0,
+                "manualPublish": True,
+                "manualAt": moment,
+            },
+        )
+
+        state, error = await self.engine.advance_until_settled(reel_id)
+        if error == ARCHIVE_WAIT:
+            error = "the reel archive is not ready on the server"
+
+        published = state in (STAGE_PUBLISHED, STAGE_CLEANING)
+        if not published and error is None:
+            error = "instagram is still processing the video; press again in a minute"
+
+        await self.store.bump_revision()
+        if published:
+            return {
+                "id": reel_id,
+                "state": state,
+                "published": True,
+                "inProgress": False,
+            }, 200
+        return {
+            "ok": False,
+            "errorCode": "in_progress",
+            "error": error,
+            "id": reel_id,
+            "state": state,
+            "published": False,
+            "inProgress": True,
+        }, 202
+
+    # ------------------------------------------------------------------
+    # reel.delete
+    # ------------------------------------------------------------------
+
+    async def delete(self, reel_id):
+        path = f"schedules/{reel_id}.json"
+        schedule = await self.store.get(path)
+        if isinstance(schedule, dict):
+            state = _stage_of(schedule)
+            if state in IN_FLIGHT_STAGES:
+                raise ApiError("in_progress", "the reel is being published right now", 409)
+
+        key = self.engine.key(reel_id)
+        try:
+            await self.env.FILES.delete(key)
+        except Exception as exc:  # noqa: BLE001
+            raise ApiError(
+                "storage_failed",
+                "could not delete the archived file: %s" % _describe(exc)[:200],
+                503,
+            )
+
+        if await self.engine.exists(reel_id) is True:
+            raise ApiError("storage_failed", "the archived file is still in R2", 503)
+
+        if not await self.engine.forget(reel_id):
+            raise ApiError(
+                "store_failed",
+                "the file is gone but the database records could not be removed",
+                503,
+            )
+
+        await self.store.bump_revision()
+        return {"id": reel_id, "deleted": True}, 200
+
+
+# ==========================================================================
+# صورة الحالة الكاملة: مصدر الحقيقة الوحيد الذي يقرأه التطبيق
+# ==========================================================================
+
+
+async def _build_state(store, env, request_id=None):
+    now = _now()
+    schedules = await store.get("schedules") or {}
+    reels = await store.get("reels") or {}
+    if not isinstance(schedules, dict):
+        schedules = {}
+    if not isinstance(reels, dict):
+        reels = {}
+
+    snapshot = {
+        "ok": True,
+        "serverTime": now,
+        "timezone": SCHEDULE_TIMEZONE,
+        "revision": 0,
+        "tokenPresent": bool(_ig_token(env)),
+        "reels": {},
+        "publishing": None,
+    }
+    if request_id:
+        snapshot["requestId"] = request_id
+
+    pending = []
+    revision = 0
+
+    for schedule_id, record in schedules.items():
+        clean_id = _safe_id(schedule_id)
+        if not clean_id or not isinstance(record, dict):
+            continue
+
+        reel = reels.get(clean_id)
+        archive = reel.get("archive") if isinstance(reel, dict) else None
+        view = _reel_view(record, archive, now)
+        snapshot["reels"][clean_id] = view
+
+        revision = max(
+            revision,
+            _int_of(record, "updatedAt"),
+            _int_of(record, "scheduledAt"),
+            _int_of(record, "publishedAt"),
+        )
+
+        if view["state"] in IN_FLIGHT_STAGES:
+            snapshot["publishing"] = {
+                "id": clean_id,
+                "state": view["state"],
+                "since": _int_of(record, "stageAt"),
+            }
+        if view["at"] > 0 and view["state"] not in FINAL_STAGES:
+            pending.append((view["at"], clean_id))
+
+    # ترتيب النشر: 1 = الريل القادم، ثم الذي بعده، بلا تكرار درجات.
+    pending.sort()
+    for index, (_at, clean_id) in enumerate(pending):
+        snapshot["reels"][clean_id]["order"] = index + 1
+
+    stored = await store.get(REVISION_PATH)
+    revision = max(revision, _int_of(stored, "rev") if isinstance(stored, dict) else 0)
+    snapshot["revision"] = revision
+    return snapshot
+
+
+# ==========================================================================
+# الطبقة 4 — HTTP: راوتر جدولي، مصادقة واحدة، ورد موحّد
+# ==========================================================================
+
+# (method, pattern) → اسم المعالج. {id} مقطع متغيّر.
+ROUTES = (
+    ("GET", (), "root"),
+    ("GET", ("health",), "health"),
+    ("GET", ("state",), "state"),
+    ("GET", ("schedules",), "state"),
+    ("POST", ("schedules",), "set_schedule"),
+    ("POST", ("schedules", "order"), "reorder"),
+    ("POST", ("publish-now",), "publish_now"),
+    ("GET", ("publish",), "publish_run"),
+    ("POST", ("publish",), "publish_run"),
+    ("POST", ("reels",), "archive_start"),
+    ("GET", ("reels", "{id}"), "reel_status"),
+    ("DELETE", ("reels", "{id}"), "reel_delete"),
+    ("GET", ("download", "{id}"), "download"),
+    ("GET", ("media", "{id}"), "media"),
+    ("HEAD", ("media", "{id}"), "media"),
+)
+
+PUBLIC_HANDLERS = ("root", "health", "media")
+
+
+def _match_route(method, parts):
+    for route_method, pattern, name in ROUTES:
+        if route_method != method or len(pattern) != len(parts):
+            continue
+        params = {}
+        matched = True
+        for expected, actual in zip(pattern, parts):
+            if expected.startswith("{") and expected.endswith("}"):
+                params[expected[1:-1]] = actual
+            elif expected != actual:
+                matched = False
+                break
+        if matched:
+            return name, params
+    return None
+
+
+class Default(WorkerEntrypoint):
+    """نقطة الدخول: تحقّق ومصادقة، ثم تفويض إلى الأوامر أو المحرّك.
+
+    لا منطق نشر هنا: الراوتر يعرف المسارات فقط، وكل قرار في Commands/Engine.
+    """
+
+    @property
+    def store(self):
+        db = _clean(getattr(self.env, "FIREBASE_DB", None), RTDB_FALLBACK)
+        return Store(db)
+
+    @property
+    def engine(self):
+        return Engine(self.env, self.store)
+
+    @property
+    def commands(self):
+        return Commands(self.env, self.store, self.engine)
+
+    def _authorized(self, request):
+        expected = _clean(getattr(self.env, "API_TOKEN", None))
+        if not expected:
+            return True
+        try:
+            provided = _clean(request.headers.get("x-api-key"))
+        except Exception:  # noqa: BLE001 - طلب بلا ترويسات
+            provided = ""
+        return provided == expected
+
+    async def fetch(self, request):
+        request_id = _new_request_id()
+        try:
+            request_id = _clean(request.headers.get("x-request-id")) or request_id
+        except Exception:  # noqa: BLE001
+            pass
+
+        method = _clean(getattr(request, "method", "GET"), "GET").upper()
+        parts = tuple(part for part in _path_of(str(request.url)).split("/") if part)
+
+        if method == "OPTIONS":
+            return Response(
+                "",
+                status=204,
+                headers={
+                    "access-control-allow-origin": "*",
+                    "access-control-allow-headers": "content-type,x-api-key,x-request-id",
+                    "access-control-allow-methods": "GET,POST,DELETE,HEAD,OPTIONS",
+                },
+            )
+
+        try:
+            route = _match_route(method, parts)
+            if route is None:
+                raise ApiError("not_found", "unknown route", 404)
+            name, params = route
+            if name not in PUBLIC_HANDLERS and not self._authorized(request):
+                raise ApiError("unauthorized", "unauthorized", 401)
+
+            result = await getattr(self, "h_" + name)(request, params, request_id)
+            if isinstance(result, Response):
+                return result
+
+            payload, status = result
+            return _reply(payload, status, request_id)
+        except ApiError as exc:
+            return _fail(exc.code, exc.message, exc.status, request_id)
+        except Exception as exc:  # noqa: BLE001 - لا نُسقط الطلب بلا رد
+            print("pigeon request failed: %s" % _describe(exc))
+            return _fail("internal", _describe(exc)[:300], 500, request_id)
+
+    # ------------------------------------------------------------------
+    # المعالجات
+    # ------------------------------------------------------------------
+
+    async def h_root(self, request, params, request_id):
+        return {
+            "service": "pigeon-reels",
+            "timezone": SCHEDULE_TIMEZONE,
+            "tokenPresent": bool(_ig_token(self.env)),
+            "routes": [
+                "GET /state",
+                "POST /schedules",
+                "POST /schedules/order",
+                "POST /publish-now",
+                "POST /reels",
+                "GET /reels/<id>",
+                "DELETE /reels/<id>",
+                "GET /download/<id>",
+                "GET /media/<id>",
+                "GET|POST /publish",
+            ],
+        }, 200
+
+    async def h_health(self, request, params, request_id):
+        return {
+            "health": True,
+            "tokenPresent": bool(_ig_token(self.env)),
+            "timezone": SCHEDULE_TIMEZONE,
+        }, 200
+
+    async def h_state(self, request, params, request_id):
+        snapshot = await _build_state(self.store, self.env, request_id)
+        return snapshot, 200
+
+    async def h_set_schedule(self, request, params, request_id):
+        body = await _body_of(request)
+        return await self.commands.set_schedule(body)
+
+    async def h_reorder(self, request, params, request_id):
+        body = await _body_of(request)
+        return await self.commands.reorder(request_id, body)
+
+    async def h_publish_now(self, request, params, request_id):
+        body = await _body_of(request)
+        reel_id = _require_id(_field(body, "id"))
+        return await self.commands.publish_now(reel_id)
+
+    async def h_archive_start(self, request, params, request_id):
+        body = await _body_of(request)
+        return await self.commands.archive(request_id, body)
+
+    async def h_reel_status(self, request, params, request_id):
+        reel_id = _require_id(params.get("id"))
+        now = _now()
+        schedule = await self.store.get(f"schedules/{reel_id}.json")
+        reel = await self.store.get(f"reels/{reel_id}.json")
+        archive = reel.get("archive") if isinstance(reel, dict) else None
+
+        if not isinstance(schedule, dict) and not isinstance(reel, dict):
+            raise ApiError("not_found", "unknown reel", 404)
+
+        view = _reel_view(schedule or {}, archive, now)
+        return {
+            "id": reel_id,
+            "state": view["state"],
+            "archive": view["archive"],
+            "allowedActions": view["allowedActions"],
+            "downloadable": view["downloadable"],
+            "publishable": view["publishable"],
+            "at": view["at"],
+            "remainingMs": view["remainingMs"],
+            "error": view["error"],
+        }, 200
+
+    async def h_reel_delete(self, request, params, request_id):
+        reel_id = _require_id(params.get("id"))
+        return await self.commands.delete(reel_id)
+
+    async def h_publish_run(self, request, params, request_id):
+        summary = await self._publish_due()
+        await self._record_run(summary)
+        return summary, 200
+
+    async def h_download(self, request, params, request_id):
+        reel_id = _require_id(params.get("id"))
+        obj = await self.env.FILES.get(self.engine.key(reel_id))
+        if obj is None:
+            raise ApiError("not_found", "not stored yet", 404)
+        return Response(
+            obj.body,
+            headers={
+                "content-type": "video/mp4",
+                "content-disposition": 'attachment; filename="pigeon-%s.mp4"' % reel_id,
+                "cache-control": "public, max-age=86400",
+                "access-control-allow-origin": "*",
+            },
+        )
+
+    async def h_media(self, request, params, request_id):
+        reel_id = _require_id(params.get("id"))
+        method = _clean(getattr(request, "method", "GET"), "GET").upper()
+        key = self.engine.key(reel_id)
+        headers = {
+            "content-type": "video/mp4",
+            "content-disposition": 'inline; filename="pigeon-%s.mp4"' % reel_id,
+            "cache-control": "public, max-age=86400",
+            "access-control-allow-origin": "*",
+        }
+
+        if method == "HEAD":
+            obj = await self.env.FILES.head(key)
+            if obj is None:
+                raise ApiError("not_found", "not stored yet", 404)
+            size = getattr(obj, "size", None)
+            if size is not None:
+                headers["content-length"] = str(size)
+            return Response("", headers=headers)
+
+        obj = await self.env.FILES.get(key)
+        if obj is None:
+            raise ApiError("not_found", "not stored yet", 404)
+        # Meta تحتاج content-length صريحاً لتقبل تنزيل الفيديو من هذا الرابط.
+        size = getattr(obj, "size", None)
+        if size is not None:
+            headers["content-length"] = str(size)
+        headers["accept-ranges"] = "bytes"
+        return Response(obj.body, headers=headers)
+
+    # ------------------------------------------------------------------
+    # cron: تشغيل السلسلة للمواعيد المستحقة
+    # ------------------------------------------------------------------
+
+    async def scheduled(self, controller, env, ctx):
+        try:
+            summary = await self._publish_due()
+        except Exception as exc:  # noqa: BLE001 - لا نُفشل الـcron كله
+            summary = {"ok": False, "error": _describe(exc)[:300], "serverTime": _now()}
+            print("pigeon schedule run failed: %s" % exc)
+        await self._record_run(summary)
+
+    async def _publish_due(self):
+        store = self.store
+        engine = self.engine
+        owner = "cron"
+
+        if not await _acquire_mutex(store, owner):
+            return {
+                "ok": True,
+                "skipped": "another operation is running",
+                "serverTime": _now(),
+            }
+
+        try:
+            now = _now()
+            report = {
+                "ok": True,
+                "checkedAt": now,
+                "tokenPresent": bool(_ig_token(self.env)),
+                "total": 0,
+                "due": 0,
+                "results": [],
+                "archived": 0,
+            }
+
+            schedules = await store.get("schedules") or {}
+            if not isinstance(schedules, dict):
+                report["ok"] = False
+                report["error"] = "the /schedules node is not an object"
+                return report
+
+            report["total"] = len(schedules)
+            work = []
+            for schedule_id, schedule in schedules.items():
+                if not isinstance(schedule, dict):
+                    continue
+                state = _stage_of(schedule)
+                if state in FINAL_STAGES:
+                    continue
+                at = _int_of(schedule, "at")
+                clean_id = _safe_id(schedule_id)
+                if at <= 0 or not clean_id:
+                    continue
+                work.append((at, clean_id, schedule))
+
+            work.sort(key=lambda entry: entry[0])
+            report["due"] = len(work)
+
+            for at, clean_id, schedule in work[:MAX_PUBLISH_PER_RUN]:
+                entry = {"id": clean_id, "at": at, "state": _stage_of(schedule)}
+                try:
+                    state, error = await engine.advance(clean_id, schedule)
+                    entry["state"] = state
+                    if error:
+                        entry["error"] = error
+                except Exception as exc:  # noqa: BLE001 - لا نُسقط بقية المواعيد
+                    print("pigeon schedule %s failed: %s" % (clean_id, exc))
+                    entry["error"] = _describe(exc)[:300]
+                report["results"].append(entry)
+
+            waiting_archive = any(
+                entry.get("error") == ARCHIVE_WAIT for entry in report["results"]
+            )
+            if not work or waiting_archive:
+                try:
+                    report["archived"] = await engine.archive_missing()
+                except Exception as exc:  # noqa: BLE001 - ليس حرجاً
+                    print("pigeon archive retry failed: %s" % exc)
+
+            await store.bump_revision()
+            return report
+        finally:
+            await _release_mutex(store, owner)
+
+    async def _record_run(self, summary):
+        """يحفظ نتيجة آخر تشغيل تحت `/worker/status` لتظهر من أي متصفح."""
+        try:
+            store = self.store
+            await store.put("worker/status/lastRun.json", summary)
+            await store.patch("worker/status.json", {"updatedAt": _now()})
+        except Exception:  # noqa: BLE001 - تشخيص فقط
+            return
