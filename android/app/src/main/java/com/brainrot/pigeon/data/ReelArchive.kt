@@ -16,7 +16,12 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -147,11 +152,15 @@ class ReelArchive(
     context: Context,
     baseClient: OkHttpClient,
     endpoint: String,
+    databaseUrl: String,
     private val token: String,
 ) {
 
     private val appContext = context.applicationContext
     private val base = endpoint.trim().trimEnd('/')
+
+    // قناة الأوامر الاحتياطية: تُستخدم عندما تحجب الشبكة نطاق الـWorker.
+    private val commands = FirebaseCommands(baseClient, databaseUrl)
 
     // التحميل الحقيقي قد يأخذ دقائق، و"انشر الآن" ينتظر معالجة الحاوية عند Meta
     // داخل نفس الطلب: بلا مهلة إجمالية ومهلة قراءة سخية.
@@ -172,7 +181,7 @@ class ReelArchive(
      * يطلب من الخادم تنزيل الريل وتخزينه. يعيد `null` إذا قُبل الطلب،
      * أو رسالة الخطأ القادمة من الشبكة/الخادم حتى تظهر للمستخدم.
      */
-    suspend fun request(item: SavedItem, media: String? = null): String? =
+    private suspend fun requestOverHttp(item: SavedItem, media: String? = null): String? =
         withContext(Dispatchers.IO) {
         val link = item.url?.takeIf { it.isNotBlank() } ?: return@withContext "the reel has no link"
         if (!configured) return@withContext "the archive service is not configured"
@@ -221,7 +230,7 @@ class ReelArchive(
      * يقرأ العدّ التنازلي من الخادم: وقت الخادم نفسه والوقت المتبقي لكل ريل
      * وحالته الحقيقية. `null` تعني تعذّر الطلب، فتبقى آخر لقطة معروضة.
      */
-    suspend fun scheduleSnapshot(): ScheduleSnapshot? = withContext(Dispatchers.IO) {
+    private suspend fun scheduleSnapshotOverHttp(): ScheduleSnapshot? = withContext(Dispatchers.IO) {
         runCatching {
             if (!configured) return@runCatching null
 
@@ -244,7 +253,7 @@ class ReelArchive(
      * يضبط موعد الريل على الخادم. الخادم وحده يكتب الموعد: يمنع التداخل مع
      * موعد ريل آخر ويرجّع الوقت النهائي، فتبدأ نفس اللحظة عند الطرفين.
      */
-    suspend fun setSchedule(id: String, at: Long): Result<PublishSchedule> =
+    private suspend fun setScheduleOverHttp(id: String, at: Long): Result<PublishSchedule> =
         withContext(Dispatchers.IO) {
             runCatching {
                 if (!configured) throw IOException("the archive service is not configured")
@@ -288,7 +297,7 @@ class ReelArchive(
      * يرسل أمر "انشر الآن" ويعيد قرار الخادم كما هو: نُشر، أو ما زال يعمل،
      * أو رُفض بسبب. التطبيق لا يستنتج النجاح من رمز HTTP وحده.
      */
-    suspend fun publishNow(id: String): PublishOutcome = withContext(Dispatchers.IO) {
+    private suspend fun publishNowOverHttp(id: String): PublishOutcome = withContext(Dispatchers.IO) {
         runCatching {
             if (!configured) throw IOException("the archive service is not configured")
 
@@ -338,7 +347,7 @@ class ReelArchive(
      * حالة أرشيف ريل واحد من الخادم: التطبيق لا يقرأ تقدّم الأرشفة من Firebase
      * مباشرة، فالخادم وحده يملك حالة المهمة.
      */
-    suspend fun archiveStatus(id: String): ArchiveStatus? = withContext(Dispatchers.IO) {
+    private suspend fun archiveStatusOverHttp(id: String): ArchiveStatus? = withContext(Dispatchers.IO) {
         runCatching {
             if (!configured) return@runCatching null
 
@@ -361,7 +370,7 @@ class ReelArchive(
      * يرسل ترتيب الشبكة الجديد: الخادم يعيد توزيع المواعيد نفسها على الريلز
      * حسب هذا الترتيب، ويرجّع الموعد الذي صار لكل ريل.
      */
-    suspend fun reorder(ids: List<String>): Result<Map<String, Long>> =
+    private suspend fun reorderOverHttp(ids: List<String>): Result<Map<String, Long>> =
         withContext(Dispatchers.IO) {
             runCatching {
                 if (!configured) throw IOException("the archive service is not configured")
@@ -399,7 +408,7 @@ class ReelArchive(
      * يحذف الريل من الخادم: ملفه من R2 وكل معلوماته من Firebase.
      * لا يُقبل الحذف أثناء خطوة نشر جارية (يردّ الخادم 409).
      */
-    suspend fun deleteRemote(id: String): Result<Unit> = withContext(Dispatchers.IO) {
+    private suspend fun deleteRemoteOverHttp(id: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             if (!configured) return@runCatching
 
@@ -458,6 +467,145 @@ class ReelArchive(
             }
         }
     }
+
+    // ------------------------------------------------------------------
+    // المسار الاحتياطي: كل أمر يصل الخادم عبر Firebase إن فشل HTTP
+    // ------------------------------------------------------------------
+
+    private suspend fun enqueueAndAwait(
+        type: String,
+        reelId: String?,
+        extra: JsonObject = JsonObject(emptyMap()),
+        timeoutMs: Long = COMMAND_TIMEOUT_MS,
+    ): CommandOutcome? = commands.run(type, reelId, extra, timeoutMs)
+
+    /**
+     * يطلب الأرشفة. إن لم يصل الطلب إلى الـWorker (حجب أو انقطاع) يُكتب الأمر
+     * في Firebase وينفّذه الـWorker في دورته، فيبقى الفيديو يتجه إلى R2.
+     */
+    suspend fun request(item: SavedItem, media: String? = null): String? {
+        val error = requestOverHttp(item, media)
+        if (error == null) return null
+        if (!commands.configured) return error
+
+        val link = item.url?.takeIf { it.isNotBlank() } ?: return error
+        val queued = commands.enqueue(
+            type = "archive",
+            reelId = item.id,
+            extra = buildJsonObject {
+                put("url", link)
+                item.thumbnail?.takeIf { it.isNotBlank() }?.let { put("thumbnail", it) }
+                media?.takeIf { it.startsWith("https://") }?.let { put("media", it) }
+            },
+        )
+        // وصل الأمر إلى Firebase: الخادم سيكمله ويكتب النتيجة في السجل.
+        return if (queued != null) null else error
+    }
+
+    /** حالة الأرشيف: من الـWorker، أو من السجل الذي كتبه الـWorker في Firebase. */
+    suspend fun archiveStatus(id: String): ArchiveStatus? =
+        archiveStatusOverHttp(id) ?: commands.reelArchive(id)
+
+    /** العدّ التنازلي: من الـWorker، أو لقطة مبنية على مواعيد الخادم في Firebase. */
+    suspend fun scheduleSnapshot(): ScheduleSnapshot? =
+        scheduleSnapshotOverHttp() ?: commands.snapshot()
+
+    /** يضبط الموعد على الخادم، أو يكتب الأمر في Firebase إن لم يصل الطلب. */
+    suspend fun setSchedule(id: String, at: Long): Result<PublishSchedule> {
+        val direct = setScheduleOverHttp(id, at)
+        if (direct.isSuccess || !commands.configured) return direct
+
+        val outcome = enqueueAndAwait(
+            type = "schedule",
+            reelId = id,
+            extra = buildJsonObject {
+                put("at", at)
+                put("timezone", ScheduleSlots.TIMEZONE)
+            },
+        ) ?: return direct
+
+        val result = outcome.result
+        if (!outcome.ok || result == null) {
+            return Result.failure(
+                IOException(outcome.error ?: "the server rejected the schedule"),
+            )
+        }
+        return Result.success(
+            PublishSchedule(
+                at = result.stringValue("at").toLongOrNull()?.takeIf { it > 0L } ?: at,
+                timezone = result.stringValue("timezone").ifBlank { ScheduleSlots.TIMEZONE },
+                state = result.stringValue("state").ifBlank { ScheduleSlots.STATE_SCHEDULED },
+            ),
+        )
+    }
+
+    /** ينشر الآن: يعيد قرار الخادم سواء جاء من الطلب أو من نتيجة الأمر. */
+    suspend fun publishNow(id: String): PublishOutcome {
+        val direct = publishNowOverHttp(id)
+        if (direct !is PublishOutcome.Failed || !commands.configured) return direct
+
+        val outcome = enqueueAndAwait(
+            type = "publish_now",
+            reelId = id,
+            timeoutMs = PUBLISH_COMMAND_TIMEOUT_MS,
+        ) ?: return direct
+        val result = outcome.result ?: return direct
+
+        val published = result.stringValue("published") == "true" &&
+            result.stringValue("state") in
+            setOf(ScheduleSlots.STATE_PUBLISHED, ScheduleSlots.STATE_CLEANING)
+
+        return when {
+            published -> PublishOutcome.Published
+            result.stringValue("errorCode") == "in_progress" ||
+                result.stringValue("inProgress") == "true" -> PublishOutcome.InProgress(
+                state = result.stringValue("state"),
+                message = result.stringValue("error").takeIf { it.isNotBlank() },
+            )
+            else -> PublishOutcome.Failed(
+                result.stringValue("error").takeIf { it.isNotBlank() }
+                    ?: outcome.error
+                    ?: "the reel was not published",
+            )
+        }
+    }
+
+    /** ترتيب الشبكة: الخادم يعيد توزيع المواعيد، ونتيجته قد تصل عبر Firebase. */
+    suspend fun reorder(ids: List<String>): Result<Map<String, Long>> {
+        val direct = reorderOverHttp(ids)
+        if (direct.isSuccess || !commands.configured) return direct
+
+        val outcome = enqueueAndAwait(
+            type = "order",
+            reelId = null,
+            extra = buildJsonObject {
+                put("ids", buildJsonArray { ids.forEach { add(it) } })
+            },
+        ) ?: return direct
+
+        val times = outcome.result?.get("times") as? JsonObject ?: return direct
+        return Result.success(
+            times.mapValues { (_key, value) ->
+                (value as? JsonPrimitive)?.longOrNull ?: 0L
+            },
+        )
+    }
+
+    /** حذف الريل من الخادم، أو بأمر عبر Firebase إن لم يصل الطلب. */
+    suspend fun deleteRemote(id: String): Result<Unit> {
+        val direct = deleteRemoteOverHttp(id)
+        if (direct.isSuccess || !commands.configured) return direct
+
+        val outcome = enqueueAndAwait(type = "delete", reelId = id) ?: return direct
+        return if (outcome.ok) {
+            Result.success(Unit)
+        } else {
+            Result.failure(IOException(outcome.error ?: "the server rejected the delete"))
+        }
+    }
+
+    private fun JsonObject.stringValue(key: String): String =
+        (this[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
 
     private fun saveToDownloads(
         name: String,

@@ -36,10 +36,12 @@ class AppContainer(context: Context) {
     val reels = FirebaseReels(httpClient, BuildConfig.DEFAULT_FIREBASE_DB)
     val thumbnails = ReelThumbnails(httpClient)
     // أرشيف الريلز على Cloudflare (Worker + R2): طلب الأرشفة والتحميل للجهاز.
+    // نفس قاعدة Firebase تُستخدم قناة أوامر احتياطية إن تعذّر الوصول للـWorker.
     val archive = ReelArchive(
         context = appContext,
         baseClient = httpClient,
         endpoint = BuildConfig.DEFAULT_ARCHIVE_ENDPOINT,
+        databaseUrl = BuildConfig.DEFAULT_FIREBASE_DB,
         token = BuildConfig.DEFAULT_ARCHIVE_TOKEN,
     )
     // حل روابط تيك توك من شبكة الهاتف: Cloudflare محجوب عن صفحات تيك توك.

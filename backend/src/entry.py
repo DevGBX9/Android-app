@@ -1074,7 +1074,7 @@ async def _ig_publish(user_id, token, container_id):
 #   4) الأوامر idempotent: تكرار الأمر لا يكرر أثره (لا نشر مزدوج، لا حذف أعمى).
 
 CAS_ATTEMPTS = 4
-SERVICE_VERSION = 13
+SERVICE_VERSION = 14
 
 # الحالات النهائية: لا تُعاد تلقائياً أبداً.
 FINAL_STAGES = (STAGE_PUBLISHED, STAGE_FAILED, STAGE_UNVERIFIED)
@@ -1090,6 +1090,11 @@ MUTEX_PATH = "worker/mutex.json"
 MUTEX_LEASE_MS = 120_000
 # مؤشر عرض فقط: يتغيّر مع كل أمر حتى تعرف الواجهة أن اللقطة تغيّرت.
 REVISION_PATH = "worker/revision.json"
+# قناة الأوامر: التطبيق يكتب أمراً هنا، والـcron ينفّذه ويكتب نتيجته.
+# هذا يجعل كل الأوامر تعمل حتى عندما تحجب شبكة الهاتف نطاق الـWorker.
+COMMANDS_PATH = "commands"
+COMMAND_MAX_PER_RUN = 6
+COMMAND_TTL_MS = 30 * 60 * 1000
 
 
 class ApiError(Exception):
@@ -1569,10 +1574,18 @@ class Engine:
             )
             return True
         except Exception as exc:  # noqa: BLE001 - نسجّل السبب ونعيد false
+            attempts = 0
+            try:
+                existing = await self.store.get(state_path)
+                if isinstance(existing, dict):
+                    attempts = _int_of(existing, "attempts")
+            except Exception:  # noqa: BLE001 - العدّاد تحسين للتباعد
+                pass
             await report(
                 "failed",
                 0,
                 error=("%s: %s" % (exc.__class__.__name__, exc))[:300],
+                attempts=attempts + 1,
             )
             return False
 
@@ -1601,6 +1614,70 @@ class Engine:
             app_media=_safe_media_url(reel.get("media")),
         )
         return await self.exists(reel_id) is True
+
+    async def archive_pending(self, limit=2):
+        """يؤرشف أي ريل مسجّل في Firebase ما زال بلا ملف في R2.
+
+        هذا هو الضمان الذي لا يعتمد على الهاتف: الرابط محفوظ في السجل، فالـcron
+        يكمّل الأرشفة وحدَه حتى لو مات طلب التطبيق في منتصفه. المحاولات
+        الفاشلة تتباعد (30s, 2m, 5m, 15m, ...) حتى لا تلتهم الدورة.
+        """
+        reels = await self.store.get("reels") or {}
+        if not isinstance(reels, dict):
+            return 0
+
+        backoff = (30_000, 120_000, 300_000, 900_000, 1_800_000, 3_600_000)
+        now = _now()
+        started = 0
+
+        for raw_id, record in reels.items():
+            if started >= limit:
+                break
+            clean_id = _safe_id(raw_id)
+            if not clean_id or not isinstance(record, dict):
+                continue
+
+            archive = record.get("archive")
+            archive = archive if isinstance(archive, dict) else {}
+            state = _clean(archive.get("state"))
+            if state == "ready":
+                continue
+
+            link = _clean(record.get("url"))
+            if not link:
+                continue
+
+            updated = _int_of(archive, "updatedAt")
+            if state in ("queued", "downloading", "storing"):
+                if now - updated < STALE_JOB_MS:
+                    continue  # مهمة تعمل الآن
+            elif state == "failed":
+                attempts = _int_of(archive, "attempts")
+                if attempts >= len(backoff):
+                    continue  # رابط ميت: لا نُعيد المحاولة بلا نهاية
+                if now - updated < backoff[min(attempts, len(backoff) - 1)]:
+                    continue
+
+            if await self.exists(clean_id) is True:
+                continue  # الملف موجود: تبقى فقط كتابة الحالة
+
+            code = _instagram_code(link)
+            tiktok = None if code else _tiktok_link(link)
+            if not code and not tiktok:
+                continue
+
+            await self.archive(
+                reel_id=clean_id,
+                code=code,
+                tiktok=tiktok,
+                source="instagram" if code else "tiktok",
+                origin=_ig_public_base(self.env),
+                thumbnail=_clean(record.get("thumbnail")) or None,
+                app_media=_safe_media_url(record.get("media")),
+            )
+            started += 1
+
+        return started
 
     async def archive_missing(self):
         """يعيد أرشفة موعد قادم ما زال ملفه غائباً عن R2 (حماية من فقدان الأرشفة)."""
@@ -2182,6 +2259,20 @@ class Commands:
             )
         source = "instagram" if code else "tiktok"
 
+        # السجل نفسه يُحفظ هنا أيضاً: لو انقطع طلب التطبيق بعد الأرشفة تفشل
+        # كتابته، أو احتاج الـcron إعادة المحاولة، فالرابط موجود على الخادم.
+        try:
+            await self.store.patch(
+                f"reels/{reel_id}.json",
+                {
+                    "url": link,
+                    "thumbnail": thumbnail or None,
+                    "source": source,
+                },
+            )
+        except ApiError:
+            pass
+
         try:
             await self.store.patch(
                 archive_path,
@@ -2569,6 +2660,174 @@ class Commands:
         return {"id": reel_id, "deleted": True}, 200
 
 
+class CommandQueue:
+    """قناة أوامر عبر Firebase: التطبيق يكتب أمراً، والخادم ينفّذه.
+
+    السبب: شبكات كثيرة تحجب نطاق `*.workers.dev` أو تُسقط الاتصال به لفترات،
+    فيضيع أمر التطبيق بصمت. Firebase يبقى متاحاً، فأصبح هو الطريق الذي يحمل
+    الأمر، والقرار والتنفيذ يبقيان على الخادم وحده.
+
+    شكل الأمر: `commands/<id>` = {type, reelId?, url?, thumbnail?, media?,
+    at?, ids?, state, createdAt}. الخادم يحجز الأمر بـCAS (pending -> running)
+    ثم يكتب `state: done|failed` و`result` أو `error`، والتطبيق يقرأ النتيجة.
+    """
+
+    def __init__(self, env, store, engine, commands):
+        self.env = env
+        self.store = store
+        self.engine = engine
+        self.commands = commands
+
+    async def run(self, limit=COMMAND_MAX_PER_RUN):
+        raw = await self.store.get(COMMANDS_PATH)
+        if not isinstance(raw, dict):
+            return {"done": 0, "failed": 0, "pending": 0}
+
+        pending = []
+        for raw_id, record in raw.items():
+            clean_id = _safe_id(raw_id)
+            if not clean_id or not isinstance(record, dict):
+                continue
+            if _clean(record.get("state"), "pending") != "pending":
+                continue
+            pending.append((_int_of(record, "createdAt"), clean_id, record))
+        pending.sort()
+
+        done = 0
+        failed = 0
+        for _at, clean_id, record in pending[:limit]:
+            path = f"{COMMANDS_PATH}/{clean_id}.json"
+            # حجز واحد: الدورة الأخرى (أو /publish اليدوي) لا تنفّذ نفس الأمر.
+            # الكتابة مشروطة بـETag، فأول من يقرأ الأمر هو من ينفّذه.
+            claimed = False
+            for _attempt in range(CAS_ATTEMPTS):
+                current, etag = await self.store.read(path)
+                if not isinstance(current, dict):
+                    break
+                if _clean(current.get("state"), "pending") != "pending":
+                    break
+                try:
+                    await self.store.commit(
+                        path, etag, current, {"state": "running", "startedAt": _now()}
+                    )
+                    claimed = True
+                except ApiError as exc:
+                    if exc.code != "conflict":
+                        raise
+                    continue
+                break
+            if not claimed:
+                continue
+            kind = _clean(record.get("type"))
+            try:
+                result = await self.dispatch(kind, record)
+                await self.store.patch(
+                    path,
+                    {
+                        "state": "done",
+                        "ok": True,
+                        "result": result,
+                        "error": None,
+                        "doneAt": _now(),
+                    },
+                )
+                done += 1
+            except ApiError as exc:
+                await self.store.patch(
+                    path,
+                    {
+                        "state": "failed",
+                        "ok": False,
+                        "errorCode": exc.code,
+                        "error": exc.message,
+                        "doneAt": _now(),
+                    },
+                )
+                failed += 1
+            except Exception as exc:  # noqa: BLE001 - أمر واحد لا يُسقط الدورة
+                print("pigeon command %s failed: %s" % (kind, exc))
+                await self.store.patch(
+                    path,
+                    {
+                        "state": "failed",
+                        "ok": False,
+                        "errorCode": "internal",
+                        "error": _describe(exc)[:300],
+                        "doneAt": _now(),
+                    },
+                )
+                failed += 1
+
+        await self.prune()
+        return {"done": done, "failed": failed, "pending": len(pending)}
+
+    async def dispatch(self, kind, record):
+        reel_id = _clean(record.get("reelId")) or _clean(record.get("id"))
+
+        if kind == "archive":
+            body, _status = await self.commands.archive(
+                _new_request_id(),
+                {
+                    "id": reel_id,
+                    "url": record.get("url"),
+                    "thumbnail": record.get("thumbnail"),
+                    "media": record.get("media"),
+                },
+            )
+            return {
+                "id": body.get("id"),
+                "state": body.get("state"),
+                "archive": body.get("archive"),
+            }
+
+        if kind in ("schedule", "reschedule"):
+            body, _status = await self.commands.set_schedule(
+                {
+                    "id": reel_id,
+                    "at": record.get("at"),
+                    "timezone": record.get("timezone"),
+                }
+            )
+            return body
+
+        if kind == "delete":
+            body, _status = await self.commands.delete(_require_id(reel_id))
+            return body
+
+        if kind == "publish_now":
+            body, _status = await self.commands.publish_now(_require_id(reel_id))
+            return body
+
+        if kind == "order":
+            body, _status = await self.commands.reorder(
+                _new_request_id(), {"ids": record.get("ids")}
+            )
+            return body
+
+        raise ApiError("invalid_request", "unknown command type: %s" % (kind or "?"))
+
+    async def prune(self):
+        """يحذف الأوامر المنتهية القديمة: تشخيص التطبيق فقط، لا نموّ بلا حد."""
+        raw = await self.store.get(COMMANDS_PATH)
+        if not isinstance(raw, dict):
+            return
+        now = _now()
+        for raw_id, record in raw.items():
+            clean_id = _safe_id(raw_id)
+            if not clean_id or not isinstance(record, dict):
+                continue
+            state = _clean(record.get("state"))
+            if state not in ("done", "failed"):
+                continue
+            stamp = _int_of(record, "doneAt") or _int_of(record, "createdAt")
+            if now - stamp < COMMAND_TTL_MS:
+                continue
+            try:
+                await self.store.delete(f"{COMMANDS_PATH}/{clean_id}.json")
+            except Exception:  # noqa: BLE001 - تنظيف يختبر نفسه
+                continue
+
+
 # ==========================================================================
 # صورة الحالة الكاملة: مصدر الحقيقة الوحيد الذي يقرأه التطبيق
 # ==========================================================================
@@ -2696,6 +2955,10 @@ class Default(WorkerEntrypoint):
     @property
     def commands(self):
         return Commands(self.env, self.store, self.engine)
+
+    @property
+    def queue(self):
+        return CommandQueue(self.env, self.store, self.engine, self.commands)
 
     def _authorized(self, request):
         expected = _clean(getattr(self.env, "API_TOKEN", None))
@@ -2912,6 +3175,20 @@ class Default(WorkerEntrypoint):
                 "archived": 0,
             }
 
+            # 1) أوامر التطبيق المعلّقة: تُنفَّذ قبل قراءة المواعيد لأنها قد
+            #    تُنشئ موعداً أو تحذف ريلاً. هذه هي القناة التي تصل حتى لو
+            #    حجب مقدّم الخدمة نطاق الـWorker عن الهاتف.
+            try:
+                report["commands"] = await self.queue.run()
+            except Exception as exc:  # noqa: BLE001 - لا نُسقط الدورة
+                print("pigeon command queue failed: %s" % exc)
+                report["commands"] = {"ok": False, "error": _describe(exc)[:200]}
+
+            # 2) أي ريل مسجّل بلا ملف في R2 يُؤرشف الآن، ولو لم يطلبه التطبيق.
+            try:
+                report["archived"] = await engine.archive_pending()
+            except Exception as exc:  # noqa: BLE001 - ليس حرجاً
+                print("pigeon pending archive failed: %s" % exc)
             schedules = await store.get("schedules") or {}
             if not isinstance(schedules, dict):
                 report["ok"] = False
@@ -2950,9 +3227,11 @@ class Default(WorkerEntrypoint):
             waiting_archive = any(
                 entry.get("error") == ARCHIVE_WAIT for entry in report["results"]
             )
-            if not work or waiting_archive:
+            if waiting_archive:
                 try:
-                    report["archived"] = await engine.archive_missing()
+                    report["archived"] = int(report.get("archived") or 0) + int(
+                        await engine.archive_missing()
+                    )
                 except Exception as exc:  # noqa: BLE001 - ليس حرجاً
                     print("pigeon archive retry failed: %s" % exc)
 
