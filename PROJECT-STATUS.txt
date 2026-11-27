@@ -198,8 +198,28 @@ brainrot.pigeon — تطبيق أندرويد أصلي
   يغطي: ترتيب السلسلة، تشغيلان متزامنان (نشر واحد)، عدم الحذف بلا تأكيد،
   idempotency الأوامر، استعادة failed، الجدولة والترتيب واللقطة، وصحة CAS.
   آخر تشغيل: SMOKE OK.
-- لم يُتحقق حيّاً بعد: نشر cron على Cloudflare بعد الرفع (يحتاج تشغيل
-  workflow النشر ومراقبة /state و/publish).
+- تحقق حيّ على الإنتاج (27 نوفمبر، نسخة الـWorker 13):
+  · Deploy Pigeon Reels API نجح على 3e71f9b، وBuild Android APK نجح على نفس الدفعة.
+  · GET / → version 13 وtokenPresent=true، وGET /health وGET /state → 200.
+  · Firebase الحقيقي: كانت القاعدتان فاضيتين (0 reels، 0 schedules).
+  · توكن إنستغرام المدمج صالح: brainrot.pigeon، 3467 متابع، 53 منشور.
+  · أرشفة حقيقية: POST /reels لريل من الحساب → 202 ثم ready في أقل من 2s
+    (782,378 بايت في R2)، وGET /download/<id> رجع الملف كاملاً 200.
+  · إعادة POST /reels لنفس الريل → 200 ready بلا إعادة تنزيل (idempotent).
+  · POST /schedules → 200 مع تدقيق الموعد، وGET /state عرض state=scheduled
+    وallowedActions=[download, publish_now, reschedule, delete] وorder=1.
+  · مصدر إنستغرام: ريل مجدول 40 دقيقة مسبقاً → cron الحقيقي أنشأ حاوية Meta
+    خلال ثوانٍ وصارت الحالة prepared بلا أي نشر (الحاوية مسودة تنتهي وحدها).
+  · مسارات الأخطاء: جدولة ريل غير مسجّل 404، publish-now لغير موجود 404،
+    reorder بمعرّف واحد 400، جسم غير صالح 400.
+  · DELETE مرتين → 200 مرتين، ثم GET /state → reels={} وGET /download → 404،
+    وبقي في Firebase فقط worker/ (تشخيص) بلا أي سجل ريلز أو مواعيد.
+- عيب حقيقي انكشف بالتحقق الحيّ وأُصلح: مسارات Firebase بلا لاحقة .json
+  كانت ترجع صفحة HTML فتفشل /state وكل قراءات cron بـJSON decode error.
+  صار Store يطبّع كل مسار إلى .json، و_firebase_get صارت تُرجع None بدل أن
+  تنفجر على رد غير JSON.
+- لم يُجرّب عن قصد: media_publish على الحساب الحقيقي (نشر عام لا رجعة فيه)
+  ولم يُجرّب التطبيق على هاتف (لا جهاز هنا).
 
 
 --------------------------------------------------------------------
