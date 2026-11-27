@@ -579,7 +579,7 @@ class ReelArchive(
             type = "order",
             reelId = null,
             extra = buildJsonObject {
-                put("ids", buildJsonArray { ids.forEach { add(it) } })
+                put("ids", buildJsonArray { ids.forEach { add(JsonPrimitive(it)) } })
             },
         ) ?: return direct
 
